@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
 import secrets
@@ -506,8 +505,8 @@ class UIBffHandler(BaseHandler):
         "macro_calendar_data": {"table": "macro_calendar_events", "date_column": "event_date", "value_kind": "date"},
         "industry_board": {"table": "industry_board_daily_data", "date_column": "trade_date"},
         "concept_board": {"table": "concept_board_daily_data", "date_column": "trade_date"},
-        "industry_board_stocks": {"table": "industry_board_stocks", "date_column": "join_date"},
-        "concept_board_stocks": {"table": "concept_board_stocks", "date_column": "join_date"},
+        "industry_board_stocks": {"table": "industry_board_stocks", "date_column": "trade_date"},
+        "concept_board_stocks": {"table": "concept_board_stocks", "date_column": "trade_date"},
         "industry_moneyflow_data": {"table": "industry_moneyflow_daily", "date_column": "trade_date"},
         "concept_moneyflow_data": {"table": "concept_moneyflow_daily", "date_column": "trade_date"},
         "batch_daily_ohlc": {"table": "stock_daily_data", "date_column": "trade_date"},
@@ -548,9 +547,6 @@ class UIBffHandler(BaseHandler):
         if self._system_api is None:
             db_manager = create_database_manager()
             self._system_api = UISystemDataAPI(db_manager)
-            allow_runtime_ddl = os.getenv("DB_ALLOW_RUNTIME_DDL", "false").lower() in {"1", "true", "yes", "on"}
-            if allow_runtime_ddl:
-                self._system_api.ensure_system_schema()
             self._system_api.seed_defaults()
         return self._system_api
 
@@ -711,57 +707,33 @@ class UIBffHandler(BaseHandler):
     async def _load_readiness_real_data_freshness(self) -> Dict[str, Dict[str, Any]]:
         try:
             api = self._get_system_api()
-            db_manager = getattr(api, "db_manager", None)
-            if db_manager is None:
+            if api is None:
                 return {}
         except Exception as exc:
             self.logger.warning(f"load readiness real data freshness failed (db unavailable): {exc}")
             return {}
 
+        try:
+            raw_snapshot = await asyncio.to_thread(
+                api.get_data_readiness_snapshot,
+                self.READINESS_REAL_DATA_TABLES,
+            )
+        except Exception as exc:
+            self.logger.warning(f"load readiness data snapshot failed: {exc}")
+            return {}
+
         result: Dict[str, Dict[str, Any]] = {}
-        for data_type, mapping in self.READINESS_REAL_DATA_TABLES.items():
-            table_name = str(mapping.get("table") or "").strip()
-            date_column = str(mapping.get("date_column") or "").strip()
-            value_kind = str(mapping.get("value_kind") or "date").strip().lower()
-            if not table_name or not date_column:
-                continue
-            try:
-                if value_kind == "period":
-                    latest_sql = f"SELECT MAX({date_column})::text AS latest_date FROM {table_name}"
-                else:
-                    latest_sql = f"SELECT TO_CHAR(MAX({date_column}), 'YYYY-MM-DD') AS latest_date FROM {table_name}"
-                latest_rows = await asyncio.to_thread(
-                    db_manager.execute_custom_query,
-                    latest_sql,
-                    {},
-                )
-                raw_latest = (latest_rows or [{}])[0].get("latest_date")
-                latest_date = self._normalize_period(raw_latest) if value_kind == "period" else self._normalize_ymd(raw_latest)
-                rows_on_latest = 0
-                if latest_date:
-                    if value_kind == "period":
-                        count_sql = f"SELECT COUNT(*) AS rows_on_latest FROM {table_name} WHERE {date_column} = :latest_value"
-                        params = {"latest_value": raw_latest}
-                    else:
-                        count_sql = f"SELECT COUNT(*) AS rows_on_latest FROM {table_name} WHERE {date_column} = :latest_date"
-                        params = {"latest_date": latest_date}
-                    count_rows = await asyncio.to_thread(
-                        db_manager.execute_custom_query,
-                        count_sql,
-                        params,
-                    )
-                    rows_on_latest = self._safe_int((count_rows or [{}])[0].get("rows_on_latest"), 0)
-                result[data_type] = {
-                    "table": table_name,
-                    "date_column": date_column,
-                    "value_kind": value_kind,
-                    "latest_date": latest_date,
-                    "rows_on_latest": rows_on_latest,
-                }
-            except Exception as exc:
-                self.logger.warning(
-                    f"load structure data freshness failed: data_type={data_type}, table={table_name}, error={exc}"
-                )
+        for data_type, payload in (raw_snapshot or {}).items():
+            value_kind = str((payload or {}).get("value_kind") or "date").strip().lower()
+            raw_latest = (payload or {}).get("latest_date")
+            latest_date = self._normalize_period(raw_latest) if value_kind == "period" else self._normalize_ymd(raw_latest)
+            result[data_type] = {
+                "table": (payload or {}).get("table"),
+                "date_column": (payload or {}).get("date_column"),
+                "value_kind": value_kind,
+                "latest_date": latest_date,
+                "rows_on_latest": self._safe_int((payload or {}).get("rows_on_latest"), 0),
+            }
         return result
 
     @staticmethod
