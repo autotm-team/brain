@@ -1,7 +1,7 @@
 # Brain Integration Service Dockerfile
 # AutoTM三层金融交易系统集成协调服务
 
-FROM python:3.11-slim AS base
+FROM python:3.13-slim AS base
 
 # 设置环境变量
 ENV PYTHONUNBUFFERED=1
