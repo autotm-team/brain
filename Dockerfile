@@ -2,14 +2,35 @@
 # AutoTM三层金融交易系统集成协调服务
 
 FROM python:3.13-slim AS base
+ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
 
 # 设置环境变量
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONPATH=/app
 ENV TZ=Asia/Shanghai
+ENV PIP_INDEX_URL=${PIP_INDEX_URL}
+ENV PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}
 
-# 安装系统依赖（当前无额外系统依赖）
+# 安装系统依赖（Python 3.13 下部分科学计算包会触发源码构建，需编译器）
+RUN set -eux; \
+    if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+      sed -i -E "s|https?://deb.debian.org/debian-security|https://${APT_MIRROR}/debian-security|g; s|https?://deb.debian.org/debian|https://${APT_MIRROR}/debian|g" /etc/apt/sources.list.d/debian.sources; \
+    fi; \
+    if [ -f /etc/apt/sources.list ]; then \
+      sed -i -E "s|https?://deb.debian.org/debian-security|https://${APT_MIRROR}/debian-security|g; s|https?://deb.debian.org/debian|https://${APT_MIRROR}/debian|g" /etc/apt/sources.list; \
+    fi; \
+    export DEBIAN_FRONTEND=noninteractive; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends --fix-missing \
+      build-essential \
+      gcc \
+      g++ \
+      ca-certificates; \
+    apt-get -f install -y; \
+    rm -rf /var/lib/apt/lists/*
 
 # 构建阶段
 FROM base AS builder
