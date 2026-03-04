@@ -68,6 +68,51 @@ class FlowhubAdapter(ISystemAdapter):
 
         logger.info("FlowhubAdapter initialized with HTTP client integration")
 
+    LEGACY_DATA_TYPE_MAP = {
+        "price-index-data": "price_index_data",
+        "money-supply-data": "money_supply_data",
+        "interest-rate-data": "interest_rate_data",
+        "stock-index-data": "stock_index_data",
+        "market-flow-data": "market_flow_data",
+        "social-financing-data": "social_financing_data",
+        "investment-data": "investment_data",
+        "industrial-data": "industrial_data",
+        "sentiment-index-data": "sentiment_index_data",
+        "inventory-cycle-data": "inventory_cycle_data",
+        "commodity-price-data": "commodity_price_data",
+        "gdp-data": "gdp_data",
+        "innovation-data": "innovation_data",
+        "demographic-data": "demographic_data",
+        "batch-stock-data": "batch_daily_ohlc",
+        "batch-basic-data": "batch_daily_basic",
+        "index-info": "index_info",
+        "index-daily-data": "index_daily_data",
+        "industry-board": "industry_board",
+        "concept-board": "concept_board",
+        "adj-factors": "adj_factors",
+    }
+
+    async def _ensure_http_client(self) -> HttpClient:
+        if not self._http_client:
+            self._http_client = HttpClient('flowhub', self.config)
+        await self._http_client.start()
+        return self._http_client
+
+    @staticmethod
+    def _unwrap_data(payload: Any) -> Any:
+        if isinstance(payload, dict) and isinstance(payload.get("data"), dict):
+            return payload.get("data")
+        return payload
+
+    @classmethod
+    def _normalize_data_type(cls, token: str) -> str:
+        raw = (token or "").strip()
+        if not raw:
+            return raw
+        if raw in cls.LEGACY_DATA_TYPE_MAP:
+            return cls.LEGACY_DATA_TYPE_MAP[raw]
+        return raw.replace("-", "_")
+
     async def list_tasks(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
         raise AdapterException("FlowhubAdapter", "Flowhub task schedules were removed; use brain /api/v1/schedules")
 
@@ -178,19 +223,20 @@ class FlowhubAdapter(ISystemAdapter):
             Dict[str, Any]: 任务创建结果
         """
         try:
-            if not self._is_connected:
-                raise AdapterException("FlowhubAdapter", "Not connected to Flowhub service")
+            await self._ensure_http_client()
 
             # 映射请求格式
             flowhub_request = self._request_mapper.map_batch_stock_data_request(request)
+            flowhub_request['data_type'] = 'batch_daily_ohlc'
 
             logger.info(f"Creating batch stock data job with request: {flowhub_request}")
 
-            # 发送HTTP请求（不以'/'开头以便自动拼接API前缀 /api/v1/jobs）
-            response = await self._http_client.post('batch-stock-data', data=flowhub_request)
+            # 发送统一任务创建请求
+            response = await self._http_client.post('/api/v1/jobs', data=flowhub_request)
+            response_data = self._unwrap_data(response) if isinstance(response, dict) else {}
 
             # 映射响应格式
-            mapped_response = self._request_mapper.map_job_response(response, 'batch_stock_data')
+            mapped_response = self._request_mapper.map_job_response(response_data or {}, 'batch_stock_data')
 
             # 更新统计
             self._request_statistics['total_requests'] += 1
@@ -215,19 +261,20 @@ class FlowhubAdapter(ISystemAdapter):
             Dict[str, Any]: 任务创建结果
         """
         try:
-            if not self._is_connected:
-                raise AdapterException("FlowhubAdapter", "Not connected to Flowhub service")
+            await self._ensure_http_client()
 
             # 映射请求格式
             flowhub_request = self._request_mapper.map_batch_basic_data_request(request)
+            flowhub_request['data_type'] = 'batch_daily_basic'
 
             logger.info(f"Creating batch basic data job with request: {flowhub_request}")
 
-            # 发送HTTP请求（不以'/'开头以便自动拼接API前缀 /api/v1/jobs）
-            response = await self._http_client.post('batch-basic-data', data=flowhub_request)
+            # 发送统一任务创建请求
+            response = await self._http_client.post('/api/v1/jobs', data=flowhub_request)
+            response_data = self._unwrap_data(response) if isinstance(response, dict) else {}
 
             # 映射响应格式
-            mapped_response = self._request_mapper.map_job_response(response, 'batch_basic_data')
+            mapped_response = self._request_mapper.map_job_response(response_data or {}, 'batch_basic_data')
 
             # 更新统计
             self._request_statistics['total_requests'] += 1
@@ -252,16 +299,16 @@ class FlowhubAdapter(ISystemAdapter):
             Dict[str, Any]: 任务状态信息
         """
         try:
-            if not self._is_connected:
-                raise AdapterException("FlowhubAdapter", "Not connected to Flowhub service")
+            await self._ensure_http_client()
 
             logger.debug(f"Getting status for job: {job_id}")
 
-            # 发送HTTP请求
-            response = await self._http_client.get(f'{job_id}/status')
+            # 统一接口：GET /api/v1/jobs/{job_id}
+            response = await self._http_client.get(f'/api/v1/jobs/{job_id}')
+            response_data = self._unwrap_data(response) if isinstance(response, dict) else {}
 
             # 映射响应格式
-            mapped_response = self._request_mapper.map_status_response(response)
+            mapped_response = self._request_mapper.map_status_response(response_data or {})
 
             # 缓存状态
             self._job_status_cache[job_id] = mapped_response
@@ -283,16 +330,16 @@ class FlowhubAdapter(ISystemAdapter):
             Dict[str, Any]: 任务执行结果
         """
         try:
-            if not self._is_connected:
-                raise AdapterException("FlowhubAdapter", "Not connected to Flowhub service")
+            await self._ensure_http_client()
 
             logger.debug(f"Getting result for job: {job_id}")
 
-            # 发送HTTP请求
-            response = await self._http_client.get(f'{job_id}/result')
+            # 统一接口下结果字段从任务详情读取
+            response = await self._http_client.get(f'/api/v1/jobs/{job_id}')
+            response_data = self._unwrap_data(response) if isinstance(response, dict) else {}
 
             # 映射响应格式
-            mapped_response = self._request_mapper.map_result_response(response)
+            mapped_response = self._request_mapper.map_result_response(response_data or {})
 
             logger.info(f"Job {job_id} result retrieved successfully")
             return mapped_response
@@ -304,8 +351,7 @@ class FlowhubAdapter(ISystemAdapter):
     async def list_jobs(self, status: str = None, limit: int = 20, offset: int = 0) -> List[Dict[str, Any]]:
         """获取任务列表"""
         try:
-            if not self._is_connected:
-                raise AdapterException("FlowhubAdapter", "Not connected to Flowhub service")
+            await self._ensure_http_client()
 
             params = {'limit': limit, 'offset': offset}
             if status:
@@ -421,13 +467,12 @@ class FlowhubAdapter(ISystemAdapter):
             bool: 取消是否成功
         """
         try:
-            if not self._is_connected:
-                raise AdapterException("FlowhubAdapter", "Not connected to Flowhub service")
+            await self._ensure_http_client()
 
             logger.info(f"Cancelling job: {job_id}")
 
-            # 发送DELETE请求取消任务
-            await self._http_client.delete(f'{job_id}')
+            # 统一接口：POST /api/v1/jobs/{job_id}/cancel
+            await self._http_client.post(f'/api/v1/jobs/{job_id}/cancel', data={})
 
             # 从缓存中移除
             self._job_status_cache.pop(job_id, None)
@@ -502,15 +547,28 @@ class FlowhubAdapter(ISystemAdapter):
         Returns:
             Any: 响应数据
         """
-        if not self._http_client:
-            raise AdapterException("FlowhubAdapter", "HTTP client not initialized")
+        await self._ensure_http_client()
         method = str(request.get('method', 'GET')).upper()
         endpoint = request.get('endpoint') or request.get('path') or '/'
         payload = request.get('payload') or request.get('data') or request.get('json')
+        endpoint = str(endpoint)
+
+        # 兼容历史 typed endpoint：POST /api/v1/jobs/<legacy-data-type> -> POST /api/v1/jobs
+        if method == 'POST' and endpoint.startswith('/api/v1/jobs/') and endpoint.count('/') == 4:
+            suffix = endpoint.rsplit('/', 1)[-1]
+            data_type = self._normalize_data_type(suffix)
+            normalized_payload = dict(payload or {})
+            normalized_payload.setdefault('data_type', data_type)
+            resp = await self._http_client.post('/api/v1/jobs', data=normalized_payload)
+            data = self._unwrap_data(resp)
+            return data if isinstance(data, dict) else resp
+
         if method == 'GET':
             return await self._http_client.get(endpoint, params=payload)
         if method == 'POST':
-            return await self._http_client.post(endpoint, data=payload)
+            resp = await self._http_client.post(endpoint, data=payload)
+            data = self._unwrap_data(resp)
+            return data if isinstance(data, dict) else resp
         if method == 'PUT':
             return await self._http_client.put(endpoint, data=payload)
         if method == 'DELETE':
@@ -733,9 +791,11 @@ class FlowhubAdapter(ISystemAdapter):
             Dict[str, Any]: 任务创建结果
         """
         try:
+            await self._ensure_http_client()
             # 构建请求参数 - 只包含 incremental 标志
             params = {
-                'incremental': incremental
+                'incremental': incremental,
+                'data_type': self._normalize_data_type(data_type),
             }
 
             # 不再传递任何日期范围参数（start_date, end_date, start_quarter, end_quarter,
@@ -756,16 +816,16 @@ class FlowhubAdapter(ISystemAdapter):
             if 'indicators' in kwargs:
                 params['indicators'] = kwargs['indicators']
 
-            # 发送请求
-            endpoint = f'/api/v1/jobs/{data_type}'
-            response = await self._http_client.post(endpoint, data=params)
+            # 发送统一任务创建请求
+            response = await self._http_client.post('/api/v1/jobs', data=params)
+            response_data = self._unwrap_data(response) if isinstance(response, dict) else {}
 
             # 更新统计信息
             self._request_statistics['total_requests'] += 1
             self._request_statistics['successful_requests'] += 1
 
-            logger.info(f"Macro data job created for {data_type}: {response.get('job_id')}")
-            return response
+            logger.info(f"Macro data job created for {data_type}: {(response_data or {}).get('job_id')}")
+            return response_data if isinstance(response_data, dict) else {}
 
         except Exception as e:
             self._request_statistics['total_requests'] += 1
