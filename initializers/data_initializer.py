@@ -228,35 +228,45 @@ class DataInitializationCoordinator:
             # 1. 股票基础信息（由 flowhub 根据自身逻辑选择全量/增量）
             req_basic = {"incremental": True}
             resp_basic = await adapter.send_request({
-                "method": "POST", "endpoint": "/api/v1/jobs/batch-basic-data", "payload": req_basic
+                "method": "POST",
+                "endpoint": "/api/v1/jobs",
+                "payload": {**req_basic, "data_type": "batch_daily_basic"},
             })
             jobs.append(resp_basic.get("job_id", ""))
 
             # 2. 指数基础信息初始化
             req_index_info = {"update_mode": "incremental"}
             resp_index_info = await adapter.send_request({
-                "method": "POST", "endpoint": "/api/v1/jobs/index-info", "payload": req_index_info
+                "method": "POST",
+                "endpoint": "/api/v1/jobs",
+                "payload": {**req_index_info, "data_type": "index_info"},
             })
             jobs.append(resp_index_info.get("job_id", ""))
 
             # 3. 指数日线数据初始化（获取近1年历史数据）
             req_index_daily = {"update_mode": "incremental"}
             resp_index_daily = await adapter.send_request({
-                "method": "POST", "endpoint": "/api/v1/jobs/index-daily-data", "payload": req_index_daily
+                "method": "POST",
+                "endpoint": "/api/v1/jobs",
+                "payload": {**req_index_daily, "data_type": "index_daily_data"},
             })
             jobs.append(resp_index_daily.get("job_id", ""))
 
             # 4. 行业板块数据初始化
             req_industry_board = {"source": "ths", "update_mode": "full_update"}
             resp_industry_board = await adapter.send_request({
-                "method": "POST", "endpoint": "/api/v1/jobs/industry-board", "payload": req_industry_board
+                "method": "POST",
+                "endpoint": "/api/v1/jobs",
+                "payload": {**req_industry_board, "data_type": "industry_board"},
             })
             jobs.append(resp_industry_board.get("job_id", ""))
 
             # 5. 概念板块数据初始化
             req_concept_board = {"source": "ths", "update_mode": "full_update"}
             resp_concept_board = await adapter.send_request({
-                "method": "POST", "endpoint": "/api/v1/jobs/concept-board", "payload": req_concept_board
+                "method": "POST",
+                "endpoint": "/api/v1/jobs",
+                "payload": {**req_concept_board, "data_type": "concept_board"},
             })
             jobs.append(resp_concept_board.get("job_id", ""))
 
@@ -289,13 +299,13 @@ class DataInitializationCoordinator:
             # 核心宏观（月度+日度）：价格指数、货币供应、利率、股指、资金流、商品价格
             # 注意：exchange-rate-data 目前未在 flowhub 路由中实现，先移除避免 405
             tasks = [
-                _create("price-index-data"),
-                _create("money-supply-data"),
-                _create("interest-rate-data"),
-                _create("stock-index-data"),
+                _create("price_index_data"),
+                _create("money_supply_data"),
+                _create("interest_rate_data"),
+                _create("stock_index_data"),
                 # 市场资金流数据：明确指定所有类型（MARGIN, NORTHBOUND, TURNOVER）
-                _create("market-flow-data", flow_types=["MARGIN", "NORTHBOUND", "TURNOVER"]),
-                _create("commodity-price-data"),
+                _create("market_flow_data", flow_types=["MARGIN", "NORTHBOUND", "TURNOVER"]),
+                _create("commodity_price_data"),
             ]
             await asyncio.gather(*tasks)
             return jobs
@@ -308,7 +318,7 @@ class DataInitializationCoordinator:
         await adapter.connect_to_system()
         try:
             # 股票日K（增量/全量由 flowhub 决定）
-            # 这里调用 batch-stock-data 类型任务（由 FlowhubAdapter 提供）
+            # 统一任务接口：POST /api/v1/jobs + data_type=batch_daily_ohlc
             req = {"incremental": True}
             resp = await adapter.create_batch_stock_data_job(req)
             jobs.append(resp.get("job_id", ""))
@@ -336,17 +346,16 @@ class DataInitializationCoordinator:
                     jobs.append(resp.get("job_id", ""))
             # 其他宏观：社融、投资、工业、情绪、库存周期、GDP、创新、人口
             tasks = [
-                _create("social-financing-data"),
-                _create("investment-data"),
-                _create("industrial-data"),
-                _create("sentiment-index-data"),
-                _create("inventory-cycle-data"),
-                _create("gdp-data"),
-                _create("innovation-data"),
-                _create("demographic-data"),
+                _create("social_financing_data"),
+                _create("investment_data"),
+                _create("industrial_data"),
+                _create("sentiment_index_data"),
+                _create("inventory_cycle_data"),
+                _create("gdp_data"),
+                _create("innovation_data"),
+                _create("demographic_data"),
             ]
             await asyncio.gather(*tasks)
             return jobs
         finally:
             await adapter.disconnect_from_system()
-

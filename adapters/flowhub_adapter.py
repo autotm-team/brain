@@ -68,30 +68,6 @@ class FlowhubAdapter(ISystemAdapter):
 
         logger.info("FlowhubAdapter initialized with HTTP client integration")
 
-    LEGACY_DATA_TYPE_MAP = {
-        "price-index-data": "price_index_data",
-        "money-supply-data": "money_supply_data",
-        "interest-rate-data": "interest_rate_data",
-        "stock-index-data": "stock_index_data",
-        "market-flow-data": "market_flow_data",
-        "social-financing-data": "social_financing_data",
-        "investment-data": "investment_data",
-        "industrial-data": "industrial_data",
-        "sentiment-index-data": "sentiment_index_data",
-        "inventory-cycle-data": "inventory_cycle_data",
-        "commodity-price-data": "commodity_price_data",
-        "gdp-data": "gdp_data",
-        "innovation-data": "innovation_data",
-        "demographic-data": "demographic_data",
-        "batch-stock-data": "batch_daily_ohlc",
-        "batch-basic-data": "batch_daily_basic",
-        "index-info": "index_info",
-        "index-daily-data": "index_daily_data",
-        "industry-board": "industry_board",
-        "concept-board": "concept_board",
-        "adj-factors": "adj_factors",
-    }
-
     async def _ensure_http_client(self) -> HttpClient:
         if not self._http_client:
             self._http_client = HttpClient('flowhub', self.config)
@@ -109,9 +85,9 @@ class FlowhubAdapter(ISystemAdapter):
         raw = (token or "").strip()
         if not raw:
             return raw
-        if raw in cls.LEGACY_DATA_TYPE_MAP:
-            return cls.LEGACY_DATA_TYPE_MAP[raw]
-        return raw.replace("-", "_")
+        if "-" in raw:
+            raise AdapterException("FlowhubAdapter", f"Legacy job_type/data_type is not allowed: {raw}")
+        return raw
 
     async def list_tasks(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
         raise AdapterException("FlowhubAdapter", "Flowhub task schedules were removed; use brain /api/v1/schedules")
@@ -553,16 +529,6 @@ class FlowhubAdapter(ISystemAdapter):
         payload = request.get('payload') or request.get('data') or request.get('json')
         endpoint = str(endpoint)
 
-        # 兼容历史 typed endpoint：POST /api/v1/jobs/<legacy-data-type> -> POST /api/v1/jobs
-        if method == 'POST' and endpoint.startswith('/api/v1/jobs/') and endpoint.count('/') == 4:
-            suffix = endpoint.rsplit('/', 1)[-1]
-            data_type = self._normalize_data_type(suffix)
-            normalized_payload = dict(payload or {})
-            normalized_payload.setdefault('data_type', data_type)
-            resp = await self._http_client.post('/api/v1/jobs', data=normalized_payload)
-            data = self._unwrap_data(resp)
-            return data if isinstance(data, dict) else resp
-
         if method == 'GET':
             return await self._http_client.get(endpoint, params=payload)
         if method == 'POST':
@@ -627,25 +593,20 @@ class FlowhubAdapter(ISystemAdapter):
             if 'trade_date' in kwargs:
                 params['trade_date'] = kwargs['trade_date']
 
-            # 根据数据类型确定端点
-            endpoint_map = {
-                'adj_factors': '/api/v1/jobs/adj-factors',
-                'index_components': '/api/v1/jobs/index-components'
-            }
-
-            endpoint = endpoint_map.get(data_type)
-            if not endpoint:
+            normalized_type = self._normalize_data_type(data_type)
+            if normalized_type not in {'adj_factors', 'index_components'}:
                 raise ValueError(f"Unsupported portfolio data type: {data_type}")
 
-            # 发送请求
-            response = await self._http_client.post(endpoint, data=params)
+            await self._ensure_http_client()
+            response = await self._http_client.post('/api/v1/jobs', data={**params, 'data_type': normalized_type})
+            response_data = self._unwrap_data(response) if isinstance(response, dict) else {}
 
             # 更新统计信息
             self._request_statistics['total_requests'] += 1
             self._request_statistics['successful_requests'] += 1
 
-            logger.info(f"Portfolio data job created for {data_type}: {response.get('job_id')}")
-            return response
+            logger.info(f"Portfolio data job created for {data_type}: {(response_data or {}).get('job_id')}")
+            return response_data if isinstance(response_data, dict) else {}
 
         except Exception as e:
             self._request_statistics['total_requests'] += 1
@@ -687,15 +648,16 @@ class FlowhubAdapter(ISystemAdapter):
                 params['end_date'] = end_date
 
             # 发送请求
-            endpoint = '/api/v1/jobs/index-daily-data'
-            response = await self._http_client.post(endpoint, data=params)
+            await self._ensure_http_client()
+            response = await self._http_client.post('/api/v1/jobs', data={**params, 'data_type': 'index_daily_data'})
+            response_data = self._unwrap_data(response) if isinstance(response, dict) else {}
 
             # 更新统计信息
             self._request_statistics['total_requests'] += 1
             self._request_statistics['successful_requests'] += 1
 
-            logger.info(f"Index daily data job created: {response.get('job_id')}")
-            return response
+            logger.info(f"Index daily data job created: {(response_data or {}).get('job_id')}")
+            return response_data if isinstance(response_data, dict) else {}
 
         except Exception as e:
             self._request_statistics['total_requests'] += 1
@@ -722,15 +684,16 @@ class FlowhubAdapter(ISystemAdapter):
             }
 
             # 发送请求
-            endpoint = '/api/v1/jobs/industry-board'
-            response = await self._http_client.post(endpoint, data=params)
+            await self._ensure_http_client()
+            response = await self._http_client.post('/api/v1/jobs', data={**params, 'data_type': 'industry_board'})
+            response_data = self._unwrap_data(response) if isinstance(response, dict) else {}
 
             # 更新统计信息
             self._request_statistics['total_requests'] += 1
             self._request_statistics['successful_requests'] += 1
 
-            logger.info(f"Industry board job created: {response.get('job_id')}")
-            return response
+            logger.info(f"Industry board job created: {(response_data or {}).get('job_id')}")
+            return response_data if isinstance(response_data, dict) else {}
 
         except Exception as e:
             self._request_statistics['total_requests'] += 1
@@ -757,15 +720,16 @@ class FlowhubAdapter(ISystemAdapter):
             }
 
             # 发送请求
-            endpoint = '/api/v1/jobs/concept-board'
-            response = await self._http_client.post(endpoint, data=params)
+            await self._ensure_http_client()
+            response = await self._http_client.post('/api/v1/jobs', data={**params, 'data_type': 'concept_board'})
+            response_data = self._unwrap_data(response) if isinstance(response, dict) else {}
 
             # 更新统计信息
             self._request_statistics['total_requests'] += 1
             self._request_statistics['successful_requests'] += 1
 
-            logger.info(f"Concept board job created: {response.get('job_id')}")
-            return response
+            logger.info(f"Concept board job created: {(response_data or {}).get('job_id')}")
+            return response_data if isinstance(response_data, dict) else {}
 
         except Exception as e:
             self._request_statistics['total_requests'] += 1
@@ -783,7 +747,7 @@ class FlowhubAdapter(ISystemAdapter):
         - 数据库有数据时：从最新日期+1开始增量抓取
 
         Args:
-            data_type: 数据类型 (e.g. 'gdp-data', 'price-index-data')
+            data_type: 数据类型 (e.g. 'gdp_data', 'price_index_data')
             incremental: 是否增量更新（默认 True）
             **kwargs: 数据类型特定参数（如 index_types, rate_types 等）
 

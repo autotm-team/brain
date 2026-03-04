@@ -2256,15 +2256,28 @@ class UIBffHandler(BaseHandler):
         except Exception as exc:
             self.logger.warning(f"list pipelines for data overview failed: {exc}")
         try:
-            payload = await self._fetch_upstream_json(
-                request,
-                "flowhub",
-                "/api/v1/jobs/recent-logs",
-                params={"limit": 50, "offset": 0},
-            )
-            recent_logs = self._unwrap_response_data(payload).get("logs", [])
+            recent_logs = []
+            for job in sorted(
+                [item for item in jobs if isinstance(item, dict)],
+                key=lambda x: self._to_datetime(x.get("updated_at") or x.get("created_at")) or datetime.min,
+                reverse=True,
+            )[:50]:
+                status = str(job.get("status") or "queued").lower()
+                level = "error" if status == "failed" else "info"
+                metadata = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+                recent_logs.append(
+                    {
+                        "id": job.get("id"),
+                        "job_id": job.get("id"),
+                        "timestamp": job.get("updated_at") or job.get("created_at"),
+                        "task_name": metadata.get("schedule_id") or job.get("job_type"),
+                        "level": level,
+                        "message": str(job.get("message") or status),
+                        "status": status,
+                    }
+                )
         except Exception as exc:
-            self.logger.warning(f"list recent logs for data overview failed: {exc}")
+            self.logger.warning(f"build recent logs for data overview failed: {exc}")
 
         source_total = len(sources)
         source_online = sum(1 for item in sources if str(item.get("status", "")).lower() == "online")
@@ -2488,13 +2501,29 @@ class UIBffHandler(BaseHandler):
     async def _handle_system_data_logs(self, request: web.Request) -> web.Response:
         limit = min(100, max(1, self._safe_int(request.query.get("limit"), 100)))
         offset = max(0, self._safe_int(request.query.get("offset"), 0))
-        payload = await self._fetch_upstream_json(
-            request,
-            "flowhub",
-            "/api/v1/jobs/recent-logs",
-            params={"limit": limit, "offset": offset},
-        )
-        return self.success_response(self._unwrap_response_data(payload))
+        orchestrator = self.get_app_component(request, "task_orchestrator")
+        listing = await orchestrator.list_task_jobs(service="flowhub", limit=500, offset=0)
+        jobs = [item for item in (listing.get("jobs") or []) if isinstance(item, dict)]
+        jobs = self._sort_by_time_desc(jobs, "updated_at", "created_at")
+
+        logs: list[Dict[str, Any]] = []
+        for job in jobs:
+            status = str(job.get("status") or "queued").lower()
+            metadata = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+            logs.append(
+                {
+                    "id": job.get("id"),
+                    "job_id": job.get("id"),
+                    "timestamp": job.get("updated_at") or job.get("created_at"),
+                    "task_name": metadata.get("schedule_id") or job.get("job_type"),
+                    "level": "error" if status == "failed" else "info",
+                    "message": str(job.get("message") or status),
+                    "status": status,
+                }
+            )
+
+        total = len(logs)
+        return self.success_response({"logs": logs[offset: offset + limit], "total": total, "limit": limit, "offset": offset})
 
     async def _handle_system_data_backfill_run(self, request: web.Request, run_id: str) -> web.Response:
         payload = await self._fetch_upstream_json(
