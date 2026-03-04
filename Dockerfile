@@ -72,7 +72,6 @@ COPY --from=builder /app/managers/ ./managers/
 COPY --from=builder /app/monitors/ ./monitors/
 COPY --from=builder /app/routers/ ./routers/
 COPY --from=builder /app/routes/ ./routes/
-COPY --from=builder /app/scheduler/ ./scheduler/
 COPY --from=builder /app/validators/ ./validators/
 COPY --from=builder /app/initializers/ ./initializers/
 

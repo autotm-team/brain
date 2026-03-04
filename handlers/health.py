@@ -84,12 +84,11 @@ class HealthHandler(BaseHandler):
                     'status': 'running' if data_flow_manager._is_running else 'stopped'
                 }
             
-            # 检查定时任务调度器
-            if 'scheduler' in app:
-                scheduler = app['scheduler']
-                components_status['scheduler'] = {
-                    'status': 'running' if scheduler._is_running else 'stopped',
-                    'tasks_count': len(scheduler._tasks) if hasattr(scheduler, '_tasks') else 0
+            # 检查统一调度器
+            if 'unified_scheduler' in app:
+                unified_scheduler = app['unified_scheduler']
+                components_status['unified_scheduler'] = {
+                    'status': 'running' if getattr(unified_scheduler, '_running', False) else 'stopped'
                 }
             
             # 检查系统监控器

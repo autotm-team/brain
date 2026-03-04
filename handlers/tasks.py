@@ -142,143 +142,88 @@ class TaskHandler(BaseHandler):
             self.logger.error(f"Get task job history failed: {e}")
             return self.error_response("获取任务历史失败", 500)
 
-    async def get_job_status(self, request: web.Request) -> web.Response:
-        """代理获取任务状态（默认走 Flowhub）"""
+    async def list_task_job_types(self, request: web.Request) -> web.Response:
+        """统一任务类型目录"""
         try:
-            job_id = self.get_path_params(request)['job_id']
-            query_params = self.get_query_params(request)
-            service = (query_params.get('service') or 'flowhub').lower()
-
-            if service == 'flowhub':
-                payload = await self._fetch_service_json(request, 'flowhub', f'/api/v1/jobs/{job_id}/status')
-            elif service == 'brain':
-                scheduler = self.get_app_component(request, 'scheduler')
-                payload = await scheduler.get_task_status(job_id)
-            elif service in ('execution', 'macro', 'portfolio'):
-                payload = await self._fetch_service_json(request, service, f'/api/v1/jobs/{job_id}')
-            else:
-                return self.error_response(f"Unsupported service: {service}", 400)
-
+            orchestrator = self.get_app_component(request, 'task_orchestrator')
+            payload = await orchestrator.list_task_job_types()
             return self.success_response(payload)
         except Exception as e:
-            self.logger.error(f"Get job status failed: {e}")
-            return self.error_response("获取任务状态失败", 500)
-    
-    async def list_tasks(self, request: web.Request) -> web.Response:
-        """获取任务列表"""
-        try:
-            scheduler = self.get_app_component(request, 'scheduler')
-            tasks = await scheduler.get_all_tasks()
-            return self.success_response(tasks)
-        except Exception as e:
-            self.logger.error(f"List tasks failed: {e}")
-            return self.error_response("获取任务列表失败", 500)
-    
-    async def create_task(self, request: web.Request) -> web.Response:
-        """创建定时任务"""
-        try:
-            # 强制要求 JSON 请求
-            ct = request.headers.get('Content-Type', '')
-            if 'application/json' not in ct:
-                return self.error_response("Content-Type must be application/json", 415, error_code="UNSUPPORTED_MEDIA_TYPE")
+            self.logger.error(f"List task job types failed: {e}")
+            return self.error_response("获取任务类型失败", 500)
 
-            try:
-                data = await self.get_request_json(request)
-            except web.HTTPBadRequest:
-                return self.error_response("Invalid JSON format", 400, error_code="INVALID_JSON")
-
-            if not isinstance(data, dict) or not data:
-                return self.error_response("Invalid or empty JSON body", 400, error_code="INVALID_JSON")
-
-            # 基本字段校验
-            error = self.validate_required_fields(data, ['name', 'cron', 'function'])
-            if error:
-                return self.error_response(error, 400, error_code="MISSING_FIELDS")
-
-            # 类型与取值校验
-            if not isinstance(data.get('name'), str) or not data['name'].strip():
-                return self.error_response("'name' must be a non-empty string", 400, error_code="INVALID_NAME")
-            if not isinstance(data.get('cron'), str) or not data['cron'].strip():
-                return self.error_response("'cron' must be a non-empty string (e.g. 'every:1m', 'at:02:00')", 400, error_code="INVALID_CRON")
-            if not isinstance(data.get('function'), str) or not data['function'].strip():
-                return self.error_response("'function' must be a non-empty string", 400, error_code="INVALID_FUNCTION")
-
-            scheduler = self.get_app_component(request, 'scheduler')
-            task = await scheduler.create_task(data)
-            return self.success_response(task, "任务创建成功")
-        except web.HTTPException:
-            raise
-        except Exception as e:
-            self.logger.error(f"Create task failed: {e}")
-            return self.error_response("创建任务失败", 500)
-
-    async def get_task(self, request: web.Request) -> web.Response:
-        """获取任务详情"""
+    async def list_schedules(self, request: web.Request) -> web.Response:
         try:
-            task_id = self.get_path_params(request)['task_id']
-            scheduler = self.get_app_component(request, 'scheduler')
-            task = await scheduler.get_task(task_id)
-            return self.success_response(task)
-        except Exception as e:
-            self.logger.error(f"Get task failed: {e}")
-            return self.error_response("获取任务详情失败", 500)
-    
-    async def update_task(self, request: web.Request) -> web.Response:
-        """更新任务"""
-        try:
-            task_id = self.get_path_params(request)['task_id']
-            data = await self.get_request_json(request)
-            scheduler = self.get_app_component(request, 'scheduler')
-            task = await scheduler.update_task(task_id, data)
-            return self.success_response(task, "任务更新成功")
-        except Exception as e:
-            self.logger.error(f"Update task failed: {e}")
-            return self.error_response("更新任务失败", 500)
-    
-    async def delete_task(self, request: web.Request) -> web.Response:
-        """删除任务"""
-        try:
-            task_id = self.get_path_params(request)['task_id']
-            scheduler = self.get_app_component(request, 'scheduler')
-            await scheduler.delete_task(task_id)
-            return self.success_response(None, "任务删除成功")
-        except Exception as e:
-            self.logger.error(f"Delete task failed: {e}")
-            return self.error_response("删除任务失败", 500)
-    
-    async def trigger_task(self, request: web.Request) -> web.Response:
-        """手动触发任务"""
-        try:
-            task_id = self.get_path_params(request)['task_id']
-            scheduler = self.get_app_component(request, 'scheduler')
-            result = await scheduler.trigger_task(task_id)
-            return self.success_response(result, "任务触发成功")
-        except Exception as e:
-            self.logger.error(f"Trigger task failed: {e}")
-            return self.error_response("触发任务失败", 500)
-    
-    async def toggle_task(self, request: web.Request) -> web.Response:
-        """启用/禁用任务"""
-        try:
-            task_id = self.get_path_params(request)['task_id']
-            scheduler = self.get_app_component(request, 'scheduler')
-            result = await scheduler.toggle_task(task_id)
-            return self.success_response(result, "任务状态切换成功")
-        except Exception as e:
-            self.logger.error(f"Toggle task failed: {e}")
-            return self.error_response("切换任务状态失败", 500)
-    
-    async def get_task_history(self, request: web.Request) -> web.Response:
-        """获取任务执行历史"""
-        try:
-            task_id = self.get_path_params(request)['task_id']
             query_params = self.get_query_params(request)
-            scheduler = self.get_app_component(request, 'scheduler')
-            history = await scheduler.get_task_history(task_id, query_params)
-            return self.success_response(history)
+            service = query_params.get("service")
+            limit = int(query_params.get("limit", 20))
+            offset = int(query_params.get("offset", 0))
+            orchestrator = self.get_app_component(request, "task_orchestrator")
+            payload = await orchestrator.list_schedules(service=service, limit=limit, offset=offset)
+            return self.success_response(payload)
+        except ValueError as exc:
+            return self.error_response(str(exc), 400)
         except Exception as e:
-            self.logger.error(f"Get task history failed: {e}")
-            return self.error_response("获取任务历史失败", 500)
+            self.logger.error(f"List schedules failed: {e}")
+            return self.error_response("获取调度列表失败", 500)
+
+    async def create_schedule(self, request: web.Request) -> web.Response:
+        try:
+            payload = await self.get_request_json(request)
+            orchestrator = self.get_app_component(request, "task_orchestrator")
+            schedule = await orchestrator.create_schedule(payload)
+            return web.json_response(
+                {"success": True, "status": "accepted", "message": "调度创建成功", "data": schedule},
+                status=202,
+            )
+        except ValueError as exc:
+            return self.error_response(str(exc), 400)
+        except Exception as e:
+            self.logger.error(f"Create schedule failed: {e}")
+            return self.error_response("创建调度失败", 500)
+
+    async def patch_schedule(self, request: web.Request) -> web.Response:
+        try:
+            schedule_id = self.get_path_params(request)['schedule_id']
+            orchestrator = self.get_app_component(request, "task_orchestrator")
+            data = await self.get_request_json(request)
+            schedule = await orchestrator.patch_schedule(schedule_id, data)
+            return self.success_response(schedule, "调度更新成功")
+        except ValueError as exc:
+            message = str(exc)
+            if message == "Schedule not found":
+                return self.error_response(message, 404, error_code="SCHEDULE_NOT_FOUND")
+            return self.error_response(message, 400)
+        except Exception as e:
+            self.logger.error(f"Patch schedule failed: {e}")
+            return self.error_response("更新调度失败", 500)
+
+    async def delete_schedule(self, request: web.Request) -> web.Response:
+        try:
+            schedule_id = self.get_path_params(request)['schedule_id']
+            orchestrator = self.get_app_component(request, "task_orchestrator")
+            ok = await orchestrator.delete_schedule(schedule_id)
+            if not ok:
+                return self.error_response("Schedule not found", 404, error_code="SCHEDULE_NOT_FOUND")
+            return self.success_response({"schedule_id": schedule_id, "deleted": True}, "调度删除成功")
+        except Exception as e:
+            self.logger.error(f"Delete schedule failed: {e}")
+            return self.error_response("删除调度失败", 500)
+
+    async def trigger_schedule(self, request: web.Request) -> web.Response:
+        try:
+            schedule_id = self.get_path_params(request)['schedule_id']
+            orchestrator = self.get_app_component(request, "task_orchestrator")
+            result = await orchestrator.trigger_schedule(schedule_id)
+            return self.success_response(result, "调度触发成功")
+        except ValueError as exc:
+            message = str(exc)
+            if message == "Schedule not found":
+                return self.error_response(message, 404, error_code="SCHEDULE_NOT_FOUND")
+            return self.error_response(message, 400)
+        except Exception as e:
+            self.logger.error(f"Trigger schedule failed: {e}")
+            return self.error_response("触发调度失败", 500)
 
     async def _fetch_service_json(
         self,

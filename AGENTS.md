@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 - Entry points: `main.py` (runtime) and `app.py` (service app wiring).
-- Core modules live at the repo root: `adapters/`, `coordinators/`, `handlers/`, `managers/`, `monitors/`, `routers/`, `routes/`, `scheduler/`, `utils/`, `validators/`.
+- Core modules live at the repo root: `adapters/`, `coordinators/`, `handlers/`, `managers/`, `monitors/`, `routers/`, `routes/`, `utils/`, `validators/`.
 - Dependency injection and configuration: `container.py`, `config.py`, `interfaces.py`, `models.py`.
 - External dependencies or submodules: `external/` (notably `external/econdb/`).
 - Tests: `tests/` with `tests/unit/` and integration-style tests like `tests/test_*`.

@@ -141,8 +141,8 @@ async def shutdown(runner: web.AppRunner, app: web.Application):
         if 'coordinator' in app:
             await app['coordinator'].stop()
         
-        if 'scheduler' in app:
-            await app['scheduler'].stop()
+        if 'unified_scheduler' in app:
+            await app['unified_scheduler'].stop()
         
         logger.info("Integration Service shutdown complete")
         

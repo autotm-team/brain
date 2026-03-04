@@ -5,9 +5,11 @@
 import asyncio
 import hashlib
 import json
+import time
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+from asyncron import request_envelope
 
 
 class UpstreamServiceError(RuntimeError):
@@ -24,46 +26,7 @@ class UpstreamServiceError(RuntimeError):
 
 class TaskOrchestrator:
     SERVICES = ("flowhub", "execution", "macro", "portfolio")
-    SERVICE_JOB_TYPES = {
-        "macro": {
-            "ui_macro_cycle_freeze",
-            "ui_macro_cycle_mark_seen",
-            "ui_macro_cycle_mark_seen_batch",
-            "ui_macro_cycle_apply_portfolio",
-            "ui_macro_cycle_apply_snapshot",
-            "ui_rotation_policy_freeze",
-            "ui_rotation_policy_apply",
-            "ui_rotation_policy_save",
-        },
-        "execution": {
-            "ui_candidates_history_query",
-            "ui_candidates_promote",
-            "ui_candidates_auto_promote",
-            "ui_candidates_merge",
-            "ui_candidates_ignore",
-            "ui_candidates_mark_read",
-            "ui_candidates_watchlist_update",
-            "ui_candidates_sync_from_analysis",
-            "ui_candidates_backfill_metadata",
-            "ui_research_decision",
-            "ui_research_freeze",
-            "ui_research_compare",
-            "ui_research_archive",
-            "ui_research_unfreeze",
-            "ui_research_replace_helper",
-            "ui_strategy_report_run",
-            "ui_strategy_report_compare",
-            "ui_strategy_config_apply",
-            "ui_strategy_preset_save",
-        },
-        "portfolio": {
-            "ui_sim_order_create",
-            "ui_sim_order_cancel",
-        },
-        # flowhub data_type evolves frequently; validate non-empty here and let flowhub
-        # enforce the exact supported set to avoid brain/service drift.
-        "flowhub": set(),
-    }
+    JOB_TYPES_CACHE_TTL_SECONDS = 60
     JOB_TYPE_ZH_MAP = {
         # Flowhub data jobs
         "daily_ohlc": "个股日线行情(单标的)",
@@ -149,6 +112,7 @@ class TaskOrchestrator:
         self._app = app
         self._brain_jobs: Dict[str, Dict[str, Any]] = {}
         self._history: Dict[str, List[Dict[str, Any]]] = {}
+        self._job_types_cache: Dict[str, Dict[str, Any]] = {}
 
     async def create_task_job(
         self,
@@ -161,7 +125,7 @@ class TaskOrchestrator:
         service = (service or "").lower()
         if service not in self.SERVICES:
             raise ValueError(f"Unsupported service: {service}")
-        self._validate_job_type(service, job_type)
+        await self._validate_job_type(service, job_type)
         normalized_params = self._normalize_params(params)
         normalized_metadata = self._normalize_metadata(metadata)
 
@@ -196,6 +160,221 @@ class TaskOrchestrator:
             upstream_status=202,
         )
         return normalized
+
+    async def list_task_job_types(self) -> Dict[str, Any]:
+        services_payload: Dict[str, Any] = {}
+        merged: Dict[str, Dict[str, Any]] = {}
+        errors: list[Dict[str, Any]] = []
+
+        for svc in self.SERVICES:
+            try:
+                items = await self._fetch_service_job_types(svc, use_cache=False)
+                normalized_items = []
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    job_type = str(item.get("job_type") or "").strip()
+                    if not job_type:
+                        continue
+                    record = {
+                        "service": svc,
+                        "job_type": job_type,
+                    }
+                    normalized_items.append(record)
+                    merged_key = f"{svc}:{job_type}"
+                    merged[merged_key] = record
+                services_payload[svc] = normalized_items
+            except Exception as exc:
+                errors.append({"service": svc, "error": str(exc)})
+                services_payload[svc] = []
+
+        items = sorted(merged.values(), key=lambda x: (x["service"], x["job_type"]))
+        return {
+            "items": items,
+            "total": len(items),
+            "services": services_payload,
+            "errors": errors,
+        }
+
+    async def list_schedules(
+        self,
+        service: Optional[str] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        service_filter = (service or "").strip().lower()
+        if service_filter and service_filter not in self.SERVICES:
+            raise ValueError(f"Unsupported service: {service}")
+
+        scheduler = self._app.get("unified_scheduler")
+        if scheduler is not None:
+            return await scheduler.list_schedules(service=service, limit=limit, offset=offset)
+
+        all_ids = await self._list_schedule_ids()
+        items: list[Dict[str, Any]] = []
+        for schedule_id in all_ids:
+            item = await self._load_schedule(schedule_id)
+            if not isinstance(item, dict):
+                continue
+            if service_filter and item.get("service") != service_filter:
+                continue
+            items.append(item)
+
+        items.sort(
+            key=lambda x: (
+                self._as_timestamp(x.get("updated_at") or x.get("created_at")),
+                str(x.get("id") or ""),
+            ),
+            reverse=True,
+        )
+        total = len(items)
+        page = items[offset : offset + limit]
+        return {"items": page, "total": total, "limit": limit, "offset": offset}
+
+    async def create_schedule(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(payload, dict):
+            raise ValueError("Invalid JSON body")
+        service = str(payload.get("service") or "").strip().lower()
+        job_type = str(payload.get("job_type") or "").strip()
+        trigger = str(payload.get("trigger") or "").strip().lower()
+        params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        enabled = bool(payload.get("enabled", True))
+
+        if service not in self.SERVICES:
+            raise ValueError(f"Unsupported service: {service}")
+        await self._validate_job_type(service, job_type)
+        if trigger not in {"cron", "interval"}:
+            raise ValueError("trigger must be one of: cron, interval")
+        if trigger == "cron":
+            cron = str(payload.get("cron") or "").strip()
+            if not cron:
+                raise ValueError("Missing required field: cron")
+        else:
+            interval_seconds = int(payload.get("interval_seconds") or 0)
+            if interval_seconds <= 0:
+                raise ValueError("interval_seconds must be positive")
+
+        scheduler = self._app.get("unified_scheduler")
+        if scheduler is not None:
+            return await scheduler.create_schedule(
+                {
+                    "service": service,
+                    "job_type": job_type,
+                    "trigger": trigger,
+                    "cron": str(payload.get("cron") or "").strip() if trigger == "cron" else None,
+                    "interval_seconds": int(payload.get("interval_seconds") or 0) if trigger == "interval" else None,
+                    "enabled": enabled,
+                    "params": dict(params),
+                    "metadata": dict(metadata),
+                }
+            )
+
+        schedule_id = str(uuid.uuid4())
+        now = self._utc_now()
+        schedule = {
+            "id": schedule_id,
+            "service": service,
+            "job_type": job_type,
+            "trigger": trigger,
+            "cron": str(payload.get("cron") or "").strip() if trigger == "cron" else None,
+            "interval_seconds": int(payload.get("interval_seconds") or 0) if trigger == "interval" else None,
+            "enabled": enabled,
+            "params": dict(params),
+            "metadata": dict(metadata),
+            "last_triggered_at": None,
+            "last_task_job_id": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+        await self._save_schedule(schedule)
+        return schedule
+
+    async def patch_schedule(self, schedule_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        scheduler = self._app.get("unified_scheduler")
+        if scheduler is not None:
+            return await scheduler.update_schedule(schedule_id, payload)
+
+        current = await self._load_schedule(schedule_id)
+        if not current:
+            raise ValueError("Schedule not found")
+        if not isinstance(payload, dict):
+            raise ValueError("Invalid JSON body")
+
+        merged = dict(current)
+        if "enabled" in payload:
+            merged["enabled"] = bool(payload.get("enabled"))
+        if "params" in payload:
+            if not isinstance(payload.get("params"), dict):
+                raise ValueError("params must be a JSON object")
+            merged["params"] = dict(payload["params"])
+        if "metadata" in payload:
+            if not isinstance(payload.get("metadata"), dict):
+                raise ValueError("metadata must be a JSON object")
+            merged["metadata"] = dict(payload["metadata"])
+        if "cron" in payload:
+            if merged.get("trigger") != "cron":
+                raise ValueError("cron can only be patched when trigger=cron")
+            cron = str(payload.get("cron") or "").strip()
+            if not cron:
+                raise ValueError("cron must be a non-empty string")
+            merged["cron"] = cron
+        if "interval_seconds" in payload:
+            if merged.get("trigger") != "interval":
+                raise ValueError("interval_seconds can only be patched when trigger=interval")
+            interval_seconds = int(payload.get("interval_seconds") or 0)
+            if interval_seconds <= 0:
+                raise ValueError("interval_seconds must be positive")
+            merged["interval_seconds"] = interval_seconds
+
+        merged["updated_at"] = self._utc_now()
+        await self._save_schedule(merged)
+        return merged
+
+    async def delete_schedule(self, schedule_id: str) -> bool:
+        scheduler = self._app.get("unified_scheduler")
+        if scheduler is not None:
+            return await scheduler.delete_schedule(schedule_id)
+
+        current = await self._load_schedule(schedule_id)
+        if not current:
+            return False
+        redis = self._redis()
+        if not redis:
+            self._brain_jobs.pop(f"schedule:{schedule_id}", None)
+            return True
+        await redis.delete(self._schedule_key(schedule_id))
+        await redis.srem(self._schedule_set_key(), schedule_id)
+        return True
+
+    async def trigger_schedule(self, schedule_id: str) -> Dict[str, Any]:
+        scheduler = self._app.get("unified_scheduler")
+        if scheduler is not None:
+            current = await scheduler.get_schedule(schedule_id)
+        else:
+            current = await self._load_schedule(schedule_id)
+        if not current:
+            raise ValueError("Schedule not found")
+        if not current.get("enabled", True):
+            raise ValueError("Schedule is disabled")
+
+        metadata = dict(current.get("metadata") or {})
+        metadata["schedule_id"] = schedule_id
+        created = await self.create_task_job(
+            service=str(current.get("service") or ""),
+            job_type=str(current.get("job_type") or ""),
+            params=dict(current.get("params") or {}),
+            metadata=metadata,
+        )
+        now = self._utc_now()
+        if scheduler is not None:
+            current = await scheduler.mark_triggered(schedule_id, created.get("id"))
+        else:
+            current["last_triggered_at"] = now
+            current["last_task_job_id"] = created.get("id")
+            current["updated_at"] = now
+            await self._save_schedule(current)
+        return {"schedule": current, "job": created}
 
     async def list_task_jobs(
         self,
@@ -330,9 +509,13 @@ class TaskOrchestrator:
     async def cancel_task_job(self, task_job_id: str) -> Dict[str, Any]:
         service, service_job_id, mapped_task_job_id = await self._resolve_task_job_id(task_job_id)
         try:
-            await self._request_service(service, "DELETE", f"/api/v1/jobs/{service_job_id}")
+            await self._request_service(service, "POST", f"/api/v1/jobs/{service_job_id}/cancel")
         except UpstreamServiceError as exc:
-            if exc.status not in {404, 409}:
+            if exc.status in {404, 409}:
+                pass
+            elif exc.status == 405:
+                await self._request_service(service, "DELETE", f"/api/v1/jobs/{service_job_id}")
+            else:
                 raise
         payload = await self._safe_get_service_job(service, service_job_id)
         normalized = self._normalize_job(
@@ -376,12 +559,12 @@ class TaskOrchestrator:
 
         raise ValueError(f"Unknown task_job_id: {task_job_id}")
 
-    def _validate_job_type(self, service: str, job_type: str) -> None:
+    async def _validate_job_type(self, service: str, job_type: str) -> None:
         value = (job_type or "").strip()
         if not value:
             raise ValueError("Missing required field: job_type")
-        allowed = self.SERVICE_JOB_TYPES.get(service, set())
-        if allowed and value not in allowed:
+        allowed = await self._fetch_service_job_type_set(service)
+        if value not in allowed:
             raise ValueError(f"Unsupported job_type for {service}: {job_type}")
 
     @staticmethod
@@ -405,10 +588,10 @@ class TaskOrchestrator:
             flowhub_payload = dict(params)
             flowhub_payload.setdefault("data_type", job_type)
             return flowhub_payload
-        return {
+        return request_envelope({
             "job_type": job_type,
             "params": params,
-        }
+        })
 
     @staticmethod
     def _normalize_upstream_error(payload: Any, status: int) -> Dict[str, Any]:
@@ -485,6 +668,30 @@ class TaskOrchestrator:
                 status=504,
                 error={"status": 504, "message": f"Upstream timeout after {self.UPSTREAM_TIMEOUT_SECONDS}s"},
             )
+
+    async def _fetch_service_job_types(self, service: str, use_cache: bool = True) -> List[Dict[str, Any]]:
+        now = time.time()
+        cache_item = self._job_types_cache.get(service)
+        if use_cache and isinstance(cache_item, dict):
+            cached_at = float(cache_item.get("cached_at") or 0.0)
+            if now - cached_at <= self.JOB_TYPES_CACHE_TTL_SECONDS:
+                items = cache_item.get("items")
+                if isinstance(items, list):
+                    return list(items)
+
+        payload = await self._request_service(service, "GET", "/api/v1/jobs/types")
+        data = payload.get("data") if isinstance(payload, dict) else {}
+        items = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            items = payload.get("items") if isinstance(payload, dict) else []
+        normalized = [item for item in items if isinstance(item, dict) and str(item.get("job_type") or "").strip()]
+        self._job_types_cache[service] = {"cached_at": now, "items": list(normalized)}
+        return normalized
+
+    async def _fetch_service_job_type_set(self, service: str) -> set[str]:
+        items = await self._fetch_service_job_types(service, use_cache=True)
+        values = {str(item.get("job_type") or "").strip() for item in items}
+        return {x for x in values if x}
 
     @staticmethod
     def _extract_data(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -653,15 +860,15 @@ class TaskOrchestrator:
         if not status:
             return "queued"
         value = str(status).strip().lower()
-        if value in {"queued", "pending", "submitted", "accepted", "created", "idle"}:
+        if value in {"queued"}:
             return "queued"
-        if value in {"running", "in_progress", "processing", "partially_filled"}:
+        if value in {"running"}:
             return "running"
-        if value in {"succeeded", "success", "completed", "done"}:
+        if value in {"succeeded"}:
             return "succeeded"
-        if value in {"failed", "error", "timeout"}:
+        if value in {"failed"}:
             return "failed"
-        if value in {"cancelled", "canceled"}:
+        if value in {"cancelled"}:
             return "cancelled"
         return "failed"
 
@@ -833,6 +1040,50 @@ class TaskOrchestrator:
     @staticmethod
     def _history_key(task_job_id: str) -> str:
         return f"brain:task_job:history:{task_job_id}"
+
+    @staticmethod
+    def _schedule_key(schedule_id: str) -> str:
+        return f"asyncron:v2:brain:schedule:{schedule_id}"
+
+    @staticmethod
+    def _schedule_set_key() -> str:
+        return "asyncron:v2:brain:schedules"
+
+    async def _save_schedule(self, schedule: Dict[str, Any]) -> None:
+        schedule_id = str(schedule.get("id") or "")
+        if not schedule_id:
+            return
+        redis = self._redis()
+        if not redis:
+            self._brain_jobs[f"schedule:{schedule_id}"] = dict(schedule)
+            return
+        await redis.set(self._schedule_key(schedule_id), json.dumps(schedule, ensure_ascii=False))
+        await redis.sadd(self._schedule_set_key(), schedule_id)
+
+    async def _load_schedule(self, schedule_id: str) -> Optional[Dict[str, Any]]:
+        redis = self._redis()
+        if not redis:
+            local = self._brain_jobs.get(f"schedule:{schedule_id}")
+            return dict(local) if isinstance(local, dict) else None
+        raw = await redis.get(self._schedule_key(schedule_id))
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    async def _list_schedule_ids(self) -> List[str]:
+        redis = self._redis()
+        if not redis:
+            ids: list[str] = []
+            for key in self._brain_jobs.keys():
+                if key.startswith("schedule:"):
+                    ids.append(key.split("schedule:", 1)[1])
+            return ids
+        values = await redis.smembers(self._schedule_set_key())
+        return [str(v) for v in values if isinstance(v, str) and v]
 
     @staticmethod
     def _utc_now() -> str:

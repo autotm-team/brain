@@ -749,11 +749,11 @@ class UIBffHandler(BaseHandler):
     def _is_active_periodic_pipeline_task(cls, task: Dict[str, Any]) -> bool:
         if not cls._coerce_bool(task.get("enabled")):
             return False
-        schedule_type = str(task.get("schedule_type") or "").strip().lower()
+        schedule_type = str(task.get("schedule_type") or task.get("trigger") or "").strip().lower()
         if schedule_type == "cron":
-            return bool(str(task.get("schedule_value") or "").strip())
+            return bool(str(task.get("schedule_value") or task.get("cron") or "").strip())
         if schedule_type == "interval":
-            return cls._safe_int(task.get("schedule_value"), 0) > 0
+            return cls._safe_int(task.get("schedule_value") or task.get("interval_seconds"), 0) > 0
         return False
 
     async def _list_flowhub_tasks(
@@ -762,40 +762,55 @@ class UIBffHandler(BaseHandler):
         limit: int = 500,
         offset: int = 0,
     ) -> list[Dict[str, Any]]:
-        safe_limit = max(0, self._safe_int(limit, 0))
-        safe_offset = max(0, self._safe_int(offset, 0))
-        if safe_limit <= 0:
-            return []
-
-        page_size = min(100, safe_limit)
-        remaining = safe_limit
-        cursor = safe_offset
-        merged: list[Dict[str, Any]] = []
-        total_hint = 0
-
-        while remaining > 0:
-            fetch_size = min(page_size, remaining)
-            payload = await self._fetch_upstream_json(
-                request,
-                "flowhub",
-                "/api/v1/tasks",
-                params={"limit": fetch_size, "offset": cursor},
+        orchestrator = self.get_app_component(request, "task_orchestrator")
+        payload = await orchestrator.list_schedules(
+            service="flowhub",
+            limit=max(1, self._safe_int(limit, 500)),
+            offset=max(0, self._safe_int(offset, 0)),
+        )
+        items = payload.get("items", []) if isinstance(payload, dict) else []
+        normalized: list[Dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            trigger = str(item.get("trigger") or "").strip().lower()
+            normalized.append(
+                {
+                    "task_id": item.get("id"),
+                    "name": (item.get("metadata") or {}).get("name") if isinstance(item.get("metadata"), dict) else None,
+                    "data_type": item.get("job_type"),
+                    "schedule_type": trigger,
+                    "schedule_value": item.get("cron") if trigger == "cron" else item.get("interval_seconds"),
+                    "enabled": bool(item.get("enabled", True)),
+                    "allow_overlap": False,
+                    "params": item.get("params") if isinstance(item.get("params"), dict) else {},
+                    "updated_at": item.get("updated_at"),
+                    "created_at": item.get("created_at"),
+                    "last_run_at": item.get("last_triggered_at"),
+                    "source": "brain_schedule",
+                }
             )
-            data = self._unwrap_response_data(payload)
-            tasks = data.get("tasks", [])
-            if not isinstance(tasks, list):
-                break
-            page_items = [item for item in tasks if isinstance(item, dict)]
-            merged.extend(page_items)
-            total_hint = max(total_hint, self._safe_int(data.get("total"), 0))
-            fetched = len(page_items)
-            if fetched < fetch_size:
-                break
-            cursor += fetched
-            remaining -= fetched
-            if total_hint > 0 and cursor >= total_hint:
-                break
-        return merged
+        return normalized
+
+    @staticmethod
+    def _pipeline_template_to_schedule(template: Dict[str, Any]) -> Dict[str, Any]:
+        schedule_type = str(template.get("schedule_type") or "cron").strip().lower()
+        schedule_value = template.get("schedule_value")
+        payload: Dict[str, Any] = {
+            "service": "flowhub",
+            "job_type": str(template.get("data_type") or "").strip(),
+            "trigger": schedule_type if schedule_type in {"cron", "interval"} else "cron",
+            "enabled": bool(template.get("enabled", True)),
+            "params": dict(template.get("params") or {}),
+            "metadata": {
+                "name": template.get("name"),
+            },
+        }
+        if payload["trigger"] == "cron":
+            payload["cron"] = str(schedule_value or "").strip() or "30 16 * * 1-5"
+        else:
+            payload["interval_seconds"] = max(1, int(schedule_value or 60))
+        return payload
 
     def _build_macro_cycle_default_templates(self) -> list[Dict[str, Any]]:
         templates: list[Dict[str, Any]] = []
@@ -971,17 +986,11 @@ class UIBffHandler(BaseHandler):
                 if any(self._is_active_periodic_pipeline_task(task) for task in existing_group):
                     continue
                 try:
-                    created_payload = await self._fetch_upstream_json(
-                        request,
-                        "flowhub",
-                        "/api/v1/tasks",
-                        method="POST",
-                        payload=template,
-                    )
-                    created_task = self._unwrap_response_data(created_payload)
+                    orchestrator = self.get_app_component(request, "task_orchestrator")
+                    created_task = await orchestrator.create_schedule(self._pipeline_template_to_schedule(template))
                     if not isinstance(created_task, dict):
                         created_task = {"data_type": data_type, "name": template.get("name")}
-                    task_id = str(created_task.get("task_id") or "").strip()
+                    task_id = str(created_task.get("id") or "").strip()
                     report["created"].append(
                         {
                             "data_type": data_type,
@@ -2089,14 +2098,9 @@ class UIBffHandler(BaseHandler):
         return ""
 
     async def _run_flowhub_pipeline_task(self, request: web.Request, pipeline_task_id: str) -> Dict[str, Any]:
-        payload = await self._fetch_upstream_json(
-            request,
-            "flowhub",
-            f"/api/v1/tasks/{pipeline_task_id}/run",
-            method="POST",
-            payload={},
-        )
-        return self._unwrap_response_data(payload)
+        orchestrator = self.get_app_component(request, "task_orchestrator")
+        payload = await orchestrator.trigger_schedule(pipeline_task_id)
+        return payload if isinstance(payload, dict) else {}
 
     @staticmethod
     def _build_fallback_pipeline_template(data_type: str) -> Dict[str, Any]:
@@ -2120,15 +2124,9 @@ class UIBffHandler(BaseHandler):
         data_type: str,
     ) -> tuple[str, Dict[str, Any], Dict[str, Any]]:
         template = self._find_default_pipeline_template(data_type) or self._build_fallback_pipeline_template(data_type)
-        created_payload = await self._fetch_upstream_json(
-            request,
-            "flowhub",
-            "/api/v1/tasks",
-            method="POST",
-            payload=template,
-        )
-        created_task = self._unwrap_response_data(created_payload)
-        pipeline_task_id = str(created_task.get("task_id") or "").strip() if isinstance(created_task, dict) else ""
+        orchestrator = self.get_app_component(request, "task_orchestrator")
+        created_task = await orchestrator.create_schedule(self._pipeline_template_to_schedule(template))
+        pipeline_task_id = str(created_task.get("id") or "").strip() if isinstance(created_task, dict) else ""
         if not pipeline_task_id:
             raise RuntimeError("Failed to create flowhub pipeline: missing task_id")
         run_payload = await self._run_flowhub_pipeline_task(request, pipeline_task_id)
@@ -2433,61 +2431,59 @@ class UIBffHandler(BaseHandler):
         body = await self.get_request_json(request)
         if not isinstance(body, dict):
             return self.error_response("Request body must be a JSON object", 400)
-        payload = await self._fetch_upstream_json(
-            request,
-            "flowhub",
-            "/api/v1/tasks",
-            method="POST",
-            payload=body,
-        )
-        return self.success_response(self._unwrap_response_data(payload), "Pipeline created")
+        payload = self._pipeline_template_to_schedule(body)
+        orchestrator = self.get_app_component(request, "task_orchestrator")
+        created = await orchestrator.create_schedule(payload)
+        return self.success_response(created, "Pipeline created")
 
     async def _handle_system_data_pipeline_update(self, request: web.Request, task_id: str) -> web.Response:
         body = await self.get_request_json(request)
         if not isinstance(body, dict):
             return self.error_response("Request body must be a JSON object", 400)
-        payload = await self._fetch_upstream_json(
-            request,
-            "flowhub",
-            f"/api/v1/tasks/{task_id}",
-            method="PUT",
-            payload=body,
-        )
-        return self.success_response(self._unwrap_response_data(payload), "Pipeline updated")
+        patch_payload: Dict[str, Any] = {}
+        if "enabled" in body:
+            patch_payload["enabled"] = bool(body.get("enabled"))
+        if "params" in body:
+            patch_payload["params"] = body.get("params") if isinstance(body.get("params"), dict) else {}
+        if "schedule_value" in body:
+            value = body.get("schedule_value")
+            if isinstance(value, (int, float)) or (isinstance(value, str) and str(value).isdigit()):
+                patch_payload["interval_seconds"] = int(value)
+            else:
+                patch_payload["cron"] = str(value or "")
+        orchestrator = self.get_app_component(request, "task_orchestrator")
+        updated = await orchestrator.patch_schedule(task_id, patch_payload)
+        return self.success_response(updated, "Pipeline updated")
 
     async def _handle_system_data_pipeline_run(self, request: web.Request, task_id: str) -> web.Response:
-        payload = await self._fetch_upstream_json(
-            request,
-            "flowhub",
-            f"/api/v1/tasks/{task_id}/run",
-            method="POST",
-            payload={},
-        )
-        return self.success_response(self._unwrap_response_data(payload), "Pipeline run requested")
+        orchestrator = self.get_app_component(request, "task_orchestrator")
+        payload = await orchestrator.trigger_schedule(task_id)
+        return self.success_response(payload, "Pipeline run requested")
 
     async def _handle_system_data_pipeline_control(self, request: web.Request, task_id: str, action: str) -> web.Response:
         mapped = "disable" if action == "pause" else "enable" if action == "resume" else action
         if mapped not in {"enable", "disable"}:
             return self.error_response("Unsupported pipeline action", 400)
-        payload = await self._fetch_upstream_json(
-            request,
-            "flowhub",
-            f"/api/v1/tasks/{task_id}/{mapped}",
-            method="POST",
-            payload={},
-        )
-        return self.success_response(self._unwrap_response_data(payload), "Pipeline updated")
+        orchestrator = self.get_app_component(request, "task_orchestrator")
+        payload = await orchestrator.patch_schedule(task_id, {"enabled": mapped == "enable"})
+        return self.success_response(payload, "Pipeline updated")
 
     async def _handle_system_data_pipeline_history(self, request: web.Request, task_id: str) -> web.Response:
         limit = int(request.query.get("limit", 50))
         offset = int(request.query.get("offset", 0))
-        payload = await self._fetch_upstream_json(
-            request,
-            "flowhub",
-            f"/api/v1/tasks/{task_id}/history",
-            params={"limit": limit, "offset": offset},
-        )
-        return self.success_response(self._unwrap_response_data(payload))
+        orchestrator = self.get_app_component(request, "task_orchestrator")
+        listing = await orchestrator.list_task_jobs(service="flowhub", limit=500, offset=0)
+        jobs = listing.get("jobs", []) if isinstance(listing, dict) else []
+        matched = []
+        for job in jobs:
+            if not isinstance(job, dict):
+                continue
+            metadata = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+            if str(metadata.get("schedule_id") or "") == str(task_id):
+                matched.append(job)
+        matched = self._sort_by_time_desc(matched, "updated_at", "created_at")
+        total = len(matched)
+        return self.success_response({"items": matched[offset: offset + limit], "total": total, "limit": limit, "offset": offset})
 
     async def _handle_system_data_logs(self, request: web.Request) -> web.Response:
         limit = min(100, max(1, self._safe_int(request.query.get("limit"), 100)))

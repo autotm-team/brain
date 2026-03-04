@@ -10,17 +10,13 @@ import inspect
 from aiohttp import web
 from aiohttp_cors import setup as cors_setup, ResourceOptions
 
-from asyncron import start_scheduler
+from asyncron import UnifiedScheduler
 import redis.asyncio as redis
 from config import IntegrationConfig
 from container import setup_container
 from interfaces import ISystemCoordinator, ISignalRouter, IDataFlowManager
 from middleware import setup_middleware
 from routes import setup_routes
-from scheduler.integration_scheduler import IntegrationScheduler
-from scheduler.macro_data_tasks import MacroDataTaskScheduler
-from scheduler.portfolio_data_tasks import PortfolioDataTaskScheduler
-from scheduler.analysis_trigger import AnalysisTriggerScheduler
 from adapters.service_registry import ServiceRegistry
 from adapters.macro_adapter import MacroAdapter
 from adapters.execution_adapter import ExecutionAdapter
@@ -112,6 +108,38 @@ async def init_components(app: web.Application, config: IntegrationConfig):
         await app['auth_service'].initialize()
         logger.info("Auth service initialized")
 
+        async def _dispatch_schedule(payload: dict) -> None:
+            schedule = payload.get("schedule") if isinstance(payload, dict) else {}
+            if not isinstance(schedule, dict):
+                return
+            schedule_id = str(payload.get("schedule_id") or schedule.get("id") or "").strip()
+            if not schedule_id:
+                return
+            orchestrator = app.get("task_orchestrator")
+            scheduler = app.get("unified_scheduler")
+            if not orchestrator or not scheduler:
+                return
+            metadata = dict(schedule.get("metadata") or {})
+            metadata["schedule_id"] = schedule_id
+            task_job_id = None
+            try:
+                created = await orchestrator.create_task_job(
+                    service=str(schedule.get("service") or ""),
+                    job_type=str(schedule.get("job_type") or ""),
+                    params=dict(schedule.get("params") or {}),
+                    metadata=metadata,
+                )
+                task_job_id = created.get("id")
+            finally:
+                await scheduler.mark_triggered(schedule_id, task_job_id)
+
+        app['unified_scheduler'] = UnifiedScheduler(
+            redis_client=app.get('redis'),
+            namespace='asyncron:v2:brain',
+            on_dispatch=_dispatch_schedule,
+            poll_interval_seconds=1,
+        )
+
         # 核心组件（通过DI解析）
         app['coordinator'] = await app['container'].resolve(ISystemCoordinator)
         app['signal_router'] = await app['container'].resolve(ISignalRouter)
@@ -136,16 +164,6 @@ async def init_components(app: web.Application, config: IntegrationConfig):
             data_flow_manager=app.get('data_flow_manager'),
             macro_adapter=app.get('macro_adapter')
         )
-
-        # 定时任务调度器
-        if config.service.scheduler_enabled:
-            app['scheduler'] = IntegrationScheduler(config, app['coordinator'], app)
-            # 宏观数据调度器
-            app['macro_scheduler'] = MacroDataTaskScheduler(config, app['coordinator'], app)
-            # 投资组合数据调度器
-            app['portfolio_scheduler'] = PortfolioDataTaskScheduler(config, app['coordinator'], app)
-            # 分析触发调度器
-            app['analysis_trigger'] = AnalysisTriggerScheduler(app)
 
         logger.info("Core components initialized successfully")
 
@@ -173,6 +191,19 @@ async def startup_handler(app: web.Application):
         # 启动服务注册表
         await app['service_registry'].start()
 
+        # 预热统一任务类型目录（以各服务 /api/v1/jobs/types 为唯一来源）
+        try:
+            orchestrator = app.get("task_orchestrator")
+            if orchestrator:
+                await orchestrator.list_task_job_types()
+                logger.info("Task job types catalog warmed up")
+        except Exception as warmup_err:
+            logger.warning(f"Task job types warmup failed: {warmup_err}")
+
+        if "unified_scheduler" in app:
+            await app["unified_scheduler"].start()
+            logger.info("Unified scheduler started")
+
         # 启动系统协调器
         await app['coordinator'].start()
 
@@ -185,42 +216,6 @@ async def startup_handler(app: web.Application):
         # 启动系统监控器
         await app['system_monitor'].start()
 
-        # 收集所有调度器的planer，统一启动（避免多次调用start_scheduler导致线程冲突）
-        planers = []
-
-        # 添加集成调度器的planer（不调用其start方法）
-        if 'scheduler' in app:
-            integration_planer = app['scheduler'].get_planer()
-            planers.append(integration_planer)
-            logger.info("Integration scheduler planer added")
-
-        # 添加宏观数据调度器的planer
-        if 'macro_scheduler' in app:
-            macro_planer = app['macro_scheduler'].get_planer()
-            planers.append(macro_planer)
-            logger.info("Macro data scheduler planer added")
-
-        # 添加投资组合数据调度器的planer
-        if 'portfolio_scheduler' in app:
-            portfolio_planer = app['portfolio_scheduler'].get_planer()
-            planers.append(portfolio_planer)
-            logger.info("Portfolio data scheduler planer added")
-
-        # 添加分析触发调度器的planer
-        if 'analysis_trigger' in app:
-            analysis_trigger_planer = app['analysis_trigger'].get_planer()
-            planers.append(analysis_trigger_planer)
-            logger.info("Analysis trigger scheduler planer added")
-
-        # 统一启动所有调度器（只调用一次start_scheduler）
-        if planers:
-            start_scheduler(planers)
-            logger.info(f"All {len(planers)} schedulers started successfully")
-
-            # 标记IntegrationScheduler为已运行状态
-            if 'scheduler' in app:
-                app['scheduler']._is_running = True
-
         logger.info("All components started successfully")
 
         # 执行系统启动协调
@@ -229,14 +224,6 @@ async def startup_handler(app: web.Application):
             logger.info("System startup coordination completed successfully")
         else:
             logger.warning("System startup coordination completed with warnings")
-
-        # 启动后校验当天数据抓取是否完成，必要时补抓
-        try:
-            if 'scheduler' in app:
-                asyncio.create_task(app['scheduler'].ensure_daily_data_fetched_today())
-                logger.info("Scheduled daily data fetch check on startup")
-        except Exception as e:
-            logger.warning(f"Failed to schedule daily data fetch check: {e}")
 
     except Exception as e:
         logger.error(f"Failed to start components: {e}")
@@ -249,9 +236,8 @@ async def cleanup_handler(app: web.Application):
     logger.info("Stopping Integration Service components")
 
     try:
-        # 停止定时任务调度器
-        if 'scheduler' in app:
-            await app['scheduler'].stop()
+        if "unified_scheduler" in app:
+            await app["unified_scheduler"].stop()
 
         # 停止系统监控器
         if 'system_monitor' in app:

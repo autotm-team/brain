@@ -69,30 +69,13 @@ class FlowhubAdapter(ISystemAdapter):
         logger.info("FlowhubAdapter initialized with HTTP client integration")
 
     async def list_tasks(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
-        """获取 Flowhub 任务列表（任务调度系统）"""
-        if not self._is_connected:
-            raise AdapterException("FlowhubAdapter", "Not connected to Flowhub service")
-        # Flowhub 限制 limit 在 1..100，避免 400
-        limit = max(1, min(int(limit or 100), 100))
-        offset = max(int(offset or 0), 0)
-        response = await self._http_client.get('/api/v1/tasks', params={'limit': limit, 'offset': offset})
-        payload = response.get('data') or response
-        tasks = payload.get('tasks') if isinstance(payload, dict) else None
-        return tasks if isinstance(tasks, list) else []
+        raise AdapterException("FlowhubAdapter", "Flowhub task schedules were removed; use brain /api/v1/schedules")
 
     async def create_task(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """创建 Flowhub 任务（任务调度系统）"""
-        if not self._is_connected:
-            raise AdapterException("FlowhubAdapter", "Not connected to Flowhub service")
-        response = await self._http_client.post('/api/v1/tasks', data=payload)
-        return response.get('data') or response
+        raise AdapterException("FlowhubAdapter", "Flowhub task schedules were removed; use brain /api/v1/schedules")
 
     async def run_task(self, task_id: str) -> Dict[str, Any]:
-        """触发 Flowhub 任务运行（返回 job_id）"""
-        if not self._is_connected:
-            raise AdapterException("FlowhubAdapter", "Not connected to Flowhub service")
-        response = await self._http_client.post(f'/api/v1/tasks/{task_id}/run')
-        return response.get('data') or response
+        raise AdapterException("FlowhubAdapter", "Flowhub task schedules were removed; use brain /api/v1/schedules/{id}/trigger")
 
     async def ensure_task(
         self,
@@ -104,51 +87,7 @@ class FlowhubAdapter(ISystemAdapter):
         enabled: Optional[bool] = None,
         allow_overlap: Optional[bool] = None,
     ) -> Dict[str, Any]:
-        """确保 Flowhub 中存在指定名称的任务"""
-        tasks = await self.list_tasks()
-        for task in tasks:
-            if task.get('name') == name:
-                current_params = task.get('params') if isinstance(task.get('params'), dict) else {}
-                current_data_type = task.get('data_type')
-                desired_schedule_type = schedule_type if schedule_type is not None else task.get('schedule_type', 'manual')
-                if schedule_type is not None or schedule_value is not None:
-                    desired_schedule_value = schedule_value
-                else:
-                    desired_schedule_value = task.get('schedule_value')
-                desired_enabled = bool(enabled) if enabled is not None else bool(task.get('enabled', True))
-                desired_allow_overlap = bool(allow_overlap) if allow_overlap is not None else bool(task.get('allow_overlap', False))
-                needs_update = (
-                    (current_data_type != data_type)
-                    or (current_params != (params or {}))
-                    or (task.get('schedule_type') != desired_schedule_type)
-                    or (task.get('schedule_value') != desired_schedule_value)
-                    or (bool(task.get('enabled', True)) != desired_enabled)
-                    or (bool(task.get('allow_overlap', False)) != desired_allow_overlap)
-                )
-                if needs_update:
-                    payload = {
-                        'name': name,
-                        'data_type': data_type,
-                        'params': params or {},
-                        'schedule_type': desired_schedule_type,
-                        'schedule_value': desired_schedule_value,
-                        'enabled': desired_enabled,
-                        'allow_overlap': desired_allow_overlap,
-                    }
-                    response = await self._http_client.put(f"/api/v1/tasks/{task.get('task_id')}", data=payload)
-                    return response.get('data') or response
-                return task
-
-        payload = {
-            'name': name,
-            'data_type': data_type,
-            'params': params,
-            'schedule_type': schedule_type if schedule_type is not None else 'manual',
-            'schedule_value': schedule_value,
-            'enabled': bool(enabled) if enabled is not None else True,
-            'allow_overlap': bool(allow_overlap) if allow_overlap is not None else False,
-        }
-        return await self.create_task(payload)
+        raise AdapterException("FlowhubAdapter", "Flowhub task schedules were removed; use brain /api/v1/schedules")
 
     async def connect_to_system(self) -> bool:
         """连接到Flowhub数据抓取服务
