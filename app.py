@@ -7,6 +7,7 @@ Integration Service 应用工厂
 import logging
 import asyncio
 import inspect
+import os
 from aiohttp import web
 from aiohttp_cors import setup as cors_setup, ResourceOptions
 
@@ -26,6 +27,162 @@ from task_orchestrator import TaskOrchestrator
 from auth_service import AuthService
 
 logger = logging.getLogger(__name__)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _flowhub_bootstrap_schedule_specs() -> list[dict]:
+    return [
+        {
+            "bootstrap_key": "strategy_daily_batch_ohlc",
+            "job_type": "batch_daily_ohlc",
+            "cron": os.getenv("FLOWHUB_STRATEGY_BATCH_OHLC_CRON", "20 18 * * 1-5"),
+            "params": {"incremental": True},
+        },
+        {
+            "bootstrap_key": "strategy_daily_adj_factors",
+            "job_type": "adj_factors",
+            "cron": os.getenv("FLOWHUB_STRATEGY_ADJ_FACTORS_CRON", "25 18 * * 1-5"),
+            "params": {"update_mode": "incremental"},
+        },
+        {
+            "bootstrap_key": "strategy_daily_index_daily",
+            "job_type": "index_daily_data",
+            "cron": os.getenv("FLOWHUB_STRATEGY_INDEX_DAILY_CRON", "30 18 * * 1-5"),
+            "params": {
+                "update_mode": "incremental",
+                "index_codes": ["000300.SH", "000905.SH", "000852.SH", "000001.SH", "399001.SZ", "399006.SZ"],
+            },
+        },
+        {
+            "bootstrap_key": "strategy_daily_trade_calendar",
+            "job_type": "trade_calendar_data",
+            "cron": os.getenv("FLOWHUB_STRATEGY_TRADE_CAL_CRON", "35 18 * * 1-5"),
+            "params": {"exchange": "SSE", "update_mode": "incremental"},
+        },
+        {
+            "bootstrap_key": "strategy_weekly_index_components",
+            "job_type": "index_components",
+            "cron": os.getenv("FLOWHUB_STRATEGY_INDEX_COMPONENTS_CRON", "30 16 * * 6"),
+            "params": {
+                "update_mode": "snapshot",
+                "index_codes": ["000300.SH", "000905.SH", "000852.SH", "000001.SH", "399001.SZ", "399006.SZ"],
+            },
+        },
+        {
+            "bootstrap_key": "strategy_monthly_sw_industry",
+            "job_type": "sw_industry_data",
+            "cron": os.getenv("FLOWHUB_STRATEGY_SW_INDUSTRY_CRON", "30 16 1 * *"),
+            "params": {"src": "SW2021", "update_mode": "incremental", "include_members": True},
+        },
+        {
+            "bootstrap_key": "research_daily_batch_basic",
+            "job_type": "batch_daily_basic",
+            "cron": os.getenv("FLOWHUB_RESEARCH_BATCH_BASIC_CRON", "35 18 * * 1-5"),
+            "params": {"incremental": True},
+        },
+        {
+            "bootstrap_key": "research_daily_suspend",
+            "job_type": "suspend_data",
+            "cron": os.getenv("FLOWHUB_RESEARCH_SUSPEND_CRON", "40 18 * * 1-5"),
+            "params": {"update_mode": "incremental"},
+        },
+        {
+            "bootstrap_key": "research_daily_st_status",
+            "job_type": "st_status_data",
+            "cron": os.getenv("FLOWHUB_RESEARCH_ST_STATUS_CRON", "45 18 * * 1-5"),
+            "params": {"update_mode": "incremental"},
+        },
+        {
+            "bootstrap_key": "research_daily_stk_limit",
+            "job_type": "stk_limit_data",
+            "cron": os.getenv("FLOWHUB_RESEARCH_STK_LIMIT_CRON", "50 18 * * 1-5"),
+            "params": {"update_mode": "incremental"},
+        },
+    ]
+
+
+async def _list_all_flowhub_schedules(orchestrator: TaskOrchestrator) -> list[dict]:
+    limit = 100
+    offset = 0
+    items: list[dict] = []
+    while True:
+        payload = await orchestrator.list_schedules(service="flowhub", limit=limit, offset=offset)
+        page = payload.get("items") if isinstance(payload, dict) else []
+        if not isinstance(page, list) or not page:
+            break
+        items.extend(page)
+        offset += len(page)
+        total = int(payload.get("total") or 0) if isinstance(payload, dict) else 0
+        if total and offset >= total:
+            break
+        if len(page) < limit:
+            break
+    return items
+
+
+async def _ensure_flowhub_bootstrap_schedules(app: web.Application) -> None:
+    if not _env_bool("BRAIN_FLOWHUB_BOOTSTRAP_ENABLED", True):
+        logger.info("Skip flowhub bootstrap schedules: BRAIN_FLOWHUB_BOOTSTRAP_ENABLED=false")
+        return
+
+    orchestrator = app.get("task_orchestrator")
+    if not orchestrator:
+        return
+
+    existing = await _list_all_flowhub_schedules(orchestrator)
+    existing_keys: dict[str, dict] = {}
+    for item in existing:
+        if not isinstance(item, dict):
+            continue
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        key = str(metadata.get("bootstrap_key") or "").strip()
+        if key:
+            existing_keys[key] = item
+
+    created_ids: list[str] = []
+    for spec in _flowhub_bootstrap_schedule_specs():
+        key = spec["bootstrap_key"]
+        if key in existing_keys:
+            continue
+        payload = {
+            "service": "flowhub",
+            "job_type": spec["job_type"],
+            "trigger": "cron",
+            "cron": spec["cron"],
+            "enabled": True,
+            "params": dict(spec.get("params") or {}),
+            "metadata": {
+                "bootstrap_key": key,
+                "bootstrap_source": "brain_startup",
+            },
+        }
+        try:
+            created = await orchestrator.create_schedule(payload)
+            created_id = str(created.get("id") or "").strip()
+            if created_id:
+                created_ids.append(created_id)
+                logger.info(f"Bootstrap schedule created: {key} ({created_id})")
+        except Exception as exc:
+            logger.warning(f"Failed to create flowhub bootstrap schedule {key}: {exc}")
+
+    if not created_ids:
+        return
+
+    if not _env_bool("BRAIN_FLOWHUB_BOOTSTRAP_TRIGGER_CREATED", True):
+        return
+
+    for schedule_id in created_ids:
+        try:
+            await orchestrator.trigger_schedule(schedule_id)
+            logger.info(f"Triggered bootstrap flowhub schedule once: {schedule_id}")
+        except Exception as exc:
+            logger.warning(f"Failed to trigger bootstrap schedule {schedule_id}: {exc}")
 
 
 async def create_app(config: IntegrationConfig) -> web.Application:
@@ -203,6 +360,12 @@ async def startup_handler(app: web.Application):
         if "unified_scheduler" in app:
             await app["unified_scheduler"].start()
             logger.info("Unified scheduler started")
+
+        # Flowhub 抓取任务由 Brain 统一补齐与触发，Flowhub 本身不再自建调度。
+        try:
+            await _ensure_flowhub_bootstrap_schedules(app)
+        except Exception as bootstrap_err:
+            logger.warning(f"Flowhub bootstrap schedules initialization failed: {bootstrap_err}")
 
         # 启动系统协调器
         await app['coordinator'].start()
