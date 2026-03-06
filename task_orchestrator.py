@@ -33,6 +33,7 @@ class TaskOrchestrator:
         "batch_daily_ohlc": "个股日线行情",
         "daily_basic": "个股日线基础(单标的)",
         "batch_daily_basic": "个股日线基础",
+        "stock_basic_data": "股票基础信息",
         "adj_factors": "复权因子",
         "index_daily_data": "指数日线",
         "index_components": "指数成分",

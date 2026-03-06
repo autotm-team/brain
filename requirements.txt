@@ -28,6 +28,7 @@ prometheus-client==0.19.0
 # 时间处理
 python-dateutil==2.8.2
 pytz==2023.3
+croniter==2.0.2
 
 # HTTP客户端
 httpx==0.25.2

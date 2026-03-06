@@ -174,6 +174,14 @@ async def _ensure_flowhub_bootstrap_schedules(app: web.Application) -> None:
     if not created_ids:
         return
 
+    config = app.get("config")
+    init_on_startup = bool(getattr(getattr(config, "service", None), "init_data_on_startup", True))
+    if init_on_startup:
+        logger.info(
+            "Skip one-shot bootstrap schedule trigger because DataInitializationCoordinator is enabled"
+        )
+        return
+
     if not _env_bool("BRAIN_FLOWHUB_BOOTSTRAP_TRIGGER_CREATED", True):
         return
 

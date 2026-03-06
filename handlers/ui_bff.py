@@ -355,6 +355,8 @@ class UIBffHandler(BaseHandler):
             "label": "市场快照",
             "data_types": [
                 {"data_type": "stock_index_data", "label": "指数行情"},
+                {"data_type": "index_info", "label": "指数基础信息"},
+                {"data_type": "index_components", "label": "指数成分股"},
                 {"data_type": "market_flow_data", "label": "市场资金流"},
                 {"data_type": "interest_rate_data", "label": "利率与流动性"},
                 {"data_type": "commodity_price_data", "label": "大宗商品"},
@@ -387,6 +389,7 @@ class UIBffHandler(BaseHandler):
         "watchlist": {
             "label": "候选池",
             "data_types": [
+                {"data_type": "stock_basic_data", "label": "股票基础信息"},
                 {"data_type": "batch_daily_ohlc", "label": "个股日线行情"},
                 {"data_type": "batch_daily_basic", "label": "个股日线基础"},
                 {"data_type": "adj_factors", "label": "复权因子"},
@@ -408,6 +411,8 @@ class UIBffHandler(BaseHandler):
 
     MARKET_SNAPSHOT_TEMPLATE_SCHEDULES = {
         "stock_index_data": {"schedule_type": "cron", "schedule_value": "30 16 * * 1-5"},
+        "index_info": {"schedule_type": "cron", "schedule_value": "35 16 * * 1-5"},
+        "index_components": {"schedule_type": "cron", "schedule_value": "38 16 * * 1-5"},
         "market_flow_data": {"schedule_type": "cron", "schedule_value": "40 16 * * 1-5"},
         "interest_rate_data": {"schedule_type": "cron", "schedule_value": "45 16 * * 1-5"},
         "commodity_price_data": {"schedule_type": "cron", "schedule_value": "50 16 * * 1-5"},
@@ -415,6 +420,8 @@ class UIBffHandler(BaseHandler):
 
     MARKET_SNAPSHOT_TEMPLATE_NAMES = {
         "stock_index_data": "模板·市场快照·指数行情",
+        "index_info": "模板·市场快照·指数基础信息",
+        "index_components": "模板·市场快照·指数成分股",
         "market_flow_data": "模板·市场快照·市场资金流",
         "interest_rate_data": "模板·市场快照·利率与流动性",
         "commodity_price_data": "模板·市场快照·大宗商品",
@@ -422,6 +429,8 @@ class UIBffHandler(BaseHandler):
 
     MARKET_SNAPSHOT_TEMPLATE_PARAMS = {
         "stock_index_data": {"incremental": True},
+        "index_info": {"update_mode": "incremental"},
+        "index_components": {"update_mode": "incremental"},
         "market_flow_data": {"incremental": True},
         "interest_rate_data": {"incremental": True},
         "commodity_price_data": {"incremental": True},
@@ -468,6 +477,7 @@ class UIBffHandler(BaseHandler):
     }
 
     WATCHLIST_TEMPLATE_SCHEDULES = {
+        "stock_basic_data": {"schedule_type": "cron", "schedule_value": "20 17 * * 1-5"},
         "batch_daily_ohlc": {"schedule_type": "cron", "schedule_value": "10 17 * * 1-5"},
         "batch_daily_basic": {"schedule_type": "cron", "schedule_value": "30 17 * * 1-5"},
         "adj_factors": {"schedule_type": "cron", "schedule_value": "45 17 * * 1-5"},
@@ -476,6 +486,7 @@ class UIBffHandler(BaseHandler):
     }
 
     WATCHLIST_TEMPLATE_NAMES = {
+        "stock_basic_data": "模板·候选池·股票基础信息",
         "batch_daily_ohlc": "模板·候选池·个股日线行情",
         "batch_daily_basic": "模板·候选池·个股日线基础",
         "adj_factors": "模板·候选池·复权因子",
@@ -484,6 +495,7 @@ class UIBffHandler(BaseHandler):
     }
 
     WATCHLIST_TEMPLATE_PARAMS = {
+        "stock_basic_data": {"update_mode": "incremental"},
         "batch_daily_ohlc": {"incremental": True},
         "batch_daily_basic": {"incremental": True},
         "adj_factors": {"update_mode": "incremental"},
@@ -493,6 +505,8 @@ class UIBffHandler(BaseHandler):
 
     READINESS_REAL_DATA_TABLES = {
         "stock_index_data": {"table": "macro_stock_index_data", "date_column": "date", "value_kind": "date"},
+        "index_info": {"table": "index_info", "date_column": "updated_at", "value_kind": "datetime"},
+        "index_components": {"table": "index_components", "date_column": "in_date", "value_kind": "date"},
         "market_flow_data": {"table": "macro_market_flow_data", "date_column": "date", "value_kind": "date"},
         "interest_rate_data": {"table": "macro_interest_rate_data", "date_column": "date", "value_kind": "date"},
         "commodity_price_data": {"table": "macro_commodity_price_data", "date_column": "date", "value_kind": "date"},
@@ -509,6 +523,7 @@ class UIBffHandler(BaseHandler):
         "concept_board_stocks": {"table": "concept_board_stocks", "date_column": "trade_date"},
         "industry_moneyflow_data": {"table": "industry_moneyflow_daily", "date_column": "trade_date"},
         "concept_moneyflow_data": {"table": "concept_moneyflow_daily", "date_column": "trade_date"},
+        "stock_basic_data": {"table": "stock_basic", "date_column": "updated_at", "value_kind": "datetime"},
         "batch_daily_ohlc": {"table": "stock_daily_data", "date_column": "trade_date"},
         "batch_daily_basic": {"table": "stock_daily_basic", "date_column": "trade_date"},
         "adj_factors": {"table": "adj_factors", "date_column": "trade_date"},

@@ -218,23 +218,64 @@ class DataInitializationCoordinator:
             logger.error(f"Phase {name} failed: {e}")
             # do not raise to keep app running
 
+    async def _wait_job_started(
+        self,
+        adapter: FlowhubAdapter,
+        job_id: str,
+        *,
+        timeout_seconds: int = 60,
+        poll_interval_seconds: int = 2,
+    ) -> str:
+        if not job_id:
+            return "unknown"
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        last_status = "unknown"
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                status_resp = await adapter.get_job_status(job_id)
+                last_status = str(status_resp.get("status") or "unknown").lower()
+                if last_status in {"running", "succeeded", "failed", "cancelled", "canceled"}:
+                    return last_status
+            except Exception as e:
+                logger.warning(f"Wait job started failed for {job_id}: {e}")
+            await asyncio.sleep(poll_interval_seconds)
+        return last_status
+
     # ===== Phases =====
     async def _phase_stock_meta(self) -> List[str]:
-        # Batch basic data, index info, index daily data and index components snapshot
+        # 空库首启必须直接提交基础元数据任务，不能依赖后续 schedule bootstrap。
         jobs: List[str] = []
         adapter = FlowhubAdapter(self.config)
         await adapter.connect_to_system()
         try:
-            # 1. 股票基础信息（由 flowhub 根据自身逻辑选择全量/增量）
-            req_basic = {"incremental": True}
-            resp_basic = await adapter.send_request({
+            # 1. 股票基础信息
+            req_stock_basic = {"update_mode": "incremental"}
+            resp_stock_basic = await adapter.send_request({
                 "method": "POST",
                 "endpoint": "/api/v1/jobs",
-                "payload": {**req_basic, "data_type": "batch_daily_basic"},
+                "payload": {**req_stock_basic, "data_type": "stock_basic_data"},
             })
-            jobs.append(resp_basic.get("job_id", ""))
+            jobs.append(resp_stock_basic.get("job_id", ""))
 
-            # 2. 指数基础信息初始化
+            # 2. 交易日历
+            req_trade_calendar = {"exchange": "SSE", "update_mode": "incremental"}
+            resp_trade_calendar = await adapter.send_request({
+                "method": "POST",
+                "endpoint": "/api/v1/jobs",
+                "payload": {**req_trade_calendar, "data_type": "trade_calendar_data"},
+            })
+            jobs.append(resp_trade_calendar.get("job_id", ""))
+
+            # 3. 申万行业分类及成分映射
+            req_sw_industry = {"src": "SW2021", "update_mode": "incremental", "include_members": True}
+            resp_sw_industry = await adapter.send_request({
+                "method": "POST",
+                "endpoint": "/api/v1/jobs",
+                "payload": {**req_sw_industry, "data_type": "sw_industry_data"},
+            })
+            jobs.append(resp_sw_industry.get("job_id", ""))
+
+            # 4. 指数基础信息
             req_index_info = {"update_mode": "incremental"}
             resp_index_info = await adapter.send_request({
                 "method": "POST",
@@ -243,7 +284,7 @@ class DataInitializationCoordinator:
             })
             jobs.append(resp_index_info.get("job_id", ""))
 
-            # 3. 指数日线数据初始化（获取近1年历史数据）
+            # 5. 指数日线
             req_index_daily = {"update_mode": "incremental"}
             resp_index_daily = await adapter.send_request({
                 "method": "POST",
@@ -252,7 +293,19 @@ class DataInitializationCoordinator:
             })
             jobs.append(resp_index_daily.get("job_id", ""))
 
-            # 4. 行业板块数据初始化
+            # 6. 指数成分股
+            req_index_components = {
+                "update_mode": "snapshot",
+                "index_codes": ["000300.SH", "000905.SH", "000852.SH", "000001.SH", "399001.SZ", "399006.SZ"],
+            }
+            resp_index_components = await adapter.send_request({
+                "method": "POST",
+                "endpoint": "/api/v1/jobs",
+                "payload": {**req_index_components, "data_type": "index_components"},
+            })
+            jobs.append(resp_index_components.get("job_id", ""))
+
+            # 7. 行业板块数据
             req_industry_board = {"source": "ths", "update_mode": "full_update"}
             resp_industry_board = await adapter.send_request({
                 "method": "POST",
@@ -261,7 +314,7 @@ class DataInitializationCoordinator:
             })
             jobs.append(resp_industry_board.get("job_id", ""))
 
-            # 5. 概念板块数据初始化
+            # 8. 概念板块数据
             req_concept_board = {"source": "ths", "update_mode": "full_update"}
             resp_concept_board = await adapter.send_request({
                 "method": "POST",
@@ -269,9 +322,6 @@ class DataInitializationCoordinator:
                 "payload": {**req_concept_board, "data_type": "concept_board"},
             })
             jobs.append(resp_concept_board.get("job_id", ""))
-
-            # 6. 指数成分股快照（由 flowhub 自身在基础数据任务内处理或通过专用策略触发）
-            # 此处不再单独触发，避免重复
 
             return jobs
         finally:
@@ -287,6 +337,17 @@ class DataInitializationCoordinator:
         adapter = FlowhubAdapter(self.config)
         await adapter.connect_to_system()
         try:
+            stock_index_resp = await adapter.create_macro_data_job("stock_index_data", incremental=True)
+            stock_index_job_id = stock_index_resp.get("job_id", "")
+            if stock_index_job_id:
+                jobs.append(stock_index_job_id)
+                stock_index_status = await self._wait_job_started(adapter, stock_index_job_id, timeout_seconds=90)
+                logger.info(
+                    "stock_index_data bootstrap job status after warmup: %s (job_id=%s)",
+                    stock_index_status,
+                    stock_index_job_id,
+                )
+
             concurrency = int(getattr(self.config.service, "init_concurrency", 2) or 2)
             sem = asyncio.Semaphore(concurrency)
 
@@ -302,7 +363,6 @@ class DataInitializationCoordinator:
                 _create("price_index_data"),
                 _create("money_supply_data"),
                 _create("interest_rate_data"),
-                _create("stock_index_data"),
                 # 市场资金流数据：明确指定所有类型（MARGIN, NORTHBOUND, TURNOVER）
                 _create("market_flow_data", flow_types=["MARGIN", "NORTHBOUND", "TURNOVER"]),
                 _create("commodity_price_data"),
@@ -317,6 +377,10 @@ class DataInitializationCoordinator:
         adapter = FlowhubAdapter(self.config)
         await adapter.connect_to_system()
         try:
+            basic_req = {"incremental": True}
+            basic_resp = await adapter.create_batch_basic_data_job(basic_req)
+            jobs.append(basic_resp.get("job_id", ""))
+
             # 股票日K（增量/全量由 flowhub 决定）
             # 统一任务接口：POST /api/v1/jobs + data_type=batch_daily_ohlc
             req = {"incremental": True}
