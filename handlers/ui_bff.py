@@ -26,22 +26,14 @@ ECONDB_PATH = PROJECT_ROOT / "external" / "econdb"
 if ECONDB_PATH.exists() and str(ECONDB_PATH) not in sys.path:
     sys.path.insert(0, str(ECONDB_PATH))
 
-try:
-    from econdb import (  # type: ignore
-        UISystemDataAPI,
-        SystemAuditDTO,
-        SystemRoleDTO,
-        SystemSettingDTO,
-        SystemUserDTO,
-        create_database_manager,
-    )
-except Exception:  # pragma: no cover - import fallback for old submodule commits
-    UISystemDataAPI = None
-    SystemAuditDTO = None
-    SystemRoleDTO = None
-    SystemSettingDTO = None
-    SystemUserDTO = None
-    create_database_manager = None
+from econdb import (  # type: ignore
+    UISystemDataAPI,
+    SystemAuditDTO,
+    SystemRoleDTO,
+    SystemSettingDTO,
+    SystemUserDTO,
+    create_database_manager,
+)
 
 
 HOP_BY_HOP_HEADERS = {
