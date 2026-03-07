@@ -107,7 +107,7 @@ class TaskOrchestrator:
     # Keep per-service listing lightweight to avoid large payload amplification.
     SERVICE_PAGE_SIZE = 20
     SERVICE_MAX_FETCH = 200
-    UPSTREAM_TIMEOUT_SECONDS = 8
+    UPSTREAM_TIMEOUT_SECONDS = 30
 
     def __init__(self, app):
         self._app = app
