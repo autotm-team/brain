@@ -10,6 +10,8 @@ import logging
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 
+from asyncron import request_envelope
+
 try:
     from ..interfaces import ISystemAdapter
     from ..config import IntegrationConfig
@@ -88,6 +90,13 @@ class FlowhubAdapter(ISystemAdapter):
         if "-" in raw:
             raise AdapterException("FlowhubAdapter", f"Legacy job_type/data_type is not allowed: {raw}")
         return raw
+
+    @staticmethod
+    def _job_request(job_type: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return request_envelope({
+            "job_type": job_type,
+            "params": dict(params or {}),
+        })
 
     async def list_tasks(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
         raise AdapterException("FlowhubAdapter", "Flowhub task schedules were removed; use brain /api/v1/schedules")
@@ -203,12 +212,10 @@ class FlowhubAdapter(ISystemAdapter):
 
             # 映射请求格式
             flowhub_request = self._request_mapper.map_batch_stock_data_request(request)
-            flowhub_request['data_type'] = 'batch_daily_ohlc'
-
             logger.info(f"Creating batch stock data job with request: {flowhub_request}")
 
             # 发送统一任务创建请求
-            response = await self._http_client.post('/api/v1/jobs', data=flowhub_request)
+            response = await self._http_client.post('/api/v1/jobs', data=self._job_request('batch_daily_ohlc', flowhub_request))
             response_data = self._unwrap_data(response) if isinstance(response, dict) else {}
 
             # 映射响应格式
@@ -241,12 +248,10 @@ class FlowhubAdapter(ISystemAdapter):
 
             # 映射请求格式
             flowhub_request = self._request_mapper.map_batch_basic_data_request(request)
-            flowhub_request['data_type'] = 'batch_daily_basic'
-
             logger.info(f"Creating batch basic data job with request: {flowhub_request}")
 
             # 发送统一任务创建请求
-            response = await self._http_client.post('/api/v1/jobs', data=flowhub_request)
+            response = await self._http_client.post('/api/v1/jobs', data=self._job_request('batch_daily_basic', flowhub_request))
             response_data = self._unwrap_data(response) if isinstance(response, dict) else {}
 
             # 映射响应格式
@@ -598,7 +603,7 @@ class FlowhubAdapter(ISystemAdapter):
                 raise ValueError(f"Unsupported portfolio data type: {data_type}")
 
             await self._ensure_http_client()
-            response = await self._http_client.post('/api/v1/jobs', data={**params, 'data_type': normalized_type})
+            response = await self._http_client.post('/api/v1/jobs', data=self._job_request(normalized_type, params))
             response_data = self._unwrap_data(response) if isinstance(response, dict) else {}
 
             # 更新统计信息
@@ -649,7 +654,7 @@ class FlowhubAdapter(ISystemAdapter):
 
             # 发送请求
             await self._ensure_http_client()
-            response = await self._http_client.post('/api/v1/jobs', data={**params, 'data_type': 'index_daily_data'})
+            response = await self._http_client.post('/api/v1/jobs', data=self._job_request('index_daily_data', params))
             response_data = self._unwrap_data(response) if isinstance(response, dict) else {}
 
             # 更新统计信息
@@ -685,7 +690,7 @@ class FlowhubAdapter(ISystemAdapter):
 
             # 发送请求
             await self._ensure_http_client()
-            response = await self._http_client.post('/api/v1/jobs', data={**params, 'data_type': 'industry_board'})
+            response = await self._http_client.post('/api/v1/jobs', data=self._job_request('industry_board', params))
             response_data = self._unwrap_data(response) if isinstance(response, dict) else {}
 
             # 更新统计信息
@@ -721,7 +726,7 @@ class FlowhubAdapter(ISystemAdapter):
 
             # 发送请求
             await self._ensure_http_client()
-            response = await self._http_client.post('/api/v1/jobs', data={**params, 'data_type': 'concept_board'})
+            response = await self._http_client.post('/api/v1/jobs', data=self._job_request('concept_board', params))
             response_data = self._unwrap_data(response) if isinstance(response, dict) else {}
 
             # 更新统计信息
@@ -757,9 +762,9 @@ class FlowhubAdapter(ISystemAdapter):
         try:
             await self._ensure_http_client()
             # 构建请求参数 - 只包含 incremental 标志
+            normalized_type = self._normalize_data_type(data_type)
             params = {
                 'incremental': incremental,
-                'data_type': self._normalize_data_type(data_type),
             }
 
             # 不再传递任何日期范围参数（start_date, end_date, start_quarter, end_quarter,
@@ -781,7 +786,7 @@ class FlowhubAdapter(ISystemAdapter):
                 params['indicators'] = kwargs['indicators']
 
             # 发送统一任务创建请求
-            response = await self._http_client.post('/api/v1/jobs', data=params)
+            response = await self._http_client.post('/api/v1/jobs', data=self._job_request(normalized_type, params))
             response_data = self._unwrap_data(response) if isinstance(response, dict) else {}
 
             # 更新统计信息

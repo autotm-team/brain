@@ -11,6 +11,8 @@ import time
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 
+from asyncron import request_envelope
+
 from interfaces import ISystemAdapter
 from config import IntegrationConfig
 from exceptions import AdapterException, ConnectionException, HealthCheckException
@@ -210,8 +212,15 @@ class StrategyAdapter(ISystemAdapter):
                 # 使用请求映射器转换请求格式
                 mapped_request = self._request_mapper.map_strategy_analysis_request(request)
 
-                # 发送请求到execution服务
-                response = await self._http_client.post('analyze/batch', mapped_request)
+                response = await self._http_client.post(
+                    '/api/v1/jobs',
+                    request_envelope(
+                        {
+                            'job_type': 'batch_analyze',
+                            'params': mapped_request,
+                        }
+                    ),
+                )
 
                 # 如果是异步任务，等待 Job 完成后再处理结果
                 job_id = self._extract_job_id(response)
@@ -361,8 +370,15 @@ class StrategyAdapter(ISystemAdapter):
                 backtest_request_payload['callback_url'] = callback_url
             backtest_request = self._request_mapper.map_backtest_request(backtest_request_payload)
 
-            # 发送回测请求
-            response = await self._http_client.post('backtest/run', backtest_request)
+            response = await self._http_client.post(
+                '/api/v1/jobs',
+                request_envelope(
+                    {
+                        'job_type': 'run_backtest',
+                        'params': backtest_request,
+                    }
+                ),
+            )
 
             job_id = self._extract_job_id(response)
             if job_id:
@@ -427,7 +443,7 @@ class StrategyAdapter(ISystemAdapter):
     def _extract_job_id(self, response: Dict[str, Any]) -> Optional[str]:
         data = response.get('data') if isinstance(response, dict) else None
         if isinstance(data, dict):
-            return data.get('job_id') or data.get('task_id')
+            return data.get('job_id')
         return response.get('job_id') if isinstance(response, dict) else None
 
     async def _wait_for_job_completion(self, job_id: str, timeout: int = 600, poll_interval: int = 2) -> Dict[str, Any]:
@@ -475,13 +491,13 @@ class StrategyAdapter(ISystemAdapter):
         """通过 Execution 查询分析历史（分页/排序/过滤），透传所有筛选参数"""
         if not self._http_client:
             raise AdapterException("StrategyAdapter", "HTTP client not initialized")
-        return await self._http_client.get('analyze/history', params=params)
+        return await self._http_client.get('ui/execution/history', params=params)
 
     async def query_signal_stream(self, **params) -> Dict[str, Any]:
         """通过 Execution 查询信号流（游标分页）"""
         if not self._http_client:
             raise AdapterException("StrategyAdapter", "HTTP client not initialized")
-        return await self._http_client.get('analyze/signal/stream', params=params)
+        return await self._http_client.get('ui/execution/signals/stream', params=params)
 
     async def query_backtest_history(self,
                                      strategy_type: Optional[str] = None,
@@ -512,7 +528,7 @@ class StrategyAdapter(ISystemAdapter):
             params['min_total_return'] = min_total_return
         if max_drawdown is not None:
             params['max_drawdown'] = max_drawdown
-        return await self._http_client.get('backtest/history', params=params)
+        return await self._http_client.get('ui/execution/backtests/history', params=params)
 
     # 私有辅助方法
     async def _poll_backtest_result(self, task_id: str, max_wait_time: int = 300) -> Dict[str, Any]:
@@ -554,7 +570,7 @@ class StrategyAdapter(ISystemAdapter):
         try:
             if self._http_client:
                 # 获取execution服务的分析能力
-                response = await self._http_client.get('analyze/capabilities')
+                response = await self._http_client.get('ui/execution/analyzers')
                 if response.get('success'):
                     capabilities = response.get('data', {})
                     available_analyzers = capabilities.get('available_analyzers', [])

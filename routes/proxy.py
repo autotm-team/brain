@@ -21,12 +21,8 @@ def setup_proxy_routes(app: web.Application, cors: CorsConfig = None):
         '/api/v1/theories',
         '/api/v1/theories/{tail:.*}',
         # Execution
-        '/api/v1/analyze',
-        '/api/v1/analyze/{tail:.*}',
         '/api/v1/alpha',
         '/api/v1/alpha/{tail:.*}',
-        '/api/v1/backtest',
-        '/api/v1/backtest/{tail:.*}',
         '/api/v1/strategy',
         '/api/v1/strategy/{tail:.*}',
         '/api/v1/realtime',

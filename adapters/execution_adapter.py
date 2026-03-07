@@ -9,6 +9,7 @@ import logging
 import time
 from typing import Dict, Any, List, Optional
 
+from asyncron import request_envelope
 from config import IntegrationConfig
 from adapters.http_client import HttpClient
 
@@ -45,8 +46,8 @@ class ExecutionAdapter:
                     - cache_enabled: bool - 是否启用缓存
 
         Returns:
-            Dict[str, Any]: 分析结果
-                - task_id: str - 任务ID
+            Dict[str, Any]: 统一 job 创建结果
+                - job_id: str - 任务ID
                 - status: str - 任务状态
                 - message: str - 消息
 
@@ -71,8 +72,15 @@ class ExecutionAdapter:
             else:
                 logger.info(f"Triggering batch analysis for ALL stocks with analyzers: {analyzers}")
 
-            # 调用Execution服务的批量分析API
-            response = await self._http_client.post('analyze/batch', request_body)
+            response = await self._http_client.post(
+                '/api/v1/jobs',
+                request_envelope(
+                    {
+                        'job_type': 'batch_analyze',
+                        'params': request_body,
+                    }
+                ),
+            )
 
             logger.info(f"Batch analysis triggered successfully: {response}")
             return response.get('data', {})
@@ -104,10 +112,10 @@ class ExecutionAdapter:
 
     async def submit_ui_job(self, job_type: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """提交 execution UI 任务（统一 jobs 契约）。"""
-        payload = {
+        payload = request_envelope({
             "job_type": job_type,
             "params": params if isinstance(params, dict) else {},
-        }
+        })
         response = await self._http_client.post("/api/v1/jobs", payload)
         data = response.get("data") if isinstance(response, dict) and isinstance(response.get("data"), dict) else response
         if not isinstance(data, dict):
@@ -162,51 +170,6 @@ class ExecutionAdapter:
             await asyncio.sleep(poll_interval)
         raise TimeoutError(f"Execution job {job_id} timeout after {timeout}s")
     
-    async def get_analysis_result(self, task_id: str) -> Dict[str, Any]:
-        """获取分析结果
-        
-        Args:
-            task_id: 任务ID
-        
-        Returns:
-            Dict[str, Any]: 分析结果
-        
-        Raises:
-            Exception: 调用失败时抛出异常
-        """
-        try:
-            response = await self._http_client.get(f'analyze/batch/{task_id}')
-            return response.get('data', {})
-            
-        except Exception as e:
-            logger.error(f"Failed to get analysis result for task {task_id}: {e}")
-            raise
-    
-    async def get_task_status(self, task_id: str) -> Dict[str, Any]:
-        """获取任务状态
-        
-        Args:
-            task_id: 任务ID
-        
-        Returns:
-            Dict[str, Any]: 任务状态
-                - task_id: str
-                - status: str
-                - progress: int
-                - created_at: str
-                - updated_at: str
-        
-        Raises:
-            Exception: 调用失败时抛出异常
-        """
-        try:
-            response = await self._http_client.get(f'/api/v1/jobs/{task_id}')
-            return response.get('data', {})
-            
-        except Exception as e:
-            logger.error(f"Failed to get task status for {task_id}: {e}")
-            raise
-    
     async def analyze_single(self, symbol: str, analyzers: List[str] = None, 
                             config: Dict[str, Any] = None) -> Dict[str, Any]:
         """分析单个股票
@@ -239,7 +202,7 @@ class ExecutionAdapter:
     async def get_analysis_history(self, **params) -> Dict[str, Any]:
         """获取分析历史（透传所有筛选参数）"""
         try:
-            response = await self._http_client.get('analyze/history', params)
+            response = await self._http_client.get('ui/execution/history', params)
             return response
         except Exception as e:
             logger.error(f"Failed to get analysis history: {e}")

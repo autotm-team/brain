@@ -29,6 +29,9 @@ def setup_task_routes(app: web.Application, cors: CorsConfig = None):
     route = app.router.add_get('/api/v1/task-jobs', task_handler.list_task_jobs)
     if cors:
         cors.add(route)
+    route = app.router.add_get('/api/v1/task-jobs/types', task_handler.list_task_job_types)
+    if cors:
+        cors.add(route)
     route = app.router.add_get('/api/v1/task-jobs/{task_job_id}', task_handler.get_task_job)
     if cors:
         cors.add(route)
@@ -36,9 +39,6 @@ def setup_task_routes(app: web.Application, cors: CorsConfig = None):
     if cors:
         cors.add(route)
     route = app.router.add_get('/api/v1/task-jobs/{task_job_id}/history', task_handler.get_task_job_history)
-    if cors:
-        cors.add(route)
-    route = app.router.add_get('/api/v1/task-jobs/types', task_handler.list_task_job_types)
     if cors:
         cors.add(route)
 

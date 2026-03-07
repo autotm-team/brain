@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from asyncron import request_envelope
+
 try:
     from ..config import IntegrationConfig
     from ..adapters.flowhub_adapter import FlowhubAdapter
@@ -42,7 +44,7 @@ def _ensure_dir(path: str) -> None:
 @dataclass
 class InitPhaseState:
     name: str
-    status: str = "pending"  # pending|running|completed|failed|skipped
+    status: str = "queued"  # queued|running|succeeded|failed|skipped
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
     job_ids: List[str] = field(default_factory=list)
@@ -193,7 +195,7 @@ class DataInitializationCoordinator:
         phase = self.state.phases[name]
 
         # 记录上次执行状态（用于监控）
-        if phase.status in ("completed", "skipped"):
+        if phase.status in ("succeeded", "skipped"):
             logger.info(f"Phase {name} was previously {phase.status}, re-running for incremental update")
 
         # 重置阶段状态为运行中
@@ -207,7 +209,7 @@ class DataInitializationCoordinator:
             jobs = await fn()
             if jobs:
                 phase.job_ids.extend(jobs)
-            phase.status = "completed"
+            phase.status = "succeeded"
             phase.completed_at = _now_iso()
             self.state.save(self.state_path)
             logger.info(f"Phase {name} completed with {len(jobs or [])} jobs")
@@ -249,78 +251,73 @@ class DataInitializationCoordinator:
         await adapter.connect_to_system()
         try:
             # 1. 股票基础信息
-            req_stock_basic = {"update_mode": "incremental"}
             resp_stock_basic = await adapter.send_request({
                 "method": "POST",
                 "endpoint": "/api/v1/jobs",
-                "payload": {**req_stock_basic, "data_type": "stock_basic_data"},
+                "payload": request_envelope({
+                    "job_type": "stock_basic_data",
+                    "params": {"update_mode": "incremental"},
+                }),
             })
             jobs.append(resp_stock_basic.get("job_id", ""))
 
             # 2. 交易日历
-            req_trade_calendar = {"exchange": "SSE", "update_mode": "incremental"}
             resp_trade_calendar = await adapter.send_request({
                 "method": "POST",
                 "endpoint": "/api/v1/jobs",
-                "payload": {**req_trade_calendar, "data_type": "trade_calendar_data"},
+                "payload": request_envelope({
+                    "job_type": "trade_calendar_data",
+                    "params": {"exchange": "SSE", "update_mode": "incremental"},
+                }),
             })
             jobs.append(resp_trade_calendar.get("job_id", ""))
 
             # 3. 申万行业分类及成分映射
-            req_sw_industry = {"src": "SW2021", "update_mode": "incremental", "include_members": True}
             resp_sw_industry = await adapter.send_request({
                 "method": "POST",
                 "endpoint": "/api/v1/jobs",
-                "payload": {**req_sw_industry, "data_type": "sw_industry_data"},
+                "payload": request_envelope({
+                    "job_type": "sw_industry_data",
+                    "params": {"src": "SW2021", "update_mode": "incremental", "include_members": True},
+                }),
             })
             jobs.append(resp_sw_industry.get("job_id", ""))
 
             # 4. 指数基础信息
-            req_index_info = {"update_mode": "incremental"}
             resp_index_info = await adapter.send_request({
                 "method": "POST",
                 "endpoint": "/api/v1/jobs",
-                "payload": {**req_index_info, "data_type": "index_info"},
+                "payload": request_envelope({
+                    "job_type": "index_info",
+                    "params": {"update_mode": "incremental"},
+                }),
             })
             jobs.append(resp_index_info.get("job_id", ""))
 
             # 5. 指数日线
-            req_index_daily = {"update_mode": "incremental"}
-            resp_index_daily = await adapter.send_request({
-                "method": "POST",
-                "endpoint": "/api/v1/jobs",
-                "payload": {**req_index_daily, "data_type": "index_daily_data"},
-            })
+            resp_index_daily = await adapter.create_index_daily_data_job(update_mode="incremental")
             jobs.append(resp_index_daily.get("job_id", ""))
 
             # 6. 指数成分股
-            req_index_components = {
-                "update_mode": "snapshot",
-                "index_codes": ["000300.SH", "000905.SH", "000852.SH", "000001.SH", "399001.SZ", "399006.SZ"],
-            }
             resp_index_components = await adapter.send_request({
                 "method": "POST",
                 "endpoint": "/api/v1/jobs",
-                "payload": {**req_index_components, "data_type": "index_components"},
+                "payload": request_envelope({
+                    "job_type": "index_components",
+                    "params": {
+                        "update_mode": "snapshot",
+                        "index_codes": ["000300.SH", "000905.SH", "000852.SH", "000001.SH", "399001.SZ", "399006.SZ"],
+                    },
+                }),
             })
             jobs.append(resp_index_components.get("job_id", ""))
 
             # 7. 行业板块数据
-            req_industry_board = {"source": "ths", "update_mode": "full_update"}
-            resp_industry_board = await adapter.send_request({
-                "method": "POST",
-                "endpoint": "/api/v1/jobs",
-                "payload": {**req_industry_board, "data_type": "industry_board"},
-            })
+            resp_industry_board = await adapter.create_industry_board_job(source="ths", update_mode="full_update")
             jobs.append(resp_industry_board.get("job_id", ""))
 
             # 8. 概念板块数据
-            req_concept_board = {"source": "ths", "update_mode": "full_update"}
-            resp_concept_board = await adapter.send_request({
-                "method": "POST",
-                "endpoint": "/api/v1/jobs",
-                "payload": {**req_concept_board, "data_type": "concept_board"},
-            })
+            resp_concept_board = await adapter.create_concept_board_job(source="ths", update_mode="full_update")
             jobs.append(resp_concept_board.get("job_id", ""))
 
             return jobs
@@ -382,7 +379,7 @@ class DataInitializationCoordinator:
             jobs.append(basic_resp.get("job_id", ""))
 
             # 股票日K（增量/全量由 flowhub 决定）
-            # 统一任务接口：POST /api/v1/jobs + data_type=batch_daily_ohlc
+            # 统一任务接口：POST /api/v1/jobs + request_envelope(job_type=batch_daily_ohlc)
             req = {"incremental": True}
             resp = await adapter.create_batch_stock_data_job(req)
             jobs.append(resp.get("job_id", ""))

@@ -1133,17 +1133,17 @@ class UIBffHandler(BaseHandler):
     ) -> Dict[str, Any]:
         def _normalize_job_status(raw: Any) -> str:
             token = str(raw or "").strip().lower()
-            if token in {"queued", "pending", "submitted", "accepted", "created", "idle"}:
+            if token == "queued":
                 return "queued"
-            if token in {"running", "in_progress", "processing"}:
+            if token == "running":
                 return "running"
-            if token in {"succeeded", "success", "completed", "done"}:
+            if token == "succeeded":
                 return "succeeded"
-            if token in {"failed", "error", "timeout"}:
+            if token == "failed":
                 return "failed"
-            if token in {"cancelled", "canceled"}:
+            if token == "cancelled":
                 return "cancelled"
-            return token
+            return "failed"
 
         def _parse_job_result(job: Dict[str, Any]) -> Dict[str, Any]:
             raw = job.get("result")
@@ -1817,7 +1817,7 @@ class UIBffHandler(BaseHandler):
 
     async def _handle_candidate_analyzers(self, request: web.Request) -> web.Response:
         try:
-            payload = await self._fetch_upstream_json(request, "execution", "/api/v1/analyze/capabilities")
+            payload = await self._fetch_upstream_json(request, "execution", "/api/v1/ui/execution/analyzers")
             data = self._unwrap_response_data(payload)
             raw_items = data.get("analyzers") if isinstance(data.get("analyzers"), list) else []
             items: list[Dict[str, Any]] = []
@@ -1866,6 +1866,91 @@ class UIBffHandler(BaseHandler):
         except Exception as exc:
             self.logger.error(f"load candidate analyzers failed: {exc}")
             return self.error_response("Failed to load candidate analyzers", 500)
+
+    async def _handle_execution_analyzers(self, request: web.Request) -> web.Response:
+        try:
+            payload = await self._fetch_upstream_json(request, "execution", "/api/v1/ui/execution/analyzers")
+            data = self._unwrap_response_data(payload)
+            items = data.get("analyzers") if isinstance(data.get("analyzers"), list) else []
+            available = data.get("available_analyzers") if isinstance(data.get("available_analyzers"), list) else []
+            if not available and items:
+                available = [
+                    str(item.get("name") or "").strip()
+                    for item in items
+                    if isinstance(item, dict) and str(item.get("name") or "").strip()
+                ]
+            return self.success_response({**data, "analyzers": items, "available_analyzers": available, "total": len(items)})
+        except Exception as exc:
+            self.logger.error(f"load execution analyzers failed: {exc}")
+            return self.error_response("Failed to load execution analyzers", 500)
+
+    async def _handle_execution_top_stocks(self, request: web.Request) -> web.Response:
+        try:
+            params = {"limit": self._safe_int(request.query.get("limit"), 20)}
+            payload = await self._fetch_upstream_json(request, "execution", "/api/v1/ui/execution/stocks/top", params=params)
+            return self.success_response(self._unwrap_response_data(payload))
+        except Exception as exc:
+            self.logger.error(f"load execution top stocks failed: {exc}")
+            return self.error_response("Failed to load execution top stocks", 500)
+
+    async def _handle_execution_latest_signals(self, request: web.Request) -> web.Response:
+        try:
+            params: Dict[str, Any] = {}
+            if request.query.get("symbols"):
+                params["symbols"] = request.query.get("symbols")
+            payload = await self._fetch_upstream_json(request, "execution", "/api/v1/ui/execution/signals/latest", params=params)
+            return self.success_response(self._unwrap_response_data(payload))
+        except Exception as exc:
+            self.logger.error(f"load latest execution signals failed: {exc}")
+            return self.error_response("Failed to load latest execution signals", 500)
+
+    async def _handle_execution_signal_stream(self, request: web.Request) -> web.Response:
+        try:
+            payload = await self._fetch_upstream_json(request, "execution", "/api/v1/ui/execution/signals/stream", params=dict(request.query))
+            return self.success_response(self._unwrap_response_data(payload))
+        except Exception as exc:
+            self.logger.error(f"load execution signal stream failed: {exc}")
+            return self.error_response("Failed to load execution signal stream", 500)
+
+    async def _handle_execution_history(self, request: web.Request) -> web.Response:
+        try:
+            payload = await self._fetch_upstream_json(request, "execution", "/api/v1/ui/execution/history", params=dict(request.query))
+            return self.success_response(self._unwrap_response_data(payload))
+        except Exception as exc:
+            self.logger.error(f"load execution history failed: {exc}")
+            return self.error_response("Failed to load execution history", 500)
+
+    async def _handle_execution_analyzer_backtests(self, request: web.Request) -> web.Response:
+        try:
+            payload = await self._fetch_upstream_json(request, "execution", "/api/v1/ui/execution/analyzer-backtests", params=dict(request.query))
+            return self.success_response(self._unwrap_response_data(payload))
+        except Exception as exc:
+            self.logger.error(f"load execution analyzer backtests failed: {exc}")
+            return self.error_response("Failed to load execution analyzer backtests", 500)
+
+    async def _handle_execution_analyzer_backtest_options(self, request: web.Request) -> web.Response:
+        try:
+            payload = await self._fetch_upstream_json(request, "execution", "/api/v1/ui/execution/analyzer-backtests/options")
+            return self.success_response(self._unwrap_response_data(payload))
+        except Exception as exc:
+            self.logger.error(f"load execution analyzer backtest options failed: {exc}")
+            return self.error_response("Failed to load execution analyzer backtest options", 500)
+
+    async def _handle_execution_backtest_history(self, request: web.Request) -> web.Response:
+        try:
+            payload = await self._fetch_upstream_json(request, "execution", "/api/v1/ui/execution/backtests/history", params=dict(request.query))
+            return self.success_response(self._unwrap_response_data(payload))
+        except Exception as exc:
+            self.logger.error(f"load execution backtest history failed: {exc}")
+            return self.error_response("Failed to load execution backtest history", 500)
+
+    async def _handle_execution_backtest_capabilities(self, request: web.Request) -> web.Response:
+        try:
+            payload = await self._fetch_upstream_json(request, "execution", "/api/v1/ui/execution/backtests/capabilities")
+            return self.success_response(self._unwrap_response_data(payload))
+        except Exception as exc:
+            self.logger.error(f"load execution backtest capabilities failed: {exc}")
+            return self.error_response("Failed to load execution backtest capabilities", 500)
 
     async def _handle_system_jobs_overview(self, request: web.Request) -> web.Response:
         orchestrator = self.get_app_component(request, "task_orchestrator")
@@ -3428,6 +3513,24 @@ class UIBffHandler(BaseHandler):
             return await self._handle_search(request)
         if method == "GET" and path == "/api/v1/ui/candidates/analyzers":
             return await self._handle_candidate_analyzers(request)
+        if method == "GET" and path == "/api/v1/ui/execution/analyzers":
+            return await self._handle_execution_analyzers(request)
+        if method == "GET" and path == "/api/v1/ui/execution/stocks/top":
+            return await self._handle_execution_top_stocks(request)
+        if method == "GET" and path == "/api/v1/ui/execution/signals/latest":
+            return await self._handle_execution_latest_signals(request)
+        if method == "GET" and path == "/api/v1/ui/execution/signals/stream":
+            return await self._handle_execution_signal_stream(request)
+        if method == "GET" and path == "/api/v1/ui/execution/history":
+            return await self._handle_execution_history(request)
+        if method == "GET" and path == "/api/v1/ui/execution/analyzer-backtests":
+            return await self._handle_execution_analyzer_backtests(request)
+        if method == "GET" and path == "/api/v1/ui/execution/analyzer-backtests/options":
+            return await self._handle_execution_analyzer_backtest_options(request)
+        if method == "GET" and path == "/api/v1/ui/execution/backtests/history":
+            return await self._handle_execution_backtest_history(request)
+        if method == "GET" and path == "/api/v1/ui/execution/backtests/capabilities":
+            return await self._handle_execution_backtest_capabilities(request)
 
         if method == "GET" and path == "/api/v1/ui/system/jobs/overview":
             return await self._handle_system_jobs_overview(request)

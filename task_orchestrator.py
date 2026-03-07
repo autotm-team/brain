@@ -525,7 +525,10 @@ class TaskOrchestrator:
             task_job_id=mapped_task_job_id or task_job_id,
         )
         if mapped_task_job_id:
-            await self._append_history(mapped_task_job_id, "cancelled", normalized)
+            if normalized.get("status") == "cancelled":
+                await self._append_history(mapped_task_job_id, "cancelled", normalized)
+            else:
+                await self._append_history_if_changed(mapped_task_job_id, normalized)
         return normalized
 
     async def get_task_job_history(self, task_job_id: str) -> Dict[str, Any]:
@@ -585,10 +588,6 @@ class TaskOrchestrator:
         return dict(metadata)
 
     def _build_create_payload(self, service: str, job_type: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        if service == "flowhub":
-            flowhub_payload = dict(params)
-            flowhub_payload.setdefault("data_type", job_type)
-            return flowhub_payload
         return request_envelope({
             "job_type": job_type,
             "params": params,
@@ -733,11 +732,8 @@ class TaskOrchestrator:
 
     @staticmethod
     def _get_service_job_id(job: Dict[str, Any]) -> Optional[str]:
-        for key in ("job_id", "task_id", "id"):
-            value = job.get(key)
-            if isinstance(value, str) and value:
-                return value
-        return None
+        value = job.get("job_id")
+        return value if isinstance(value, str) and value else None
 
     async def _find_task_job_id(self, service: str, service_job_id: str) -> Optional[str]:
         for task_job_id, record in self._brain_jobs.items():
@@ -757,24 +753,16 @@ class TaskOrchestrator:
     def _normalize_job(self, service: str, job: Dict[str, Any], task_job_id: str) -> Dict[str, Any]:
         job = job if isinstance(job, dict) else {}
         service_job_id = self._get_service_job_id(job) or task_job_id
-        status = self._normalize_status(job.get("status") or job.get("state") or job.get("job_status"))
+        status = self._normalize_status(job.get("status"))
         progress = self._normalize_progress(job.get("progress"), status)
         params = job.get("params") if isinstance(job.get("params"), dict) else {}
         metadata = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
         message = metadata.get("message") or job.get("message")
-        job_type = (
-            job.get("job_type")
-            or job.get("type")
-            or job.get("task_type")
-            or job.get("data_type")
-            or params.get("job_type")
-            or params.get("data_type")
-            or "unknown"
-        )
+        job_type = job.get("job_type") or "unknown"
         created_at = job.get("created_at")
-        started_at = job.get("started_at") or job.get("start_time")
-        updated_at = job.get("updated_at") or job.get("last_update")
-        completed_at = job.get("completed_at") or job.get("end_time")
+        started_at = job.get("started_at")
+        updated_at = job.get("updated_at")
+        completed_at = job.get("completed_at")
         if updated_at is None:
             updated_at = completed_at or started_at or created_at
         task_name = (
@@ -783,8 +771,6 @@ class TaskOrchestrator:
             or job.get("task_name")
             or params.get("job_name")
             or job.get("job_name")
-            or job.get("name")
-            or job.get("title")
         )
         job_type_zh = self._resolve_job_type_zh(
             service=service,
