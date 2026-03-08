@@ -2,9 +2,10 @@
 # AutoTM三层金融交易系统集成协调服务
 
 FROM python:3.13-slim AS base
-ARG APT_MIRROR=mirrors.tuna.tsinghua.edu.cn
+ARG APT_MIRROR=deb.debian.org
 ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 ARG PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
+ARG PIP_EXTRA_INDEX_URL=https://pypi.org/simple
 
 # 设置环境变量
 ENV PYTHONUNBUFFERED=1
@@ -13,6 +14,7 @@ ENV PYTHONPATH=/app
 ENV TZ=Asia/Shanghai
 ENV PIP_INDEX_URL=${PIP_INDEX_URL}
 ENV PIP_TRUSTED_HOST=${PIP_TRUSTED_HOST}
+ENV PIP_EXTRA_INDEX_URL=${PIP_EXTRA_INDEX_URL}
 
 # 安装系统依赖（Python 3.13 下部分科学计算包会触发源码构建，需编译器）
 RUN set -eux; \
@@ -28,6 +30,7 @@ RUN set -eux; \
       build-essential \
       gcc \
       g++ \
+      python3-setuptools \
       ca-certificates; \
     apt-get -f install -y; \
     rm -rf /var/lib/apt/lists/*
@@ -50,7 +53,8 @@ COPY external/asyncron/ ./external/asyncron/
 
 # 安装本地共享库
 RUN cd external/econdb && pip install --no-cache-dir --user .
-RUN cd external/asyncron && pip install --no-cache-dir --user .
+RUN mkdir -p /root/.local/lib/python3.13/site-packages && \
+    cp -R external/asyncron/asyncron /root/.local/lib/python3.13/site-packages/
 
 # 复制服务代码
 COPY . ./

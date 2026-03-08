@@ -41,6 +41,13 @@ def _ensure_dir(path: str) -> None:
         os.makedirs(d, exist_ok=True)
 
 
+def _canonical_bootstrap_params(job_type: str, params: Dict[str, Any]) -> str:
+    payload = dict(params or {})
+    payload.pop("data_type", None)
+    payload["_job_type"] = job_type
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+
+
 @dataclass
 class InitPhaseState:
     name: str
@@ -106,6 +113,8 @@ class DataInitializationCoordinator:
         self.config = config
         self.state_path = STATE_PATH
         self.state = InitState.from_file(self.state_path)
+        self.bootstrap_success_ttl_seconds = int(os.getenv("BRAIN_BOOTSTRAP_SUCCESS_TTL_SECONDS", "43200"))
+        self.flowhub_stable_wait_seconds = int(os.getenv("BRAIN_FLOWHUB_STABLE_WAIT_SECONDS", "20"))
         # define phases
         for name in ("stock_meta", "macro_core", "equities", "macro_rest"):
             if name not in self.state.phases:
@@ -168,10 +177,20 @@ class DataInitializationCoordinator:
             try:
                 adapter = FlowhubAdapter(self.config)
                 connected = await adapter.connect_to_system()
-                await adapter.disconnect_from_system()
                 if connected:
-                    logger.info("Flowhub dependency is healthy")
-                    return
+                    status_payload = await adapter.get_system_status()
+                    lifecycle = status_payload.get("lifecycle") if isinstance(status_payload, dict) else {}
+                    if isinstance(lifecycle, dict) and lifecycle.get("startup_stable") is True:
+                        logger.info("Flowhub dependency is healthy and startup-stable")
+                        await adapter.disconnect_from_system()
+                        return
+                    logger.info(
+                        "Flowhub dependency is healthy but not startup-stable yet; waiting %ss",
+                        self.flowhub_stable_wait_seconds,
+                    )
+                    await adapter.disconnect_from_system()
+                    await asyncio.sleep(self.flowhub_stable_wait_seconds)
+                    continue
             except Exception as e:
                 logger.warning(f"Flowhub health not ready (attempt {attempt}): {e}")
 
@@ -185,6 +204,72 @@ class DataInitializationCoordinator:
 
             delay = backoff[min(len(backoff) - 1, attempt - 1)]
             await asyncio.sleep(delay)
+
+    async def _find_reusable_job(
+        self,
+        adapter: FlowhubAdapter,
+        job_type: str,
+        params: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        expected = _canonical_bootstrap_params(job_type, params)
+        now_ts = datetime.utcnow().timestamp()
+        jobs = await adapter.list_jobs(limit=200, offset=0)
+        for job in jobs:
+            if str(job.get("job_type") or "") != job_type:
+                continue
+            current = _canonical_bootstrap_params(job_type, job.get("params") or {})
+            if current != expected:
+                continue
+            status = str(job.get("status") or "").lower()
+            if status in {"queued", "running"}:
+                return job
+            if status == "succeeded":
+                completed_at = job.get("completed_at")
+                try:
+                    completed_ts = float(completed_at or 0.0)
+                except Exception:
+                    completed_ts = 0.0
+                result = job.get("result")
+                is_terminal_skip = False
+                if isinstance(result, dict):
+                    reason = str(result.get("reason") or "").lower()
+                    status_flag = str((result.get("data_summary") or {}).get("status") or "").lower()
+                    message = str(result.get("message") or "").lower()
+                    is_terminal_skip = (
+                        result.get("skipped") is True
+                        or reason in {"data already up to date", "invalid date range"}
+                        or status_flag == "up_to_date"
+                        or "already up to date" in message
+                    )
+                if is_terminal_skip or (completed_ts > 0 and now_ts - completed_ts <= self.bootstrap_success_ttl_seconds):
+                    return job
+        return None
+
+    async def _submit_or_reuse_flowhub_job(
+        self,
+        adapter: FlowhubAdapter,
+        job_type: str,
+        params: Dict[str, Any],
+    ) -> str:
+        reusable = await self._find_reusable_job(adapter, job_type, params)
+        if reusable:
+            job_id = str(reusable.get("job_id") or "")
+            logger.info(
+                "Reuse existing bootstrap flowhub job type=%s status=%s job_id=%s",
+                job_type,
+                reusable.get("status"),
+                job_id,
+            )
+            return job_id
+        resp = await adapter.send_request({
+            "method": "POST",
+            "endpoint": "/api/v1/jobs",
+            "payload": request_envelope({
+                "job_type": job_type,
+                "params": dict(params or {}),
+            }),
+        })
+        return str(resp.get("job_id") or "")
 
     async def _run_phase(self, name: str, fn) -> None:
         """执行初始化阶段
@@ -251,74 +336,55 @@ class DataInitializationCoordinator:
         await adapter.connect_to_system()
         try:
             # 1. 股票基础信息
-            resp_stock_basic = await adapter.send_request({
-                "method": "POST",
-                "endpoint": "/api/v1/jobs",
-                "payload": request_envelope({
-                    "job_type": "stock_basic_data",
-                    "params": {"update_mode": "incremental"},
-                }),
-            })
-            jobs.append(resp_stock_basic.get("job_id", ""))
+            stock_basic_job_id = await self._submit_or_reuse_flowhub_job(
+                adapter,
+                "stock_basic_data",
+                {"update_mode": "incremental"},
+            )
+            jobs.append(stock_basic_job_id)
 
             # 2. 交易日历
-            resp_trade_calendar = await adapter.send_request({
-                "method": "POST",
-                "endpoint": "/api/v1/jobs",
-                "payload": request_envelope({
-                    "job_type": "trade_calendar_data",
-                    "params": {"exchange": "SSE", "update_mode": "incremental"},
-                }),
-            })
-            jobs.append(resp_trade_calendar.get("job_id", ""))
+            trade_calendar_job_id = await self._submit_or_reuse_flowhub_job(
+                adapter,
+                "trade_calendar_data",
+                {"exchange": "SSE", "update_mode": "incremental"},
+            )
+            jobs.append(trade_calendar_job_id)
 
             # 3. 申万行业分类及成分映射
-            resp_sw_industry = await adapter.send_request({
-                "method": "POST",
-                "endpoint": "/api/v1/jobs",
-                "payload": request_envelope({
-                    "job_type": "sw_industry_data",
-                    "params": {"src": "SW2021", "update_mode": "incremental", "include_members": True},
-                }),
-            })
-            jobs.append(resp_sw_industry.get("job_id", ""))
+            sw_industry_job_id = await self._submit_or_reuse_flowhub_job(
+                adapter,
+                "sw_industry_data",
+                {"src": "SW2021", "update_mode": "incremental", "include_members": True},
+            )
+            jobs.append(sw_industry_job_id)
 
             # 4. 指数基础信息
-            resp_index_info = await adapter.send_request({
-                "method": "POST",
-                "endpoint": "/api/v1/jobs",
-                "payload": request_envelope({
-                    "job_type": "index_info",
-                    "params": {"update_mode": "incremental"},
-                }),
-            })
-            jobs.append(resp_index_info.get("job_id", ""))
+            index_info_job_id = await self._submit_or_reuse_flowhub_job(
+                adapter,
+                "index_info",
+                {"update_mode": "incremental"},
+            )
+            jobs.append(index_info_job_id)
 
             # 5. 指数日线
-            resp_index_daily = await adapter.create_index_daily_data_job(update_mode="incremental")
-            jobs.append(resp_index_daily.get("job_id", ""))
+            index_daily_job_id = await self._submit_or_reuse_flowhub_job(
+                adapter,
+                "index_daily_data",
+                {"update_mode": "incremental"},
+            )
+            jobs.append(index_daily_job_id)
 
             # 6. 指数成分股
-            resp_index_components = await adapter.send_request({
-                "method": "POST",
-                "endpoint": "/api/v1/jobs",
-                "payload": request_envelope({
-                    "job_type": "index_components",
-                    "params": {
-                        "update_mode": "snapshot",
-                        "index_codes": ["000300.SH", "000905.SH", "000852.SH", "000001.SH", "399001.SZ", "399006.SZ"],
-                    },
-                }),
-            })
-            jobs.append(resp_index_components.get("job_id", ""))
-
-            # 7. 行业板块数据
-            resp_industry_board = await adapter.create_industry_board_job(source="ths", update_mode="full_update")
-            jobs.append(resp_industry_board.get("job_id", ""))
-
-            # 8. 概念板块数据
-            resp_concept_board = await adapter.create_concept_board_job(source="ths", update_mode="full_update")
-            jobs.append(resp_concept_board.get("job_id", ""))
+            index_components_job_id = await self._submit_or_reuse_flowhub_job(
+                adapter,
+                "index_components",
+                {
+                    "update_mode": "snapshot",
+                    "index_codes": ["000300.SH", "000905.SH", "000852.SH", "000001.SH", "399001.SZ", "399006.SZ"],
+                },
+            )
+            jobs.append(index_components_job_id)
 
             return jobs
         finally:
@@ -334,8 +400,11 @@ class DataInitializationCoordinator:
         adapter = FlowhubAdapter(self.config)
         await adapter.connect_to_system()
         try:
-            stock_index_resp = await adapter.create_macro_data_job("stock_index_data", incremental=True)
-            stock_index_job_id = stock_index_resp.get("job_id", "")
+            stock_index_job_id = await self._submit_or_reuse_flowhub_job(
+                adapter,
+                "stock_index_data",
+                {"incremental": True},
+            )
             if stock_index_job_id:
                 jobs.append(stock_index_job_id)
                 stock_index_status = await self._wait_job_started(adapter, stock_index_job_id, timeout_seconds=90)
@@ -350,9 +419,9 @@ class DataInitializationCoordinator:
 
             async def _create(dt: str, **kwargs):
                 async with sem:
-                    # 只传递 incremental=True，不传递 max_history 或日期范围参数
-                    resp = await adapter.create_macro_data_job(dt, incremental=True, **kwargs)
-                    jobs.append(resp.get("job_id", ""))
+                    params = {"incremental": True}
+                    params.update(kwargs)
+                    jobs.append(await self._submit_or_reuse_flowhub_job(adapter, dt, params))
 
             # 核心宏观（月度+日度）：价格指数、货币供应、利率、股指、资金流、商品价格
             # 注意：exchange-rate-data 目前未在 flowhub 路由中实现，先移除避免 405
@@ -374,15 +443,11 @@ class DataInitializationCoordinator:
         adapter = FlowhubAdapter(self.config)
         await adapter.connect_to_system()
         try:
-            basic_req = {"incremental": True}
-            basic_resp = await adapter.create_batch_basic_data_job(basic_req)
-            jobs.append(basic_resp.get("job_id", ""))
+            jobs.append(await self._submit_or_reuse_flowhub_job(adapter, "batch_daily_basic", {"incremental": True}))
 
             # 股票日K（增量/全量由 flowhub 决定）
             # 统一任务接口：POST /api/v1/jobs + request_envelope(job_type=batch_daily_ohlc)
-            req = {"incremental": True}
-            resp = await adapter.create_batch_stock_data_job(req)
-            jobs.append(resp.get("job_id", ""))
+            jobs.append(await self._submit_or_reuse_flowhub_job(adapter, "batch_daily_ohlc", {"incremental": True}))
             return jobs
         finally:
             await adapter.disconnect_from_system()
@@ -402,9 +467,18 @@ class DataInitializationCoordinator:
 
             async def _create(dt: str, **kwargs):
                 async with sem:
-                    # 只传递 incremental=True，不传递 max_history 或日期范围参数
-                    resp = await adapter.create_macro_data_job(dt, incremental=True, **kwargs)
-                    jobs.append(resp.get("job_id", ""))
+                    params = {"incremental": True}
+                    params.update(kwargs)
+                    jobs.append(await self._submit_or_reuse_flowhub_job(adapter, dt, params))
+
+            async def _create_flowhub(job_type: str, params: Dict[str, Any]):
+                async with sem:
+                    jobs.append(await self._submit_or_reuse_flowhub_job(adapter, job_type, params))
+
+            # 结构域依赖顺序：先板块日线，再板块成分股/资金流。
+            await _create_flowhub("industry_board", {"source": "ths", "update_mode": "incremental"})
+            await _create_flowhub("concept_board", {"source": "ths", "update_mode": "incremental"})
+
             # 其他宏观：社融、投资、工业、情绪、库存周期、GDP、创新、人口
             tasks = [
                 _create("social_financing_data"),
@@ -415,6 +489,10 @@ class DataInitializationCoordinator:
                 _create("gdp_data"),
                 _create("innovation_data"),
                 _create("demographic_data"),
+                _create_flowhub("industry_board_stocks", {"source": "ths", "update_mode": "incremental"}),
+                _create_flowhub("concept_board_stocks", {"source": "ths", "update_mode": "incremental"}),
+                _create_flowhub("industry_moneyflow_data", {"source": "ths", "update_mode": "incremental"}),
+                _create_flowhub("concept_moneyflow_data", {"source": "ths", "update_mode": "incremental"}),
             ]
             await asyncio.gather(*tasks)
             return jobs

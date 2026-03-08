@@ -459,10 +459,10 @@ class UIBffHandler(BaseHandler):
     }
 
     STRUCTURE_ROTATION_TEMPLATE_PARAMS = {
-        "industry_board": {"source": "ths", "update_mode": "full_update"},
-        "concept_board": {"source": "ths", "update_mode": "full_update"},
-        "industry_board_stocks": {"source": "ths", "update_mode": "full_update"},
-        "concept_board_stocks": {"source": "ths", "update_mode": "full_update"},
+        "industry_board": {"source": "ths", "update_mode": "incremental"},
+        "concept_board": {"source": "ths", "update_mode": "incremental"},
+        "industry_board_stocks": {"source": "ths", "update_mode": "incremental"},
+        "concept_board_stocks": {"source": "ths", "update_mode": "incremental"},
         "industry_moneyflow_data": {"source": "ths", "incremental": True},
         "concept_moneyflow_data": {"source": "em", "incremental": True},
         "batch_daily_basic": {"incremental": True},
