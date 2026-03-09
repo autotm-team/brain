@@ -5,11 +5,20 @@
 import asyncio
 import hashlib
 import json
+import os
 import time
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from asyncron import request_envelope
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+ECONDB_PATH = PROJECT_ROOT / "external" / "econdb"
+if ECONDB_PATH.exists() and str(ECONDB_PATH) not in os.sys.path:
+    os.sys.path.insert(0, str(ECONDB_PATH))
+
+from econdb import create_database_manager  # type: ignore
 
 
 class UpstreamServiceError(RuntimeError):
@@ -91,6 +100,7 @@ class TaskOrchestrator:
         "ui_strategy_config_apply": "策略配置应用",
         "ui_strategy_preset_save": "策略预设保存",
         "batch_analyze": "批量分析",
+        "analysis_backfill": "分析结果回补",
         # Macro/Portfolio UI jobs
         "ui_macro_cycle_freeze": "宏观周期冻结",
         "ui_macro_cycle_mark_seen": "宏观周期标记已读",
@@ -114,6 +124,8 @@ class TaskOrchestrator:
         self._brain_jobs: Dict[str, Dict[str, Any]] = {}
         self._history: Dict[str, List[Dict[str, Any]]] = {}
         self._job_types_cache: Dict[str, Dict[str, Any]] = {}
+        self._db_manager = None
+        self._local_auto_chain_claims: set[str] = set()
 
     async def create_task_job(
         self,
@@ -144,6 +156,7 @@ class TaskOrchestrator:
             "service_job_id": service_job_id,
             "job_type": job_type,
             "created_at": self._utc_now(),
+            "params": normalized_params,
             "metadata": normalized_metadata,
             "request_payload_hash": request_payload_hash,
         }
@@ -409,6 +422,7 @@ class TaskOrchestrator:
                     normalized = self._compact_job_for_list(normalized)
                     if mapped_id:
                         await self._append_history_if_changed(mapped_id, normalized)
+                        await self._maybe_trigger_followups(mapped_id, normalized)
                     if status and normalized.get("status") != self._normalize_status(status):
                         continue
                     jobs.append(normalized)
@@ -478,6 +492,7 @@ class TaskOrchestrator:
                 normalized = await self._merge_record_metadata(mapped_task_job_id, normalized)
             if mapped_task_job_id:
                 await self._append_history_if_changed(mapped_task_job_id, normalized)
+                await self._maybe_trigger_followups(mapped_task_job_id, normalized)
             return normalized
         except UpstreamServiceError as exc:
             if not mapped_task_job_id:
@@ -965,6 +980,274 @@ class TaskOrchestrator:
             await redis.set(self._index_key(record["service"], record["service_job_id"]), task_job_id)
         except Exception:
             return
+
+    async def _update_task_record_metadata(self, task_job_id: str, updates: Dict[str, Any]) -> None:
+        record = await self._load_task_record(task_job_id)
+        if not isinstance(record, dict):
+            return
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        metadata = {**metadata, **(updates or {})}
+        record["metadata"] = metadata
+        await self._save_task_record(record)
+
+    def _get_db_manager(self):
+        if self._db_manager is None:
+            self._db_manager = create_database_manager()
+        return self._db_manager
+
+    def _get_table_latest_date(self, table_name: str, column: str = "trade_date") -> Optional[str]:
+        try:
+            value = self._get_db_manager().get_table_max_value(table_name, column)
+        except Exception:
+            return None
+        if value is None:
+            return None
+        return value.isoformat() if hasattr(value, "isoformat") else str(value)
+
+    async def _claim_auto_chain(self, key: str) -> bool:
+        redis = self._redis()
+        if redis:
+            try:
+                claimed = await redis.set(self._auto_chain_key(key), "1", nx=True, ex=86400)
+                return bool(claimed)
+            except Exception:
+                pass
+        if key in self._local_auto_chain_claims:
+            return False
+        self._local_auto_chain_claims.add(key)
+        return True
+
+    @staticmethod
+    def _auto_chain_key(key: str) -> str:
+        return f"brain:auto_chain:{key}"
+
+    async def _maybe_trigger_followups(self, task_job_id: str, normalized: Dict[str, Any]) -> None:
+        if str(normalized.get("status") or "") != "succeeded":
+            return
+        service = str(normalized.get("service") or "").strip().lower()
+        job_type = str(normalized.get("job_type") or "").strip()
+        try:
+            if service == "flowhub" and job_type in {"batch_daily_ohlc", "batch_daily_basic"}:
+                await self._maybe_trigger_daily_analysis(task_job_id, normalized)
+            elif service == "execution" and job_type == "batch_analyze":
+                await self._maybe_trigger_candidate_sync(task_job_id, normalized)
+        except Exception as exc:
+            await self._append_history(
+                task_job_id,
+                "auto_chain_error",
+                normalized,
+            )
+            normalized_metadata = normalized.get("metadata") if isinstance(normalized.get("metadata"), dict) else {}
+            normalized_metadata["auto_chain_error"] = str(exc)
+            await self._update_task_record_metadata(task_job_id, normalized_metadata)
+
+    async def _maybe_trigger_daily_analysis(self, task_job_id: str, normalized: Dict[str, Any]) -> None:
+        ready, blocked_reason, latest_ohlc, latest_basic = await self._evaluate_daily_analysis_prereqs(
+            source_task_job_id=task_job_id,
+        )
+        if not ready:
+            await self._update_task_record_metadata(
+                task_job_id,
+                {
+                    "auto_chain_blocked_reason": blocked_reason,
+                    "auto_chain_latest_ohlc_trade_date": latest_ohlc,
+                    "auto_chain_latest_basic_trade_date": latest_basic,
+                },
+            )
+            await self._append_history(task_job_id, "auto_chain_blocked", normalized)
+            return
+        source_record = await self._load_task_record(task_job_id) or {}
+        source_params = source_record.get("params") if isinstance(source_record.get("params"), dict) else {}
+        scope_signature = self._scope_signature(source_params)
+        claim_key = self._auto_chain_claim_key("daily_analysis", latest_ohlc, scope_signature)
+        if not await self._claim_auto_chain(claim_key):
+            return
+        source_symbols = source_params.get("symbols") if isinstance(source_params.get("symbols"), list) else None
+        created = await self.create_task_job(
+            service="execution",
+            job_type="batch_analyze",
+            params={
+                **({"symbols": list(source_symbols)} if source_symbols else {}),
+                "analyzers": ["livermore", "multi_indicator", "chanlun"],
+                "config": {
+                    "mode": "incremental",
+                    "save_all_dates": True,
+                    "save_daily_states": True,
+                    "emit_events": True,
+                    "cache_enabled": False,
+                    "use_incremental": True,
+                },
+            },
+            metadata={
+                "auto_chain_source": "flowhub_daily",
+                "auto_chain_trade_date": latest_ohlc,
+                **({"auto_chain_symbol_scope": list(source_symbols)} if source_symbols else {}),
+            },
+        )
+        await self._update_task_record_metadata(
+            task_job_id,
+            {
+                "auto_chain_trade_date": latest_ohlc,
+                "followup_execution_task_job_id": created.get("id"),
+            },
+        )
+        await self._append_history(
+            task_job_id,
+            "auto_chain_created",
+            normalized,
+        )
+
+    @staticmethod
+    def _scope_signature(params: Dict[str, Any]) -> str:
+        if not isinstance(params, dict):
+            return ""
+        normalized = {}
+        for key in ("symbols", "start_date", "end_date", "incremental"):
+            value = params.get(key)
+            if value is None:
+                continue
+            normalized[key] = value
+        if not normalized:
+            return ""
+        return json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+
+    @staticmethod
+    def _auto_chain_claim_key(prefix: str, trade_date: Optional[str], scope_signature: str = "") -> str:
+        base = f"{prefix}:{trade_date or 'unknown'}"
+        if not scope_signature:
+            return base
+        digest = hashlib.sha1(scope_signature.encode("utf-8")).hexdigest()[:12]
+        return f"{base}:{digest}"
+
+    @staticmethod
+    def _job_result_ready_for_auto_chain(normalized: Dict[str, Any]) -> bool:
+        if str(normalized.get("status") or "") != "succeeded":
+            return False
+        result = normalized.get("result") if isinstance(normalized.get("result"), dict) else {}
+        failed_count = result.get("failed_count")
+        if failed_count is not None:
+            try:
+                return int(failed_count) == 0
+            except Exception:
+                return False
+        success_flag = result.get("success")
+        if success_flag is not None:
+            return bool(success_flag)
+        return True
+
+    async def _evaluate_daily_analysis_prereqs(
+        self,
+        source_task_job_id: Optional[str] = None,
+    ) -> tuple[bool, str, Optional[str], Optional[str]]:
+        latest_ohlc = self._get_table_latest_date("stock_daily_data")
+        latest_basic = self._get_table_latest_date("stock_daily_basic")
+        if not latest_ohlc or not latest_basic:
+            return False, "missing_latest_trade_date", latest_ohlc, latest_basic
+        if latest_ohlc != latest_basic:
+            return False, "trade_date_not_aligned", latest_ohlc, latest_basic
+        source_record = await self._load_task_record(source_task_job_id) if source_task_job_id else None
+        source_params = source_record.get("params") if isinstance(source_record, dict) and isinstance(source_record.get("params"), dict) else {}
+        scope_signature = self._scope_signature(source_params)
+        if scope_signature:
+            scoped_jobs: Dict[str, Dict[str, Any]] = {}
+            for record in self._brain_jobs.values():
+                if not isinstance(record, dict):
+                    continue
+                if record.get("service") != "flowhub":
+                    continue
+                job_type = str(record.get("job_type") or "").strip()
+                if job_type not in {"batch_daily_ohlc", "batch_daily_basic"}:
+                    continue
+                params = record.get("params") if isinstance(record.get("params"), dict) else {}
+                if self._scope_signature(params) != scope_signature:
+                    continue
+                existing = scoped_jobs.get(job_type)
+                if existing is None or self._as_timestamp(record.get("created_at")) >= self._as_timestamp(existing.get("created_at")):
+                    scoped_jobs[job_type] = record
+            for job_type in ("batch_daily_ohlc", "batch_daily_basic"):
+                record = scoped_jobs.get(job_type)
+                if not record:
+                    return False, f"paired_scope_missing:{job_type}", latest_ohlc, latest_basic
+                payload = await self._safe_get_service_job("flowhub", str(record.get("service_job_id") or ""))
+                normalized = self._normalize_job(
+                    "flowhub",
+                    payload or {"job_id": record.get("service_job_id"), "status": "queued"},
+                    task_job_id=str(record.get("task_job_id") or f"flowhub:{record.get('service_job_id')}"),
+                )
+                if not self._job_result_ready_for_auto_chain(normalized):
+                    return False, f"paired_scope_not_ready:{job_type}:{normalized.get('status')}", latest_ohlc, latest_basic
+            return True, "", latest_ohlc, latest_basic
+        try:
+            recent_jobs = await self._list_service_jobs("flowhub", status=None, max_items=100)
+        except Exception:
+            return False, "flowhub_jobs_unavailable", latest_ohlc, latest_basic
+        latest_status: Dict[str, tuple[float, str]] = {}
+        for raw_job in recent_jobs:
+            job_type = str(raw_job.get("job_type") or "").strip()
+            if job_type not in {"batch_daily_ohlc", "batch_daily_basic"}:
+                continue
+            normalized = self._normalize_job(
+                "flowhub",
+                raw_job,
+                task_job_id=f"flowhub:{self._get_service_job_id(raw_job) or job_type}",
+            )
+            ts = self._as_timestamp(
+                normalized.get("updated_at")
+                or normalized.get("completed_at")
+                or normalized.get("created_at")
+            )
+            current = latest_status.get(job_type)
+            if current is None or ts >= current[0]:
+                latest_status[job_type] = (ts, str(normalized.get("status") or ""))
+        readiness: Dict[str, bool] = {}
+        for raw_job in recent_jobs:
+            job_type = str(raw_job.get("job_type") or "").strip()
+            if job_type not in {"batch_daily_ohlc", "batch_daily_basic"}:
+                continue
+            normalized = self._normalize_job(
+                "flowhub",
+                raw_job,
+                task_job_id=f"flowhub:{self._get_service_job_id(raw_job) or job_type}",
+            )
+            current = latest_status.get(job_type)
+            if current and str(normalized.get("status") or "") == current[1]:
+                readiness[job_type] = self._job_result_ready_for_auto_chain(normalized)
+        ohlc_status = latest_status.get("batch_daily_ohlc", (0.0, ""))[1]
+        basic_status = latest_status.get("batch_daily_basic", (0.0, ""))[1]
+        if ohlc_status != "succeeded" or basic_status != "succeeded":
+            return False, f"upstream_status_not_ready:ohlc={ohlc_status or 'missing'},basic={basic_status or 'missing'}", latest_ohlc, latest_basic
+        if not readiness.get("batch_daily_ohlc", False) or not readiness.get("batch_daily_basic", False):
+            return False, "upstream_result_not_ready", latest_ohlc, latest_basic
+        return True, "", latest_ohlc, latest_basic
+
+    async def _maybe_trigger_candidate_sync(self, task_job_id: str, normalized: Dict[str, Any]) -> None:
+        result = normalized.get("result") if isinstance(normalized.get("result"), dict) else {}
+        trade_date = str(result.get("last_trade_date") or "").strip() or self._get_table_latest_date("analysis_results")
+        if not trade_date:
+            return
+        if not await self._claim_auto_chain(f"candidate_sync:{trade_date}"):
+            return
+        created = await self.create_task_job(
+            service="execution",
+            job_type="ui_candidates_sync_from_analysis",
+            params={"as_of_date": trade_date},
+            metadata={
+                "auto_chain_source": "batch_analyze",
+                "auto_chain_trade_date": trade_date,
+            },
+        )
+        await self._update_task_record_metadata(
+            task_job_id,
+            {
+                "auto_chain_trade_date": trade_date,
+                "followup_candidate_sync_task_job_id": created.get("id"),
+            },
+        )
+        await self._append_history(
+            task_job_id,
+            "auto_chain_created",
+            normalized,
+        )
 
     async def _load_task_record(self, task_job_id: str) -> Optional[Dict[str, Any]]:
         local = self._brain_jobs.get(task_job_id)
