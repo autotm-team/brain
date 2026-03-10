@@ -113,7 +113,6 @@ class DataInitializationCoordinator:
         self.config = config
         self.state_path = STATE_PATH
         self.state = InitState.from_file(self.state_path)
-        self.bootstrap_success_ttl_seconds = int(os.getenv("BRAIN_BOOTSTRAP_SUCCESS_TTL_SECONDS", "43200"))
         self.flowhub_stable_wait_seconds = int(os.getenv("BRAIN_FLOWHUB_STABLE_WAIT_SECONDS", "20"))
         # define phases
         for name in ("stock_meta", "macro_core", "equities", "macro_rest"):
@@ -212,7 +211,6 @@ class DataInitializationCoordinator:
         params: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
         expected = _canonical_bootstrap_params(job_type, params)
-        now_ts = datetime.utcnow().timestamp()
         jobs = await adapter.list_jobs(limit=200, offset=0)
         for job in jobs:
             if str(job.get("job_type") or "") != job_type:
@@ -223,26 +221,6 @@ class DataInitializationCoordinator:
             status = str(job.get("status") or "").lower()
             if status in {"queued", "running"}:
                 return job
-            if status == "succeeded":
-                completed_at = job.get("completed_at")
-                try:
-                    completed_ts = float(completed_at or 0.0)
-                except Exception:
-                    completed_ts = 0.0
-                result = job.get("result")
-                is_terminal_skip = False
-                if isinstance(result, dict):
-                    reason = str(result.get("reason") or "").lower()
-                    status_flag = str((result.get("data_summary") or {}).get("status") or "").lower()
-                    message = str(result.get("message") or "").lower()
-                    is_terminal_skip = (
-                        result.get("skipped") is True
-                        or reason in {"data already up to date", "invalid date range"}
-                        or status_flag == "up_to_date"
-                        or "already up to date" in message
-                    )
-                if is_terminal_skip or (completed_ts > 0 and now_ts - completed_ts <= self.bootstrap_success_ttl_seconds):
-                    return job
         return None
 
     async def _submit_or_reuse_flowhub_job(
