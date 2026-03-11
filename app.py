@@ -345,7 +345,10 @@ async def startup_handler(app: web.Application):
     try:
         config = app['config']
         if getattr(config.service, 'init_data_on_startup', True) and 'data_initializer' not in app:
-            initializer = DataInitializationCoordinator(config)
+            initializer = DataInitializationCoordinator(
+                config,
+                task_orchestrator=app.get("task_orchestrator"),
+            )
             app['data_initializer'] = initializer
             asyncio.create_task(initializer.run())
             logger.info("Background data initialization task scheduled")

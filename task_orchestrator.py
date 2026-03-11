@@ -768,8 +768,8 @@ class TaskOrchestrator:
     def _normalize_job(self, service: str, job: Dict[str, Any], task_job_id: str) -> Dict[str, Any]:
         job = job if isinstance(job, dict) else {}
         service_job_id = self._get_service_job_id(job) or task_job_id
+        result = job.get("result") if isinstance(job.get("result"), dict) else job.get("result")
         status = self._normalize_status(job.get("status"))
-        progress = self._normalize_progress(job.get("progress"), status)
         params = job.get("params") if isinstance(job.get("params"), dict) else {}
         metadata = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
         message = metadata.get("message") or job.get("message")
@@ -780,6 +780,13 @@ class TaskOrchestrator:
         completed_at = job.get("completed_at")
         if updated_at is None:
             updated_at = completed_at or started_at or created_at
+        if completed_at is not None and isinstance(result, dict):
+            result_status = self._normalize_status(result.get("status"))
+            if result_status in {"succeeded", "failed", "cancelled"}:
+                status = result_status
+        progress = self._normalize_progress(job.get("progress"), status)
+        if completed_at is not None and status in {"succeeded", "failed", "cancelled"}:
+            progress = 100
         task_name = (
             metadata.get("task_name")
             or params.get("task_name")
@@ -807,7 +814,7 @@ class TaskOrchestrator:
             "cancellable": status in {"queued", "running"},
             "message": message,
             "error": job.get("error"),
-            "result": job.get("result"),
+            "result": result,
             "created_at": created_at,
             "started_at": started_at,
             "updated_at": updated_at,

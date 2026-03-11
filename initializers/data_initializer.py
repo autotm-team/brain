@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import os
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -109,10 +110,12 @@ class InitState:
 
 
 class DataInitializationCoordinator:
-    def __init__(self, config: IntegrationConfig):
+    def __init__(self, config: IntegrationConfig, task_orchestrator: Any = None):
         self.config = config
+        self.task_orchestrator = task_orchestrator
         self.state_path = STATE_PATH
         self.state = InitState.from_file(self.state_path)
+        self._bootstrap_watch_tasks: set[asyncio.Task[Any]] = set()
         self.flowhub_stable_wait_seconds = int(os.getenv("BRAIN_FLOWHUB_STABLE_WAIT_SECONDS", "20"))
         # define phases
         for name in ("stock_meta", "macro_core", "equities", "macro_rest"):
@@ -238,7 +241,24 @@ class DataInitializationCoordinator:
                 reusable.get("status"),
                 job_id,
             )
+            await self._ensure_task_job_mapping(job_type, params, job_id)
             return job_id
+        if self.task_orchestrator is not None:
+            created = await self.task_orchestrator.create_task_job(
+                service="flowhub",
+                job_type=job_type,
+                params=dict(params or {}),
+                metadata={"bootstrap_source": "brain_initializer"},
+            )
+            service_job_id = str(created.get("service_job_id") or created.get("job_id") or "")
+            task_job_id = str(created.get("id") or "")
+            logger.info(
+                "Created bootstrap flowhub task via orchestrator type=%s task_job_id=%s service_job_id=%s",
+                job_type,
+                task_job_id,
+                service_job_id,
+            )
+            return service_job_id or task_job_id
         resp = await adapter.send_request({
             "method": "POST",
             "endpoint": "/api/v1/jobs",
@@ -247,7 +267,78 @@ class DataInitializationCoordinator:
                 "params": dict(params or {}),
             }),
         })
-        return str(resp.get("job_id") or "")
+        service_job_id = str(resp.get("job_id") or "")
+        await self._ensure_task_job_mapping(job_type, params, service_job_id)
+        return service_job_id
+
+    async def _ensure_task_job_mapping(
+        self,
+        job_type: str,
+        params: Dict[str, Any],
+        service_job_id: str,
+    ) -> str:
+        if not service_job_id or self.task_orchestrator is None:
+            return service_job_id
+        mapped = await self.task_orchestrator._find_task_job_id("flowhub", service_job_id)
+        if mapped:
+            return mapped
+        task_job_id = str(uuid.uuid4())
+        record = {
+            "task_job_id": task_job_id,
+            "service": "flowhub",
+            "service_job_id": service_job_id,
+            "job_type": job_type,
+            "created_at": self.task_orchestrator._utc_now(),
+            "params": dict(params or {}),
+            "metadata": {"bootstrap_source": "brain_initializer"},
+            "request_payload_hash": self.task_orchestrator._hash_payload(
+                self.task_orchestrator._build_create_payload("flowhub", job_type, dict(params or {}))
+            ),
+        }
+        await self.task_orchestrator._save_task_record(record)
+        payload = await self.task_orchestrator._safe_get_service_job("flowhub", service_job_id)
+        normalized = self.task_orchestrator._normalize_job(
+            "flowhub",
+            payload or {"job_id": service_job_id, "job_type": job_type, "status": "queued"},
+            task_job_id=task_job_id,
+        )
+        normalized["metadata"] = {**record["metadata"], **(normalized.get("metadata") or {})}
+        await self.task_orchestrator._append_history(
+            task_job_id,
+            "created",
+            normalized,
+            request_payload_hash=record["request_payload_hash"],
+            upstream_status=202,
+        )
+        return task_job_id
+
+    def _schedule_bootstrap_followup_monitor(self, service: str, service_job_id: str) -> None:
+        if not service_job_id or self.task_orchestrator is None:
+            return
+
+        async def _watch() -> None:
+            mapped_id = await self.task_orchestrator._find_task_job_id(service, service_job_id)
+            if not mapped_id:
+                return
+            deadline = asyncio.get_running_loop().time() + 6 * 3600
+            while asyncio.get_running_loop().time() < deadline:
+                try:
+                    payload = await self.task_orchestrator.get_task_job(mapped_id)
+                    status = str(payload.get("status") or "").lower()
+                    if status in {"succeeded", "failed", "cancelled"}:
+                        return
+                except Exception as exc:
+                    logger.warning(
+                        "Bootstrap follow-up monitor failed for %s:%s: %s",
+                        service,
+                        service_job_id,
+                        exc,
+                    )
+                await asyncio.sleep(5)
+
+        task = asyncio.create_task(_watch())
+        self._bootstrap_watch_tasks.add(task)
+        task.add_done_callback(self._bootstrap_watch_tasks.discard)
 
     async def _run_phase(self, name: str, fn) -> None:
         """执行初始化阶段
@@ -421,11 +512,15 @@ class DataInitializationCoordinator:
         adapter = FlowhubAdapter(self.config)
         await adapter.connect_to_system()
         try:
-            jobs.append(await self._submit_or_reuse_flowhub_job(adapter, "batch_daily_basic", {"incremental": True}))
+            daily_basic_job_id = await self._submit_or_reuse_flowhub_job(adapter, "batch_daily_basic", {"incremental": True})
+            jobs.append(daily_basic_job_id)
+            self._schedule_bootstrap_followup_monitor("flowhub", daily_basic_job_id)
 
             # 股票日K（增量/全量由 flowhub 决定）
             # 统一任务接口：POST /api/v1/jobs + request_envelope(job_type=batch_daily_ohlc)
-            jobs.append(await self._submit_or_reuse_flowhub_job(adapter, "batch_daily_ohlc", {"incremental": True}))
+            daily_ohlc_job_id = await self._submit_or_reuse_flowhub_job(adapter, "batch_daily_ohlc", {"incremental": True})
+            jobs.append(daily_ohlc_job_id)
+            self._schedule_bootstrap_followup_monitor("flowhub", daily_ohlc_job_id)
             return jobs
         finally:
             await adapter.disconnect_from_system()
