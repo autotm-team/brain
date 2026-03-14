@@ -1,6 +1,6 @@
 [submodule "external/econdb"]
 	path = external/econdb
-	url = git@github.com:g1im2/EconDB.git
+	url = git@github.com:autotm-team/EconDB.git
 [submodule "external/asyncron"]
 	path = external/asyncron
-	url = git@github.com:g1im2/asyncron.git
+	url = git@github.com:autotm-team/asyncron.git
