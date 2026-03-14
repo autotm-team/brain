@@ -449,7 +449,15 @@ class DataInitializationCoordinator:
             )
             jobs.append(trade_calendar_job_id)
 
-            # 3. 申万行业分类及成分映射
+            # 3. 宏观日历
+            macro_calendar_job_id = await self._submit_or_reuse_flowhub_job(
+                adapter,
+                "macro_calendar_data",
+                {"incremental": True},
+            )
+            jobs.append(macro_calendar_job_id)
+
+            # 4. 申万行业分类及成分映射
             sw_industry_job_id = await self._submit_or_reuse_flowhub_job(
                 adapter,
                 "sw_industry_data",
@@ -457,7 +465,7 @@ class DataInitializationCoordinator:
             )
             jobs.append(sw_industry_job_id)
 
-            # 4. 指数基础信息
+            # 5. 指数基础信息
             index_info_job_id = await self._submit_or_reuse_flowhub_job(
                 adapter,
                 "index_info",
@@ -465,7 +473,7 @@ class DataInitializationCoordinator:
             )
             jobs.append(index_info_job_id)
 
-            # 5. 指数日线
+            # 6. 指数日线
             index_daily_job_id = await self._submit_or_reuse_flowhub_job(
                 adapter,
                 "index_daily_data",
@@ -473,7 +481,7 @@ class DataInitializationCoordinator:
             )
             jobs.append(index_daily_job_id)
 
-            # 6. 指数成分股
+            # 7. 指数成分股
             index_components_job_id = await self._submit_or_reuse_flowhub_job(
                 adapter,
                 "index_components",
