@@ -1,0 +1,62 @@
+import json
+import logging
+import sys
+from pathlib import Path
+
+import pytest
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+EXTERNAL_ASYNCRON = PROJECT_ROOT / "external" / "asyncron"
+EXTERNAL_ECONDB = PROJECT_ROOT / "external" / "econdb"
+for path in (EXTERNAL_ASYNCRON, EXTERNAL_ECONDB, PROJECT_ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+
+from handlers.ui_bff import UIBffHandler
+
+
+class _DummyOrchestrator:
+    async def list_task_jobs(self, limit=20, offset=0):
+        return {
+            "jobs": [
+                {"status": "running", "cancellable": True},
+                {"status": "failed", "cancellable": False},
+            ]
+        }
+
+
+class _DummySystemAPI:
+    def get_user(self, user_id):
+        return {"id": user_id, "username": "admin"}
+
+    def list_notifications(self, limit=5):
+        return [{"id": "n1"}, {"id": "n2"}]
+
+
+class _DummyRequest:
+    def __init__(self):
+        self.query = {"page": "watchlist"}
+        self.app = {}
+
+
+@pytest.mark.asyncio
+async def test_shell_context_returns_real_watchlist_badge():
+    handler = UIBffHandler.__new__(UIBffHandler)
+    handler.logger = logging.getLogger("test-shell-context")
+    handler.get_app_component = lambda request, key: _DummyOrchestrator()
+    handler._get_system_api = lambda: _DummySystemAPI()
+
+    async def _fetch_upstream_json(request, service, path, params=None):
+        assert service == "execution"
+        assert path == "/api/v1/ui/candidates/events"
+        assert params == {"limit": 1, "offset": 0, "status": "pending"}
+        return {"data": {"items": [], "total": 7}}
+
+    handler._fetch_upstream_json = _fetch_upstream_json
+    response = await handler._handle_shell_context(_DummyRequest())
+    payload = json.loads(response.text)
+
+    assert payload["success"] is True
+    assert payload["data"]["sidebar_badges"]["watchlist"] == 7
+    assert payload["data"]["sidebar_badges"]["jobs"] == 1
+    assert payload["data"]["sidebar_badges"]["alerts"] == 1

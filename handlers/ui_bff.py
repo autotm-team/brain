@@ -1744,6 +1744,21 @@ class UIBffHandler(BaseHandler):
         except Exception as exc:
             self.logger.warning(f"system api unavailable for shell context: {exc}")
 
+        watchlist_badge = 0
+        try:
+            watchlist_payload = await self._fetch_upstream_json(
+                request,
+                "execution",
+                "/api/v1/ui/candidates/events",
+                params={"limit": 1, "offset": 0, "status": "pending"},
+            )
+            watchlist_data = watchlist_payload.get("data") if isinstance(watchlist_payload, dict) else None
+            watchlist_total = watchlist_data.get("total") if isinstance(watchlist_data, dict) else None
+            watchlist_items = watchlist_data.get("items") if isinstance(watchlist_data, dict) and isinstance(watchlist_data.get("items"), list) else []
+            watchlist_badge = self._safe_int(watchlist_total, len(watchlist_items))
+        except Exception as exc:
+            self.logger.warning(f"watchlist badge unavailable for shell context: {exc}")
+
         payload = {
             "page": page,
             "phase": context["phase"],
@@ -1763,6 +1778,7 @@ class UIBffHandler(BaseHandler):
                 "jobs": running_count,
                 "alerts": failed_count,
                 "notifications": len(notifications),
+                "watchlist": watchlist_badge,
             },
             "current_user": user_info,
             "notifications": notifications,
