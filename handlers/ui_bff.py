@@ -892,6 +892,8 @@ class UIBffHandler(BaseHandler):
             data_type = str(item.get("data_type") or "").strip().lower()
             if not data_type:
                 continue
+            if data_type in {"batch_daily_ohlc", "batch_daily_basic"}:
+                continue
             data_label = str(item.get("label") or data_type).strip() or data_type
             schedule = self.WATCHLIST_TEMPLATE_SCHEDULES.get(
                 data_type,

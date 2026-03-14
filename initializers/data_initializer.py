@@ -397,6 +397,29 @@ class DataInitializationCoordinator:
             await asyncio.sleep(poll_interval_seconds)
         return last_status
 
+    async def _wait_job_terminal(
+        self,
+        adapter: FlowhubAdapter,
+        job_id: str,
+        *,
+        timeout_seconds: int = 6 * 3600,
+        poll_interval_seconds: int = 5,
+    ) -> str:
+        if not job_id:
+            return "unknown"
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        last_status = "unknown"
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                status_resp = await adapter.get_job_status(job_id)
+                last_status = str(status_resp.get("status") or "unknown").lower()
+                if last_status in {"succeeded", "failed", "cancelled", "canceled"}:
+                    return last_status
+            except Exception as e:
+                logger.warning(f"Wait job terminal failed for {job_id}: {e}")
+            await asyncio.sleep(poll_interval_seconds)
+        return last_status
+
     # ===== Phases =====
     async def _phase_stock_meta(self) -> List[str]:
         # 空库首启必须直接提交基础元数据任务，不能依赖后续 schedule bootstrap。
@@ -411,6 +434,12 @@ class DataInitializationCoordinator:
                 {"update_mode": "incremental"},
             )
             jobs.append(stock_basic_job_id)
+            stock_basic_status = await self._wait_job_terminal(
+                adapter,
+                stock_basic_job_id,
+            )
+            if stock_basic_status != "succeeded":
+                raise RuntimeError(f"stock_basic_data bootstrap did not succeed: {stock_basic_status}")
 
             # 2. 交易日历
             trade_calendar_job_id = await self._submit_or_reuse_flowhub_job(

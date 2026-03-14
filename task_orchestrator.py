@@ -126,6 +126,7 @@ class TaskOrchestrator:
         self._job_types_cache: Dict[str, Dict[str, Any]] = {}
         self._db_manager = None
         self._local_auto_chain_claims: set[str] = set()
+        self._followup_watch_tasks: set[asyncio.Task] = set()
 
     async def create_task_job(
         self,
@@ -173,7 +174,30 @@ class TaskOrchestrator:
             request_payload_hash=request_payload_hash,
             upstream_status=202,
         )
+        self._schedule_followup_monitor(task_job_id, service, job_type)
         return normalized
+
+    def _schedule_followup_monitor(self, task_job_id: str, service: str, job_type: str) -> None:
+        if service not in {"flowhub", "execution"}:
+            return
+        if job_type not in {"stock_basic_data", "batch_daily_ohlc", "batch_daily_basic", "batch_analyze"}:
+            return
+
+        async def _watch() -> None:
+            deadline = asyncio.get_running_loop().time() + 6 * 3600
+            while asyncio.get_running_loop().time() < deadline:
+                try:
+                    payload = await self.get_task_job(task_job_id)
+                    status = str(payload.get("status") or "").lower()
+                    if status in {"succeeded", "failed", "cancelled"}:
+                        return
+                except Exception:
+                    return
+                await asyncio.sleep(5)
+
+        task = asyncio.create_task(_watch())
+        self._followup_watch_tasks.add(task)
+        task.add_done_callback(self._followup_watch_tasks.discard)
 
     async def list_task_job_types(self) -> Dict[str, Any]:
         services_payload: Dict[str, Any] = {}
@@ -1034,7 +1058,9 @@ class TaskOrchestrator:
         service = str(normalized.get("service") or "").strip().lower()
         job_type = str(normalized.get("job_type") or "").strip()
         try:
-            if service == "flowhub" and job_type in {"batch_daily_ohlc", "batch_daily_basic"}:
+            if service == "flowhub" and job_type == "stock_basic_data":
+                await self._maybe_trigger_stock_daily_fetches(task_job_id, normalized)
+            elif service == "flowhub" and job_type in {"batch_daily_ohlc", "batch_daily_basic"}:
                 await self._maybe_trigger_daily_analysis(task_job_id, normalized)
             elif service == "execution" and job_type == "batch_analyze":
                 await self._maybe_trigger_candidate_sync(task_job_id, normalized)
@@ -1047,6 +1073,46 @@ class TaskOrchestrator:
             normalized_metadata = normalized.get("metadata") if isinstance(normalized.get("metadata"), dict) else {}
             normalized_metadata["auto_chain_error"] = str(exc)
             await self._update_task_record_metadata(task_job_id, normalized_metadata)
+
+    async def _maybe_trigger_stock_daily_fetches(self, task_job_id: str, normalized: Dict[str, Any]) -> None:
+        metadata = normalized.get("metadata") if isinstance(normalized.get("metadata"), dict) else {}
+        if str(metadata.get("bootstrap_source") or "").strip().lower() == "brain_initializer":
+            return
+        if not self._job_result_ready_for_auto_chain(normalized):
+            return
+        claim_key = self._auto_chain_claim_key("stock_daily_fetch", task_job_id)
+        if not await self._claim_auto_chain(claim_key):
+            return
+        ohlc_created = await self.create_task_job(
+            service="flowhub",
+            job_type="batch_daily_ohlc",
+            params={"incremental": True},
+            metadata={
+                "auto_chain_source": "stock_basic_data",
+                "auto_chain_parent_task_job_id": task_job_id,
+            },
+        )
+        basic_created = await self.create_task_job(
+            service="flowhub",
+            job_type="batch_daily_basic",
+            params={"incremental": True},
+            metadata={
+                "auto_chain_source": "stock_basic_data",
+                "auto_chain_parent_task_job_id": task_job_id,
+            },
+        )
+        await self._update_task_record_metadata(
+            task_job_id,
+            {
+                "followup_flowhub_ohlc_task_job_id": ohlc_created.get("id"),
+                "followup_flowhub_basic_task_job_id": basic_created.get("id"),
+            },
+        )
+        await self._append_history(
+            task_job_id,
+            "auto_chain_created",
+            normalized,
+        )
 
     async def _maybe_trigger_daily_analysis(self, task_job_id: str, normalized: Dict[str, Any]) -> None:
         ready, blocked_reason, latest_ohlc, latest_basic = await self._evaluate_daily_analysis_prereqs(
