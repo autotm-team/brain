@@ -1,6 +1,10 @@
 [submodule "external/econdb"]
 	path = external/econdb
 	url = git@github.com:autotm-team/EconDB.git
+	branch = main
+	update = rebase
 [submodule "external/asyncron"]
 	path = external/asyncron
 	url = git@github.com:autotm-team/asyncron.git
+	branch = main
+	update = rebase
