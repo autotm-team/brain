@@ -468,6 +468,8 @@ class UIBffHandler(BaseHandler):
         "batch_daily_basic": {"incremental": True},
     }
 
+    DEPENDENT_STOCK_PIPELINE_TYPES = {"batch_daily_ohlc", "batch_daily_basic"}
+
     WATCHLIST_TEMPLATE_SCHEDULES = {
         "stock_basic_data": {"schedule_type": "cron", "schedule_value": "20 17 * * 1-5"},
         "batch_daily_ohlc": {"schedule_type": "cron", "schedule_value": "10 17 * * 1-5"},
@@ -857,6 +859,8 @@ class UIBffHandler(BaseHandler):
             data_type = str(item.get("data_type") or "").strip().lower()
             if not data_type:
                 continue
+            if data_type in self.DEPENDENT_STOCK_PIPELINE_TYPES:
+                continue
             data_label = str(item.get("label") or data_type).strip() or data_type
             schedule = self.STRUCTURE_ROTATION_TEMPLATE_SCHEDULES.get(
                 data_type,
@@ -892,7 +896,7 @@ class UIBffHandler(BaseHandler):
             data_type = str(item.get("data_type") or "").strip().lower()
             if not data_type:
                 continue
-            if data_type in {"batch_daily_ohlc", "batch_daily_basic"}:
+            if data_type in self.DEPENDENT_STOCK_PIPELINE_TYPES:
                 continue
             data_label = str(item.get("label") or data_type).strip() or data_type
             schedule = self.WATCHLIST_TEMPLATE_SCHEDULES.get(
@@ -915,6 +919,15 @@ class UIBffHandler(BaseHandler):
                 }
             )
         return templates
+
+    @classmethod
+    def _is_conflicting_dependent_stock_schedule(cls, task: Dict[str, Any]) -> bool:
+        if not isinstance(task, dict):
+            return False
+        data_type = str(task.get("data_type") or "").strip().lower()
+        if data_type not in cls.DEPENDENT_STOCK_PIPELINE_TYPES:
+            return False
+        return cls._is_active_periodic_pipeline_task(task)
 
     def _build_market_snapshot_default_templates(self) -> list[Dict[str, Any]]:
         templates: list[Dict[str, Any]] = []
@@ -985,6 +998,33 @@ class UIBffHandler(BaseHandler):
                 if not token:
                     continue
                 tasks_by_type.setdefault(token, []).append(task)
+
+            for task in list(working_tasks):
+                if not self._is_conflicting_dependent_stock_schedule(task):
+                    continue
+                task_id = str(task.get("task_id") or "").strip()
+                if not task_id:
+                    continue
+                try:
+                    orchestrator = self.get_app_component(request, "task_orchestrator")
+                    await orchestrator.patch_schedule(task_id, {"enabled": False})
+                    task["enabled"] = False
+                    report.setdefault("disabled", []).append(
+                        {
+                            "data_type": task.get("data_type"),
+                            "task_id": task_id,
+                            "reason": "dependent_stock_pipeline",
+                        }
+                    )
+                except Exception as exc:
+                    report["errors"].append(
+                        {
+                            "data_type": task.get("data_type"),
+                            "task_id": task_id,
+                            "stage": "disable",
+                            "message": str(exc),
+                        }
+                    )
 
             templates = self._build_all_default_pipeline_templates()
             for template in templates:

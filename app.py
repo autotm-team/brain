@@ -39,10 +39,10 @@ def _env_bool(name: str, default: bool) -> bool:
 def _flowhub_bootstrap_schedule_specs() -> list[dict]:
     return [
         {
-            "bootstrap_key": "strategy_daily_batch_ohlc",
-            "job_type": "batch_daily_ohlc",
-            "cron": os.getenv("FLOWHUB_STRATEGY_BATCH_OHLC_CRON", "20 18 * * 1-5"),
-            "params": {"incremental": True},
+            "bootstrap_key": "research_daily_stock_basic",
+            "job_type": "stock_basic_data",
+            "cron": os.getenv("FLOWHUB_RESEARCH_STOCK_BASIC_CRON", "20 17 * * 1-5"),
+            "params": {"update_mode": "incremental"},
         },
         {
             "bootstrap_key": "strategy_daily_adj_factors",
@@ -81,12 +81,6 @@ def _flowhub_bootstrap_schedule_specs() -> list[dict]:
             "params": {"src": "SW2021", "update_mode": "incremental", "include_members": True},
         },
         {
-            "bootstrap_key": "research_daily_batch_basic",
-            "job_type": "batch_daily_basic",
-            "cron": os.getenv("FLOWHUB_RESEARCH_BATCH_BASIC_CRON", "35 18 * * 1-5"),
-            "params": {"incremental": True},
-        },
-        {
             "bootstrap_key": "research_daily_suspend",
             "job_type": "suspend_data",
             "cron": os.getenv("FLOWHUB_RESEARCH_SUSPEND_CRON", "40 18 * * 1-5"),
@@ -105,6 +99,23 @@ def _flowhub_bootstrap_schedule_specs() -> list[dict]:
             "params": {"update_mode": "incremental"},
         },
     ]
+
+
+def _is_legacy_dependent_stock_bootstrap_schedule(item: dict) -> bool:
+    if not isinstance(item, dict):
+        return False
+    if not bool(item.get("enabled", True)):
+        return False
+    job_type = str(item.get("job_type") or "").strip().lower()
+    if job_type not in {"batch_daily_ohlc", "batch_daily_basic"}:
+        return False
+    metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+    bootstrap_key = str(metadata.get("bootstrap_key") or "").strip().lower()
+    bootstrap_source = str(metadata.get("bootstrap_source") or "").strip().lower()
+    return (
+        bootstrap_key in {"strategy_daily_batch_ohlc", "research_daily_batch_basic"}
+        or bootstrap_source == "brain_startup"
+    )
 
 
 async def _list_all_flowhub_schedules(orchestrator: TaskOrchestrator) -> list[dict]:
@@ -136,9 +147,28 @@ async def _ensure_flowhub_bootstrap_schedules(app: web.Application) -> None:
         return
 
     existing = await _list_all_flowhub_schedules(orchestrator)
+    for item in existing:
+        if not _is_legacy_dependent_stock_bootstrap_schedule(item):
+            continue
+        schedule_id = str(item.get("id") or "").strip()
+        if not schedule_id:
+            continue
+        try:
+            await orchestrator.patch_schedule(schedule_id, {"enabled": False})
+            item["enabled"] = False
+            logger.info(
+                "Disabled legacy bootstrap schedule that bypassed stock_basic_data prerequisite: %s (%s)",
+                item.get("job_type"),
+                schedule_id,
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to disable legacy bootstrap schedule {schedule_id}: {exc}")
+
     existing_keys: dict[str, dict] = {}
     for item in existing:
         if not isinstance(item, dict):
+            continue
+        if not bool(item.get("enabled", True)):
             continue
         metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
         key = str(metadata.get("bootstrap_key") or "").strip()
