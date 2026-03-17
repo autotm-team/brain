@@ -384,7 +384,6 @@ class UIBffHandler(BaseHandler):
                 {"data_type": "stock_basic_data", "label": "股票基础信息"},
                 {"data_type": "batch_daily_ohlc", "label": "个股日线行情"},
                 {"data_type": "batch_daily_basic", "label": "个股日线基础"},
-                {"data_type": "adj_factors", "label": "复权因子"},
                 {"data_type": "industry_board_stocks", "label": "行业板块成分股"},
                 {"data_type": "industry_moneyflow_data", "label": "行业资金流"},
             ],
@@ -474,7 +473,6 @@ class UIBffHandler(BaseHandler):
         "stock_basic_data": {"schedule_type": "cron", "schedule_value": "20 17 * * 1-5"},
         "batch_daily_ohlc": {"schedule_type": "cron", "schedule_value": "10 17 * * 1-5"},
         "batch_daily_basic": {"schedule_type": "cron", "schedule_value": "30 17 * * 1-5"},
-        "adj_factors": {"schedule_type": "cron", "schedule_value": "45 17 * * 1-5"},
         "industry_board_stocks": {"schedule_type": "cron", "schedule_value": "40 16 * * 1-5"},
         "industry_moneyflow_data": {"schedule_type": "cron", "schedule_value": "10 17 * * 1-5"},
     }
@@ -483,7 +481,6 @@ class UIBffHandler(BaseHandler):
         "stock_basic_data": "模板·候选池·股票基础信息",
         "batch_daily_ohlc": "模板·候选池·个股日线行情",
         "batch_daily_basic": "模板·候选池·个股日线基础",
-        "adj_factors": "模板·候选池·复权因子",
         "industry_board_stocks": "模板·候选池·行业板块成分股",
         "industry_moneyflow_data": "模板·候选池·行业资金流",
     }
@@ -492,7 +489,6 @@ class UIBffHandler(BaseHandler):
         "stock_basic_data": {"update_mode": "incremental"},
         "batch_daily_ohlc": {"incremental": True},
         "batch_daily_basic": {"incremental": True},
-        "adj_factors": {"update_mode": "incremental"},
         "industry_board_stocks": {"source": "ths", "update_mode": "incremental"},
         "industry_moneyflow_data": {"source": "ths", "incremental": True},
     }
@@ -520,7 +516,6 @@ class UIBffHandler(BaseHandler):
         "stock_basic_data": {"table": "stock_basic", "date_column": "updated_at", "value_kind": "datetime"},
         "batch_daily_ohlc": {"table": "stock_daily_data", "date_column": "trade_date"},
         "batch_daily_basic": {"table": "stock_daily_basic", "date_column": "trade_date"},
-        "adj_factors": {"table": "adj_factors", "date_column": "trade_date"},
     }
 
     def __init__(self):

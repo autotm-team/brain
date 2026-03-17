@@ -45,12 +45,6 @@ def _flowhub_bootstrap_schedule_specs() -> list[dict]:
             "params": {"update_mode": "incremental"},
         },
         {
-            "bootstrap_key": "strategy_daily_adj_factors",
-            "job_type": "adj_factors",
-            "cron": os.getenv("FLOWHUB_STRATEGY_ADJ_FACTORS_CRON", "25 18 * * 1-5"),
-            "params": {"update_mode": "incremental"},
-        },
-        {
             "bootstrap_key": "strategy_daily_index_daily",
             "job_type": "index_daily_data",
             "cron": os.getenv("FLOWHUB_STRATEGY_INDEX_DAILY_CRON", "30 18 * * 1-5"),
