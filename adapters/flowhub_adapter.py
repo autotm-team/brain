@@ -670,12 +670,12 @@ class FlowhubAdapter(ISystemAdapter):
             logger.error(f"Failed to create index daily data job: {e}")
             raise AdapterException("FlowhubAdapter", f"Index daily data job creation failed: {e}")
 
-    async def create_industry_board_job(self, source: str = 'ths',
+    async def create_industry_board_job(self, source: str = 'em',
                                        update_mode: str = 'incremental') -> Dict[str, Any]:
         """创建行业板块数据抓取任务
 
         Args:
-            source: 数据源 ('ths' 同花顺)
+            source: 数据源 ('em' 东方财富板块)
             update_mode: 更新模式 ('incremental', 'full_update')
 
         Returns:
@@ -706,12 +706,12 @@ class FlowhubAdapter(ISystemAdapter):
             logger.error(f"Failed to create industry board job: {e}")
             raise AdapterException("FlowhubAdapter", f"Industry board job creation failed: {e}")
 
-    async def create_concept_board_job(self, source: str = 'ths',
+    async def create_concept_board_job(self, source: str = 'em',
                                       update_mode: str = 'incremental') -> Dict[str, Any]:
         """创建概念板块数据抓取任务
 
         Args:
-            source: 数据源 ('ths' 同花顺)
+            source: 数据源 ('em' 东方财富板块)
             update_mode: 更新模式 ('incremental', 'full_update')
 
         Returns:
