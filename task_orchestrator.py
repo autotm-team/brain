@@ -5,6 +5,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import time
 import uuid
@@ -19,6 +20,9 @@ if ECONDB_PATH.exists() and str(ECONDB_PATH) not in os.sys.path:
     os.sys.path.insert(0, str(ECONDB_PATH))
 
 from econdb import create_database_manager  # type: ignore
+
+
+logger = logging.getLogger(__name__)
 
 
 class UpstreamServiceError(RuntimeError):
@@ -118,6 +122,10 @@ class TaskOrchestrator:
     SERVICE_PAGE_SIZE = 20
     SERVICE_MAX_FETCH = 200
     UPSTREAM_TIMEOUT_SECONDS = 30
+    ORPHAN_MONITOR_INTERVAL_SECONDS = 30
+    TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
+    ACTIVE_STATUSES = {"queued", "running"}
+    RECOVERY_MAX_ATTEMPTS = 3
 
     def __init__(self, app):
         self._app = app
@@ -426,6 +434,7 @@ class TaskOrchestrator:
             raise ValueError(f"Unsupported service: {service}")
         jobs: List[Dict[str, Any]] = []
         errors: List[Dict[str, str]] = []
+        seen_task_ids: set[str] = set()
 
         for svc in services:
             try:
@@ -445,6 +454,7 @@ class TaskOrchestrator:
                         normalized = await self._merge_record_metadata(mapped_id, normalized)
                     normalized = self._compact_job_for_list(normalized)
                     if mapped_id:
+                        seen_task_ids.add(mapped_id)
                         await self._append_history_if_changed(mapped_id, normalized)
                         await self._maybe_trigger_followups(mapped_id, normalized)
                     if status and normalized.get("status") != self._normalize_status(status):
@@ -461,6 +471,8 @@ class TaskOrchestrator:
             except Exception as exc:
                 errors.append({"service": svc, "error": str(exc)})
 
+        local_jobs = await self._list_local_task_jobs(services=services, status=status, seen_task_ids=seen_task_ids)
+        jobs.extend(local_jobs)
         jobs.sort(
             key=lambda item: (
                 self._as_timestamp(item.get("updated_at") or item.get("completed_at") or item.get("created_at")),
@@ -521,19 +533,10 @@ class TaskOrchestrator:
         except UpstreamServiceError as exc:
             if not mapped_task_job_id:
                 raise
-            record = await self._load_task_record(mapped_task_job_id) or {}
-            fallback = self._normalize_job(
-                service,
-                {
-                    "job_id": service_job_id,
-                    "job_type": record.get("job_type"),
-                    "status": "queued",
-                    "metadata": record.get("metadata") if isinstance(record.get("metadata"), dict) else {},
-                    "message": f"upstream not available: {exc.status}",
-                },
-                task_job_id=mapped_task_job_id,
-            )
-            fallback = await self._merge_record_metadata(mapped_task_job_id, fallback)
+            fallback = await self._build_local_task_view(mapped_task_job_id)
+            if not fallback:
+                raise
+            fallback["message"] = fallback.get("message") or f"upstream not available: {exc.status}"
             fallback["error"] = {
                 "upstream_status": exc.status,
                 "message": exc.error.get("message"),
@@ -545,6 +548,72 @@ class TaskOrchestrator:
                 upstream_status=exc.status,
             )
             return fallback
+
+    async def scan_orphaned_task_jobs_once(self) -> Dict[str, Any]:
+        scanned = 0
+        recreated = 0
+        cancelled = 0
+        capped = 0
+        skipped = 0
+        errors: list[dict[str, Any]] = []
+
+        for task_job_id in await self._list_task_job_ids():
+            try:
+                record = await self._load_task_record(task_job_id)
+                if not isinstance(record, dict):
+                    continue
+                latest = await self._build_local_task_view(task_job_id)
+                if not isinstance(latest, dict):
+                    continue
+                status = str(latest.get("status") or "").strip().lower()
+                if status not in self.ACTIVE_STATUSES:
+                    continue
+                service = str(record.get("service") or "").strip().lower()
+                service_job_id = str(record.get("service_job_id") or "").strip()
+                if service not in self.SERVICES or not service_job_id:
+                    continue
+                scanned += 1
+                try:
+                    payload = await self._request_service(service, "GET", f"/api/v1/jobs/{service_job_id}")
+                    normalized = self._normalize_job(
+                        service,
+                        self._extract_data(payload),
+                        task_job_id=task_job_id,
+                    )
+                    normalized = await self._merge_record_metadata(task_job_id, normalized)
+                    await self._append_history_if_changed(task_job_id, normalized)
+                    await self._maybe_trigger_followups(task_job_id, normalized)
+                except UpstreamServiceError as exc:
+                    if exc.status == 404:
+                        action = await self._recover_orphaned_task(task_job_id, record, latest)
+                        if action == "recreated":
+                            recreated += 1
+                            cancelled += 1
+                        elif action == "capped":
+                            capped += 1
+                            cancelled += 1
+                        else:
+                            skipped += 1
+                    else:
+                        await self._append_history(
+                            task_job_id,
+                            "upstream_snapshot_error",
+                            latest,
+                            upstream_status=exc.status,
+                        )
+                except Exception as exc:
+                    errors.append({"task_job_id": task_job_id, "error": str(exc)})
+            except Exception as exc:
+                errors.append({"task_job_id": task_job_id, "error": str(exc)})
+
+        return {
+            "scanned": scanned,
+            "cancelled": cancelled,
+            "recreated": recreated,
+            "capped": capped,
+            "skipped": skipped,
+            "errors": errors,
+        }
 
     async def cancel_task_job(self, task_job_id: str) -> Dict[str, Any]:
         service, service_job_id, mapped_task_job_id = await self._resolve_task_job_id(task_job_id)
@@ -1009,6 +1078,7 @@ class TaskOrchestrator:
         try:
             await redis.set(self._record_key(task_job_id), json.dumps(record, ensure_ascii=False))
             await redis.set(self._index_key(record["service"], record["service_job_id"]), task_job_id)
+            await redis.sadd(self._task_job_set_key(), task_job_id)
         except Exception:
             return
 
@@ -1345,6 +1415,32 @@ class TaskOrchestrator:
             return dict(record)
         return None
 
+    async def _list_task_job_ids(self) -> List[str]:
+        ids = {
+            key
+            for key in self._brain_jobs.keys()
+            if isinstance(key, str) and not key.startswith("schedule:")
+        }
+
+        redis = self._redis()
+        if redis:
+            try:
+                values = await redis.smembers(self._task_job_set_key())
+                ids.update(str(v) for v in values if isinstance(v, str) and v)
+            except Exception:
+                pass
+            if not ids:
+                try:
+                    async for key in redis.scan_iter(match="brain:task_job:*"):
+                        if not isinstance(key, str):
+                            continue
+                        suffix = key.removeprefix("brain:task_job:")
+                        if suffix and ":" not in suffix:
+                            ids.add(suffix)
+                except Exception:
+                    pass
+        return sorted(ids)
+
     async def _get_history(self, task_job_id: str) -> List[Dict[str, Any]]:
         local = self._history.get(task_job_id)
         if local:
@@ -1369,6 +1465,147 @@ class TaskOrchestrator:
             self._history[task_job_id] = list(history)
         return history
 
+    async def _latest_history_entry(self, task_job_id: str) -> Optional[Dict[str, Any]]:
+        history = await self._get_history(task_job_id)
+        if not history:
+            return None
+        latest = history[-1]
+        return dict(latest) if isinstance(latest, dict) else None
+
+    async def _build_local_task_view(self, task_job_id: str) -> Optional[Dict[str, Any]]:
+        record = await self._load_task_record(task_job_id)
+        if not isinstance(record, dict):
+            return None
+        latest = await self._latest_history_entry(task_job_id)
+        if isinstance(latest, dict):
+            job = latest.get("job")
+            if isinstance(job, dict):
+                return await self._merge_record_metadata(task_job_id, dict(job))
+        normalized = self._normalize_job(
+            str(record.get("service") or ""),
+            {
+                "job_id": record.get("service_job_id"),
+                "job_type": record.get("job_type"),
+                "status": "queued",
+                "metadata": record.get("metadata") if isinstance(record.get("metadata"), dict) else {},
+                "created_at": record.get("created_at"),
+                "updated_at": record.get("created_at"),
+            },
+            task_job_id=task_job_id,
+        )
+        return await self._merge_record_metadata(task_job_id, normalized)
+
+    async def _list_local_task_jobs(
+        self,
+        *,
+        services: List[str],
+        status: Optional[str],
+        seen_task_ids: set[str],
+    ) -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        normalized_status = self._normalize_status(status) if status else None
+        for task_job_id in await self._list_task_job_ids():
+            if task_job_id in seen_task_ids:
+                continue
+            record = await self._load_task_record(task_job_id)
+            if not isinstance(record, dict):
+                continue
+            service = str(record.get("service") or "").strip().lower()
+            if service not in services:
+                continue
+            local_view = await self._build_local_task_view(task_job_id)
+            if not isinstance(local_view, dict):
+                continue
+            if normalized_status and str(local_view.get("status") or "") != normalized_status:
+                continue
+            items.append(self._compact_job_for_list(local_view))
+        return items
+
+    async def _recover_orphaned_task(
+        self,
+        task_job_id: str,
+        record: Dict[str, Any],
+        latest: Dict[str, Any],
+    ) -> str:
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        root_task_job_id = str(metadata.get("recovery_root_task_job_id") or task_job_id)
+        current_attempts = self._coerce_int(metadata.get("recovery_attempt_count"), default=0)
+        recovery_attempt = current_attempts + 1
+        base_metadata = dict(metadata)
+        await self._append_history(task_job_id, "orphan_detected", latest, upstream_status=404)
+
+        action = "capped" if current_attempts >= self.RECOVERY_MAX_ATTEMPTS else "recreated"
+        cancelled_metadata = {
+            **base_metadata,
+            "recovery_root_task_job_id": root_task_job_id,
+            "recovery_attempt_count": current_attempts,
+            "orphaned_upstream_job": True,
+            "orphaned_reason": "upstream_job_missing",
+            "recovery_action": action,
+            "recovery_attempt": recovery_attempt,
+        }
+        if action == "capped":
+            cancelled_metadata["recovery_capped"] = True
+
+        cancelled_job = dict(latest)
+        cancelled_job["status"] = "cancelled"
+        cancelled_job["cancellable"] = False
+        cancelled_job["completed_at"] = self._utc_now()
+        cancelled_job["updated_at"] = cancelled_job["completed_at"]
+        cancelled_job["metadata"] = cancelled_metadata
+        cancelled_job["message"] = "upstream job missing; task cancelled by brain orphan recovery"
+        cancelled_job["error"] = {
+            "code": "UPSTREAM_JOB_MISSING",
+            "message": "Upstream job disappeared while brain task was still active",
+        }
+        await self._save_task_record({**record, "metadata": cancelled_metadata})
+        await self._append_history(task_job_id, "orphan_cancelled", cancelled_job, upstream_status=404)
+
+        if action == "capped":
+            await self._append_history(task_job_id, "auto_recreate_capped", cancelled_job, upstream_status=404)
+            return "capped"
+
+        recreate_metadata = {
+            **{
+                k: v
+                for k, v in base_metadata.items()
+                if k
+                not in {
+                    "replacement_task_job_id",
+                    "orphaned_upstream_job",
+                    "orphaned_reason",
+                    "recovery_action",
+                    "recovery_attempt",
+                    "recovery_capped",
+                }
+            },
+            "recovery_root_task_job_id": root_task_job_id,
+            "recreated_from_task_job_id": task_job_id,
+            "recovery_attempt_count": recovery_attempt,
+            "auto_recreated": True,
+        }
+        created = await self.create_task_job(
+            service=str(record.get("service") or ""),
+            job_type=str(record.get("job_type") or ""),
+            params=record.get("params") if isinstance(record.get("params"), dict) else {},
+            metadata=recreate_metadata,
+        )
+        replacement_task_job_id = str(created.get("id") or "").strip()
+        if replacement_task_job_id:
+            await self._update_task_record_metadata(
+                task_job_id,
+                {
+                    **cancelled_metadata,
+                    "replacement_task_job_id": replacement_task_job_id,
+                },
+            )
+            cancelled_job["metadata"] = {
+                **cancelled_metadata,
+                "replacement_task_job_id": replacement_task_job_id,
+            }
+        await self._append_history(task_job_id, "auto_recreated", cancelled_job, upstream_status=404)
+        return "recreated"
+
     def _redis(self):
         return self._app.get("redis")
 
@@ -1383,6 +1620,10 @@ class TaskOrchestrator:
     @staticmethod
     def _history_key(task_job_id: str) -> str:
         return f"brain:task_job:history:{task_job_id}"
+
+    @staticmethod
+    def _task_job_set_key() -> str:
+        return "brain:task_jobs"
 
     @staticmethod
     def _schedule_key(schedule_id: str) -> str:
@@ -1449,3 +1690,10 @@ class TaskOrchestrator:
             return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
         except Exception:
             return 0.0
+
+    @staticmethod
+    def _coerce_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return default

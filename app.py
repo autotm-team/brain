@@ -396,6 +396,30 @@ async def startup_handler(app: web.Application):
             await app["unified_scheduler"].start()
             logger.info("Unified scheduler started")
 
+        orchestrator = app.get("task_orchestrator")
+        if orchestrator:
+            async def _orphan_task_monitor() -> None:
+                while True:
+                    try:
+                        result = await orchestrator.scan_orphaned_task_jobs_once()
+                        if any(int(result.get(key) or 0) > 0 for key in ("cancelled", "recreated", "capped")):
+                            logger.info(
+                                "Orphan task scan completed: scanned=%s cancelled=%s recreated=%s capped=%s skipped=%s",
+                                result.get("scanned"),
+                                result.get("cancelled"),
+                                result.get("recreated"),
+                                result.get("capped"),
+                                result.get("skipped"),
+                            )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as scan_err:
+                        logger.warning(f"Orphan task monitor scan failed: {scan_err}")
+                    await asyncio.sleep(getattr(orchestrator, "ORPHAN_MONITOR_INTERVAL_SECONDS", 30))
+
+            app["orphan_task_monitor"] = asyncio.create_task(_orphan_task_monitor())
+            logger.info("Orphan task monitor started")
+
         # Flowhub 抓取任务由 Brain 统一补齐与触发，Flowhub 本身不再自建调度。
         try:
             await _ensure_flowhub_bootstrap_schedules(app)
@@ -434,6 +458,14 @@ async def cleanup_handler(app: web.Application):
     logger.info("Stopping Integration Service components")
 
     try:
+        orphan_task_monitor = app.get("orphan_task_monitor")
+        if orphan_task_monitor:
+            orphan_task_monitor.cancel()
+            try:
+                await orphan_task_monitor
+            except asyncio.CancelledError:
+                pass
+
         if "unified_scheduler" in app:
             await app["unified_scheduler"].stop()
 
