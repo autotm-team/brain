@@ -94,7 +94,7 @@ async def main():
         app = await create_app(config)
         
         # 启动Web服务
-        runner = web.AppRunner(app)
+        runner = web.AppRunner(app, access_log=None)
         await runner.setup()
         
         host = config.service.host
