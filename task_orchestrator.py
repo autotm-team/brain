@@ -167,6 +167,7 @@ class TaskOrchestrator:
             "created_at": self._utc_now(),
             "params": normalized_params,
             "metadata": normalized_metadata,
+            "service_payload": dict(service_payload) if isinstance(service_payload, dict) else None,
             "request_payload_hash": request_payload_hash,
         }
         await self._save_task_record(record)
@@ -537,7 +538,7 @@ class TaskOrchestrator:
             if not fallback:
                 raise
             fallback["message"] = fallback.get("message") or f"upstream not available: {exc.status}"
-            fallback["error"] = {
+            fallback["error"] = fallback.get("error") or {
                 "upstream_status": exc.status,
                 "message": exc.error.get("message"),
             }
@@ -1559,9 +1560,9 @@ class TaskOrchestrator:
             "message": "Upstream job disappeared while brain task was still active",
         }
         await self._save_task_record({**record, "metadata": cancelled_metadata})
-        await self._append_history(task_job_id, "orphan_cancelled", cancelled_job, upstream_status=404)
 
         if action == "capped":
+            await self._append_history(task_job_id, "orphan_cancelled", cancelled_job, upstream_status=404)
             await self._append_history(task_job_id, "auto_recreate_capped", cancelled_job, upstream_status=404)
             return "capped"
 
@@ -1584,12 +1585,38 @@ class TaskOrchestrator:
             "recovery_attempt_count": recovery_attempt,
             "auto_recreated": True,
         }
-        created = await self.create_task_job(
-            service=str(record.get("service") or ""),
-            job_type=str(record.get("job_type") or ""),
-            params=record.get("params") if isinstance(record.get("params"), dict) else {},
-            metadata=recreate_metadata,
-        )
+        create_kwargs = {
+            "service": str(record.get("service") or ""),
+            "job_type": str(record.get("job_type") or ""),
+            "params": record.get("params") if isinstance(record.get("params"), dict) else {},
+            "metadata": recreate_metadata,
+            "service_payload": record.get("service_payload") if isinstance(record.get("service_payload"), dict) else None,
+        }
+        try:
+            created = await self.create_task_job(**create_kwargs)
+        except Exception as exc:
+            retry_metadata = {
+                **base_metadata,
+                "recovery_root_task_job_id": root_task_job_id,
+                "recovery_attempt_count": recovery_attempt,
+                "orphaned_upstream_job": True,
+                "orphaned_reason": "upstream_job_missing",
+                "recovery_action": "retry_pending",
+                "recovery_attempt": recovery_attempt,
+                "last_recovery_error": str(exc),
+            }
+            retry_job = dict(latest)
+            retry_job["metadata"] = retry_metadata
+            retry_job["message"] = "upstream job missing; auto recreation pending retry"
+            retry_job["error"] = {
+                "code": "ORPHAN_RECREATE_FAILED",
+                "message": str(exc),
+            }
+            await self._save_task_record({**record, "metadata": retry_metadata})
+            await self._append_history(task_job_id, "auto_recreate_failed", retry_job, upstream_status=404)
+            return "skipped"
+
+        await self._append_history(task_job_id, "orphan_cancelled", cancelled_job, upstream_status=404)
         replacement_task_job_id = str(created.get("id") or "").strip()
         if replacement_task_job_id:
             await self._update_task_record_metadata(
