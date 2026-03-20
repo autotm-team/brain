@@ -586,8 +586,8 @@ class DataInitializationCoordinator:
                     jobs.append(await self._submit_or_reuse_flowhub_job(adapter, job_type, params))
 
             # 结构域依赖顺序：先板块日线，再板块成分股/资金流。
-            await _create_flowhub("industry_board", {"source": "em", "update_mode": "incremental"})
-            await _create_flowhub("concept_board", {"source": "em", "update_mode": "incremental"})
+            await _create_flowhub("industry_board", {"source": "ths", "update_mode": "incremental"})
+            await _create_flowhub("concept_board", {"source": "ths", "update_mode": "incremental"})
 
             # 其他宏观：社融、投资、工业、情绪、库存周期、GDP、创新、人口
             tasks = [
@@ -599,10 +599,10 @@ class DataInitializationCoordinator:
                 _create("gdp_data"),
                 _create("innovation_data"),
                 _create("demographic_data"),
-                _create_flowhub("industry_board_stocks", {"source": "em", "update_mode": "incremental"}),
-                _create_flowhub("concept_board_stocks", {"source": "em", "update_mode": "incremental"}),
-                _create_flowhub("industry_moneyflow_data", {"source": "em", "update_mode": "incremental"}),
-                _create_flowhub("concept_moneyflow_data", {"source": "em", "update_mode": "incremental"}),
+                _create_flowhub("industry_board_stocks", {"source": "ths", "update_mode": "incremental"}),
+                _create_flowhub("concept_board_stocks", {"source": "ths", "update_mode": "incremental"}),
+                _create_flowhub("industry_moneyflow_data", {"source": "ths", "update_mode": "incremental"}),
+                _create_flowhub("concept_moneyflow_data", {"source": "ths", "update_mode": "incremental"}),
             ]
             await asyncio.gather(*tasks)
             return jobs

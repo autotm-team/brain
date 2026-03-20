@@ -458,12 +458,12 @@ class UIBffHandler(BaseHandler):
     }
 
     STRUCTURE_ROTATION_TEMPLATE_PARAMS = {
-        "industry_board": {"source": "em", "update_mode": "incremental"},
-        "concept_board": {"source": "em", "update_mode": "incremental"},
-        "industry_board_stocks": {"source": "em", "update_mode": "incremental"},
-        "concept_board_stocks": {"source": "em", "update_mode": "incremental"},
-        "industry_moneyflow_data": {"source": "em", "incremental": True},
-        "concept_moneyflow_data": {"source": "em", "incremental": True},
+        "industry_board": {"source": "ths", "update_mode": "incremental"},
+        "concept_board": {"source": "ths", "update_mode": "incremental"},
+        "industry_board_stocks": {"source": "ths", "update_mode": "incremental"},
+        "concept_board_stocks": {"source": "ths", "update_mode": "incremental"},
+        "industry_moneyflow_data": {"source": "ths", "incremental": True},
+        "concept_moneyflow_data": {"source": "ths", "incremental": True},
         "batch_daily_basic": {"incremental": True},
     }
 
@@ -489,8 +489,8 @@ class UIBffHandler(BaseHandler):
         "stock_basic_data": {"update_mode": "incremental"},
         "batch_daily_ohlc": {"incremental": True},
         "batch_daily_basic": {"incremental": True},
-        "industry_board_stocks": {"source": "em", "update_mode": "incremental"},
-        "industry_moneyflow_data": {"source": "em", "incremental": True},
+        "industry_board_stocks": {"source": "ths", "update_mode": "incremental"},
+        "industry_moneyflow_data": {"source": "ths", "incremental": True},
     }
 
     READINESS_REAL_DATA_TABLES = {
