@@ -14,7 +14,7 @@ import logging
 import os
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from asyncron import request_envelope
@@ -33,7 +33,7 @@ STATE_PATH = "data/brain/init_state.json"
 
 
 def _now_iso() -> str:
-    return datetime.utcnow().isoformat() + "Z"
+    return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
 
 def _ensure_dir(path: str) -> None:
@@ -173,7 +173,7 @@ class DataInitializationCoordinator:
         timeout_total = int(retry_cfg.get("timeout", 300))
 
         attempt = 0
-        start_ts = datetime.utcnow()
+        start_ts = datetime.now(timezone.utc)
         while True:
             attempt += 1
             try:
@@ -197,7 +197,7 @@ class DataInitializationCoordinator:
                 logger.warning(f"Flowhub health not ready (attempt {attempt}): {e}")
 
             if attempt >= max_retries:
-                elapsed = (datetime.utcnow() - start_ts).total_seconds()
+                elapsed = (datetime.now(timezone.utc) - start_ts).total_seconds()
                 if elapsed >= timeout_total:
                     logger.error("Dependency wait timed out, proceeding in degraded mode")
                     return

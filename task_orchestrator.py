@@ -9,7 +9,7 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from asyncron import request_envelope
@@ -584,6 +584,8 @@ class TaskOrchestrator:
                     normalized = await self._merge_record_metadata(task_job_id, normalized)
                     await self._append_history_if_changed(task_job_id, normalized)
                     await self._maybe_trigger_followups(task_job_id, normalized)
+                    # 每次 upstream API 调用后短暂延时，防止大量活跃任务时产生请求风暴
+                    await asyncio.sleep(0.2)
                 except UpstreamServiceError as exc:
                     if exc.status == 404:
                         action = await self._recover_orphaned_task(task_job_id, record, latest)
@@ -1698,7 +1700,7 @@ class TaskOrchestrator:
 
     @staticmethod
     def _utc_now() -> str:
-        return datetime.utcnow().isoformat() + "Z"
+        return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
     @staticmethod
     def _as_timestamp(value: Any) -> float:

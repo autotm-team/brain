@@ -27,9 +27,11 @@ def validate_schema_requirements() -> None:
     if not enforce:
         return
     if validate_schema_on_startup is None:
-        logging.getLogger(__name__).warning(
-            "schema validator unavailable while DB_SCHEMA_ENFORCE=true; skip startup schema validation"
-        )
+        msg = "schema validator unavailable while DB_SCHEMA_ENFORCE=true"
+        if os.getenv("DB_SCHEMA_EXIT_ON_FAILURE", "true").lower() == "true":
+            logging.getLogger(__name__).error(msg + "; refusing to start")
+            sys.exit(1)
+        logging.getLogger(__name__).warning(msg + "; skip startup schema validation")
         return
     required_version = os.getenv("DB_SCHEMA_REQUIRED_VERSION", "V001")
     validate_schema_on_startup(
