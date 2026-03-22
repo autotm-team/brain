@@ -157,6 +157,7 @@ class UIBffHandler(BaseHandler):
             "ui_rotation_policy_save",
         ),
         RouteSpec("GET", re.compile(r"^/api/v1/ui/structure-rotation/policy/diff$"), "macro"),
+        RouteSpec("GET", re.compile(r"^/api/v1/ui/structure-rotation/flow-migration$"), "macro"),
         RouteSpec("GET", re.compile(r"^/api/v1/ui/candidates/clusters$"), "execution"),
         RouteSpec("GET", re.compile(r"^/api/v1/ui/candidates/events$"), "execution"),
         RouteSpec("GET", re.compile(r"^/api/v1/ui/candidates/symbols/(?P<symbol>[^/]+)/chart$"), "execution"),
