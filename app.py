@@ -379,6 +379,19 @@ async def startup_handler(app: web.Application):
     except Exception as e:
         logger.warning(f"Failed to schedule data initialization: {e}")
 
+    # 清除旧 boot cycle 的 auto_chain claims，防止跨重启残留导致链式触发被阻塞
+    try:
+        redis_client = app.get('redis')
+        if redis_client:
+            cleared = 0
+            async for key in redis_client.scan_iter(match="brain:auto_chain:*"):
+                await redis_client.delete(key)
+                cleared += 1
+            if cleared:
+                logger.info("Cleared %d stale auto_chain claims from previous boot cycle", cleared)
+    except Exception as clear_err:
+        logger.warning(f"Failed to clear auto_chain claims: {clear_err}")
+
     try:
         # 启动服务注册表
         await app['service_registry'].start()

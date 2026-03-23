@@ -1155,6 +1155,10 @@ class TaskOrchestrator:
             return
         claim_key = self._auto_chain_claim_key("stock_daily_fetch", task_job_id)
         if not await self._claim_auto_chain(claim_key):
+            logger.warning(
+                "Auto-chain claim '%s' already taken, skipping batch_daily trigger for task_job_id=%s",
+                claim_key, task_job_id,
+            )
             return
         ohlc_created = await self.create_task_job(
             service="flowhub",
@@ -1207,6 +1211,10 @@ class TaskOrchestrator:
         scope_signature = self._scope_signature(source_params)
         claim_key = self._auto_chain_claim_key("daily_analysis", latest_ohlc, scope_signature)
         if not await self._claim_auto_chain(claim_key):
+            logger.warning(
+                "Auto-chain claim '%s' already taken, skipping batch_analyze trigger for trade_date=%s",
+                claim_key, latest_ohlc,
+            )
             return
         source_symbols = source_params.get("symbols") if isinstance(source_params.get("symbols"), list) else None
         created = await self.create_task_job(
@@ -1372,6 +1380,10 @@ class TaskOrchestrator:
         if not trade_date:
             return
         if not await self._claim_auto_chain(f"candidate_sync:{trade_date}"):
+            logger.warning(
+                "Auto-chain claim 'candidate_sync:%s' already taken, skipping candidate_sync trigger",
+                trade_date,
+            )
             return
         created = await self.create_task_job(
             service="execution",
