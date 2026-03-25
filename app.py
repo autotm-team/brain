@@ -284,7 +284,12 @@ async def init_components(app: web.Application, config: IntegrationConfig):
             app['redis'] = redis.from_url(
                 config.redis.url,
                 encoding='utf-8',
-                decode_responses=True
+                decode_responses=True,
+                socket_timeout=30,
+                socket_connect_timeout=10,
+                retry_on_timeout=True,
+                max_connections=50,
+                health_check_interval=15,
             )
             await app['redis'].ping()
             logger.info(f"Redis client initialized: {config.redis.url}")

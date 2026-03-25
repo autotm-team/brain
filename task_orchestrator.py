@@ -114,6 +114,7 @@ class TaskOrchestrator:
         "ui_rotation_policy_freeze": "轮动策略冻结",
         "ui_rotation_policy_apply": "轮动策略应用",
         "ui_rotation_policy_save": "轮动策略保存",
+        "ui_snapshot_refresh": "快照刷新",
         "ui_sim_order_create": "模拟下单",
         "ui_sim_order_cancel": "模拟撤单",
     }
@@ -189,7 +190,7 @@ class TaskOrchestrator:
     def _schedule_followup_monitor(self, task_job_id: str, service: str, job_type: str) -> None:
         if service not in {"flowhub", "execution"}:
             return
-        if job_type not in {"stock_basic_data", "batch_daily_ohlc", "batch_daily_basic", "batch_analyze"}:
+        if job_type not in {"stock_basic_data", "batch_daily_ohlc", "batch_daily_basic", "batch_analyze", "index_daily_data", "industry_board"}:
             return
 
         async def _watch() -> None:
@@ -1121,15 +1122,40 @@ class TaskOrchestrator:
         self._local_auto_chain_claims.add(key)
         return True
 
+    async def _release_auto_chain(self, key: str) -> bool:
+        """释放 auto-chain 声明锁，允许该链路重新触发。"""
+        released = False
+        redis = self._redis()
+        if redis:
+            try:
+                result = await redis.delete(self._auto_chain_key(key))
+                released = bool(result)
+            except Exception:
+                pass
+        self._local_auto_chain_claims.discard(key)
+        if released:
+            logger.info("Released auto-chain claim '%s' to allow re-trigger", key)
+        return released
+
     @staticmethod
     def _auto_chain_key(key: str) -> str:
         return f"brain:auto_chain:{key}"
 
     async def _maybe_trigger_followups(self, task_job_id: str, normalized: Dict[str, Any]) -> None:
-        if str(normalized.get("status") or "") != "succeeded":
-            return
+        status = str(normalized.get("status") or "")
         service = str(normalized.get("service") or "").strip().lower()
         job_type = str(normalized.get("job_type") or "").strip()
+
+        # 下游任务失败/取消时，释放对应的 auto-chain 锁以允许重新触发
+        if status in {"failed", "cancelled"}:
+            try:
+                await self._maybe_release_failed_chain_locks(task_job_id, normalized)
+            except Exception as exc:
+                logger.warning("Failed to release chain locks for %s: %s", task_job_id, exc)
+            return
+
+        if status != "succeeded":
+            return
         try:
             if service == "flowhub" and job_type == "stock_basic_data":
                 await self._maybe_trigger_stock_daily_fetches(task_job_id, normalized)
@@ -1137,6 +1163,11 @@ class TaskOrchestrator:
                 await self._maybe_trigger_daily_analysis(task_job_id, normalized)
             elif service == "execution" and job_type == "batch_analyze":
                 await self._maybe_trigger_candidate_sync(task_job_id, normalized)
+                await self._try_converge_snapshot_prereq("batch_analyze", task_job_id, normalized)
+            elif service == "flowhub" and job_type == "index_daily_data":
+                await self._try_converge_snapshot_prereq("index_daily", task_job_id, normalized)
+            elif service == "flowhub" and job_type == "industry_board":
+                await self._try_converge_snapshot_prereq("industry_board", task_job_id, normalized)
         except Exception as exc:
             await self._append_history(
                 task_job_id,
@@ -1146,6 +1177,98 @@ class TaskOrchestrator:
             normalized_metadata = normalized.get("metadata") if isinstance(normalized.get("metadata"), dict) else {}
             normalized_metadata["auto_chain_error"] = str(exc)
             await self._update_task_record_metadata(task_job_id, normalized_metadata)
+
+    async def _maybe_release_failed_chain_locks(self, task_job_id: str, normalized: Dict[str, Any]) -> None:
+        """当下游任务失败时，释放其占用的 auto-chain 声明锁，并立即重新触发下游任务。"""
+        service = str(normalized.get("service") or "").strip().lower()
+        job_type = str(normalized.get("job_type") or "").strip()
+        metadata = normalized.get("metadata") if isinstance(normalized.get("metadata"), dict) else {}
+        trade_date = str(metadata.get("auto_chain_trade_date") or "").strip()
+
+        if service == "execution" and job_type == "batch_analyze" and trade_date:
+            # 释放 daily_analysis 锁（与 _maybe_trigger_daily_analysis 中创建锁的逻辑对称）
+            record = await self._load_task_record(task_job_id)
+            source_params = record.get("params") if isinstance(record, dict) and isinstance(record.get("params"), dict) else {}
+            scope_signature = self._scope_signature(source_params)
+            claim_key = self._auto_chain_claim_key("daily_analysis", trade_date, scope_signature)
+            released = await self._release_auto_chain(claim_key)
+            if released:
+                await self._append_history(task_job_id, "auto_chain_lock_released", normalized)
+                logger.info(
+                    "Released daily_analysis chain lock for trade_date=%s after batch_analyze failure (task_job_id=%s)",
+                    trade_date, task_job_id,
+                )
+                # 立即重新触发 batch_analyze
+                await self._retry_failed_chain_task(task_job_id, record, normalized, "batch_analyze")
+
+        elif service == "execution" and job_type == "ui_candidates_sync_from_analysis" and trade_date:
+            # 释放 candidate_sync 锁
+            record = await self._load_task_record(task_job_id)
+            released = await self._release_auto_chain(f"candidate_sync:{trade_date}")
+            if released:
+                await self._append_history(task_job_id, "auto_chain_lock_released", normalized)
+                logger.info(
+                    "Released candidate_sync chain lock for trade_date=%s after failure (task_job_id=%s)",
+                    trade_date, task_job_id,
+                )
+                # 立即重新触发 candidate_sync
+                await self._retry_failed_chain_task(task_job_id, record, normalized, "ui_candidates_sync_from_analysis")
+
+    async def _retry_failed_chain_task(
+        self,
+        failed_task_job_id: str,
+        record: Optional[Dict[str, Any]],
+        normalized: Dict[str, Any],
+        job_type: str,
+    ) -> None:
+        """在释放锁后立即重新创建失败的下游任务。"""
+        if not isinstance(record, dict):
+            logger.warning("Cannot retry chain task %s: no record found", failed_task_job_id)
+            return
+
+        service = str(record.get("service") or "").strip()
+        params = record.get("params") if isinstance(record.get("params"), dict) else {}
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+
+        # 标记为重试
+        retry_count = int(metadata.get("auto_chain_retry_count", 0)) + 1
+        max_retries = 3
+        if retry_count > max_retries:
+            logger.warning(
+                "Skipping auto-retry for %s: exceeded max retries (%d/%d), task_job_id=%s",
+                job_type, retry_count, max_retries, failed_task_job_id,
+            )
+            return
+
+        retry_metadata = dict(metadata)
+        retry_metadata["auto_chain_retry_count"] = retry_count
+        retry_metadata["auto_chain_retry_from"] = failed_task_job_id
+        retry_metadata["auto_chain_retry_reason"] = str(normalized.get("status", "failed"))
+
+        try:
+            created = await self.create_task_job(
+                service=service,
+                job_type=job_type,
+                params=params,
+                metadata=retry_metadata,
+            )
+            new_task_job_id = created.get("id", "")
+            logger.info(
+                "Auto-retried failed chain task %s → new task %s (retry %d/%d)",
+                failed_task_job_id, new_task_job_id, retry_count, max_retries,
+            )
+            await self._append_history(
+                failed_task_job_id,
+                "auto_chain_retried",
+                normalized,
+                new_task_job_id=new_task_job_id,
+                retry_count=retry_count,
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed to auto-retry chain task %s: %s",
+                failed_task_job_id, exc,
+            )
 
     async def _maybe_trigger_stock_daily_fetches(self, task_job_id: str, normalized: Dict[str, Any]) -> None:
         metadata = normalized.get("metadata") if isinstance(normalized.get("metadata"), dict) else {}
@@ -1216,6 +1339,20 @@ class TaskOrchestrator:
                 claim_key, latest_ohlc,
             )
             return
+        # Defense-in-depth: check if execution already has a batch_analyze running
+        try:
+            redis = self._redis()
+            if redis:
+                running_holder = await redis.get("execution:batch_analyze:running_lock")
+                if running_holder:
+                    logger.warning(
+                        "batch_analyze already running on execution (holder=%s), skipping trigger for trade_date=%s",
+                        running_holder, latest_ohlc,
+                    )
+                    await self._release_auto_chain(claim_key)
+                    return
+        except Exception as exc:
+            logger.debug("Failed to check execution batch_analyze lock: %s", exc)
         source_symbols = source_params.get("symbols") if isinstance(source_params.get("symbols"), list) else None
         created = await self.create_task_job(
             service="execution",
@@ -1406,6 +1543,138 @@ class TaskOrchestrator:
             "auto_chain_created",
             normalized,
         )
+
+    # ---------- Multi-source convergence for snapshot refresh ----------
+
+    SNAPSHOT_PREREQ_FIELDS = frozenset({"batch_analyze", "index_daily", "industry_board"})
+
+    def _snapshot_prereqs_key(self, trade_date: str) -> str:
+        return f"brain:snapshot_prereqs:{trade_date}"
+
+    def _resolve_snapshot_trade_date(self, normalized: Dict[str, Any]) -> Optional[str]:
+        """Extract the trade_date from a completed job result."""
+        result = normalized.get("result") if isinstance(normalized.get("result"), dict) else {}
+        # batch_analyze stores it in last_trade_date
+        td = str(result.get("last_trade_date") or "").strip()
+        if td:
+            return td
+        # flowhub data jobs may store it in trade_date or latest_trade_date
+        td = str(result.get("trade_date") or result.get("latest_trade_date") or "").strip()
+        if td:
+            return td
+        # fallback: check DB tables
+        for table in ("analysis_results", "index_daily_data", "stock_daily_data"):
+            td = self._get_table_latest_date(table)
+            if td:
+                return td
+        return None
+
+    async def _try_converge_snapshot_prereq(
+        self, field: str, task_job_id: str, normalized: Dict[str, Any]
+    ) -> None:
+        """Register one prerequisite completion and fire snapshot refresh if ALL are met."""
+        trade_date = self._resolve_snapshot_trade_date(normalized)
+        if not trade_date:
+            logger.warning("Cannot resolve trade_date for snapshot prereq '%s'", field)
+            return
+
+        prereq_key = self._snapshot_prereqs_key(trade_date)
+        redis = self._redis()
+
+        if redis:
+            try:
+                await redis.hset(prereq_key, field, "1")
+                await redis.expire(prereq_key, 86400)
+                raw = await redis.hgetall(prereq_key)
+                completed_fields = set()
+                for k, v in raw.items():
+                    key_str = k.decode("utf-8") if isinstance(k, bytes) else str(k)
+                    val_str = v.decode("utf-8") if isinstance(v, bytes) else str(v)
+                    if val_str == "1":
+                        completed_fields.add(key_str)
+            except Exception as exc:
+                logger.warning("Redis snapshot prereq tracking failed for '%s': %s", field, exc)
+                completed_fields = {field}
+        else:
+            # Local fallback (single-instance only)
+            local_key = f"_snapshot_prereqs_{trade_date}"
+            if not hasattr(self, local_key):
+                setattr(self, local_key, set())
+            local_set: set = getattr(self, local_key)
+            local_set.add(field)
+            completed_fields = set(local_set)
+
+        missing = self.SNAPSHOT_PREREQ_FIELDS - completed_fields
+        if missing:
+            logger.info(
+                "Snapshot prereq '%s' ready for trade_date=%s, still waiting: %s (completed: %s)",
+                field, trade_date, sorted(missing), sorted(completed_fields),
+            )
+            await self._update_task_record_metadata(
+                task_job_id,
+                {
+                    "snapshot_prereq_field": field,
+                    "snapshot_prereq_trade_date": trade_date,
+                    "snapshot_prereq_completed": sorted(completed_fields),
+                    "snapshot_prereq_missing": sorted(missing),
+                },
+            )
+            return
+
+        logger.info(
+            "All snapshot prereqs met for trade_date=%s (fields: %s), firing snapshot refresh",
+            trade_date, sorted(completed_fields),
+        )
+        await self._fire_snapshot_refresh(trade_date, task_job_id, normalized)
+
+    async def _fire_snapshot_refresh(
+        self, trade_date: str, task_job_id: str, normalized: Dict[str, Any]
+    ) -> None:
+        """Actually trigger macro:ui_snapshot_refresh after all prereqs are met."""
+        claim_key = f"snapshot_refresh:{trade_date}"
+        if not await self._claim_auto_chain(claim_key):
+            logger.warning(
+                "Auto-chain claim '%s' already taken, skipping snapshot_refresh trigger",
+                claim_key,
+            )
+            return
+        try:
+            created = await self.create_task_job(
+                service="macro",
+                job_type="ui_snapshot_refresh",
+                params={
+                    "benchmark": "CSI300",
+                    "scale": "D1",
+                    "expected_trade_date": trade_date,
+                },
+                metadata={
+                    "auto_chain_source": "snapshot_prereq_convergence",
+                    "auto_chain_trade_date": trade_date,
+                    "auto_chain_prereqs": sorted(self.SNAPSHOT_PREREQ_FIELDS),
+                },
+            )
+            await self._update_task_record_metadata(
+                task_job_id,
+                {
+                    "auto_chain_trade_date": trade_date,
+                    "followup_snapshot_refresh_task_job_id": created.get("id"),
+                },
+            )
+            await self._append_history(
+                task_job_id,
+                "auto_chain_created",
+                normalized,
+            )
+            logger.info(
+                "Convergence triggered macro:ui_snapshot_refresh for trade_date=%s (task_job_id=%s)",
+                trade_date, created.get("id"),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to trigger snapshot_refresh for trade_date=%s: %s",
+                trade_date, exc,
+            )
+            await self._release_auto_chain(claim_key)
 
     async def _load_task_record(self, task_job_id: str) -> Optional[Dict[str, Any]]:
         local = self._brain_jobs.get(task_job_id)

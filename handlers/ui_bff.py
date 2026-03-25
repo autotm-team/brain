@@ -75,6 +75,7 @@ class UIBffHandler(BaseHandler):
         RouteSpec("GET", re.compile(r"^/api/v1/ui/market-snapshot/list$"), "macro"),
         RouteSpec("GET", re.compile(r"^/api/v1/ui/market-snapshot/alerts$"), "macro"),
         RouteSpec("GET", re.compile(r"^/api/v1/ui/market-snapshot/latest$"), "macro"),
+        RouteSpec("POST", re.compile(r"^/api/v1/ui/market-snapshot/refresh$"), "macro", True, "ui_snapshot_refresh"),
         RouteSpec("GET", re.compile(r"^/api/v1/ui/market-snapshot/(?P<snapshot_id>[^/]+)$"), "macro"),
         RouteSpec(
             "GET",
