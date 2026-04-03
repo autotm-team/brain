@@ -311,9 +311,14 @@ class SystemMonitor:
         for alert in self._alert_history:
             if alert.alert_id == alert_id:
                 if not alert.is_resolved:
-                    alert.is_resolved = True
-                    alert.resolution_time = datetime.now()
-                    alert.resolution_notes = notes or "acknowledged"
+                    metadata = dict(alert.metadata or {})
+                    metadata["acked"] = True
+                    metadata["acknowledged"] = True
+                    metadata["acknowledged_at"] = datetime.now().isoformat()
+                    if notes:
+                        metadata["acknowledge_notes"] = notes
+                    alert.metadata = metadata
+                    alert.resolution_notes = notes or alert.resolution_notes
                 return self._serialize_alert(alert)
         raise MonitoringException(f"Alert not found: {alert_id}")
 
@@ -342,15 +347,29 @@ class SystemMonitor:
 
     def set_alert_rule(self, rule: Dict[str, Any]) -> Dict[str, Any]:
         """设置告警规则"""
-        rule_id = rule.get('rule_id') or f"rule_{datetime.now().timestamp()}"
+        existing_rule = None
+        rule_id = rule.get('rule_id') or rule.get('id')
+        if rule_id:
+            existing_rule = next((item for item in self._alert_rules if item.get('rule_id') == rule_id), None)
+        if not rule_id:
+            rule_id = f"rule_{datetime.now().timestamp()}"
+
+        created_at = (
+            existing_rule.get('created_at')
+            if isinstance(existing_rule, dict) and existing_rule.get('created_at')
+            else datetime.now().isoformat()
+        )
         normalized = {
             'rule_id': rule_id,
             'name': rule.get('name'),
+            'component': rule.get('component') or (existing_rule.get('component') if isinstance(existing_rule, dict) else None) or 'integration_layer',
             'condition': rule.get('condition'),
             'threshold': rule.get('threshold'),
+            'alert_level': rule.get('alert_level') or (existing_rule.get('alert_level') if isinstance(existing_rule, dict) else None) or 'P2',
             'enabled': bool(rule.get('enabled', True)),
-            'created_at': datetime.now().isoformat(),
-            'metadata': rule.get('metadata', {})
+            'created_at': created_at,
+            'updated_at': datetime.now().isoformat(),
+            'metadata': rule.get('metadata', {}) if isinstance(rule.get('metadata'), dict) else {},
         }
 
         # 同步到性能阈值（若规则是标准指标）
@@ -361,7 +380,11 @@ class SystemMonitor:
             except (TypeError, ValueError):
                 pass
 
-        self._alert_rules.append(normalized)
+        if existing_rule is not None:
+            idx = self._alert_rules.index(existing_rule)
+            self._alert_rules[idx] = normalized
+        else:
+            self._alert_rules.append(normalized)
         return normalized
     
     def get_monitoring_statistics(self) -> Dict[str, Any]:

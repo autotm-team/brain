@@ -162,6 +162,18 @@ class TaskHandler(BaseHandler):
             self.logger.error(f"List task job types failed: {e}")
             return self._err("INTERNAL_ERROR", "获取任务类型失败", 500)
 
+    async def get_task_job_analytics(self, request: web.Request) -> web.Response:
+        try:
+            query_params = self.get_query_params(request)
+            service = query_params.get("service")
+            window_key = query_params.get("window_key")
+            orchestrator = self.get_app_component(request, "task_orchestrator")
+            payload = await orchestrator.get_task_job_analytics(service=service, window_key=window_key)
+            return self._ok(payload)
+        except Exception as e:
+            self.logger.error(f"Get task job analytics failed: {e}")
+            return self._err("INTERNAL_ERROR", "获取任务分析失败", 500)
+
     async def list_schedules(self, request: web.Request) -> web.Response:
         try:
             query_params = self.get_query_params(request)

@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import secrets
 import sys
+import time
 from urllib.parse import unquote
 import uuid
 from typing import Any, Callable, Dict, Optional, Pattern
@@ -354,6 +355,9 @@ class UIBffHandler(BaseHandler):
                 {"data_type": "market_flow_data", "label": "市场资金流"},
                 {"data_type": "interest_rate_data", "label": "利率与流动性"},
                 {"data_type": "commodity_price_data", "label": "大宗商品"},
+                {"data_type": "stock_factor_data", "label": "个股技术因子(专业版)"},
+                {"data_type": "daily_info_data", "label": "全市场交易统计"},
+                {"data_type": "limit_list_data", "label": "每日涨跌停统计"},
             ],
         },
         "macro_cycle": {
@@ -409,6 +413,9 @@ class UIBffHandler(BaseHandler):
         "market_flow_data": {"schedule_type": "cron", "schedule_value": "40 16 * * 1-5"},
         "interest_rate_data": {"schedule_type": "cron", "schedule_value": "45 16 * * 1-5"},
         "commodity_price_data": {"schedule_type": "cron", "schedule_value": "50 16 * * 1-5"},
+        "stock_factor_data": {"schedule_type": "cron", "schedule_value": "55 16 * * 1-5"},
+        "daily_info_data": {"schedule_type": "cron", "schedule_value": "56 16 * * 1-5"},
+        "limit_list_data": {"schedule_type": "cron", "schedule_value": "57 16 * * 1-5"},
     }
 
     MARKET_SNAPSHOT_TEMPLATE_NAMES = {
@@ -418,6 +425,9 @@ class UIBffHandler(BaseHandler):
         "market_flow_data": "模板·市场快照·市场资金流",
         "interest_rate_data": "模板·市场快照·利率与流动性",
         "commodity_price_data": "模板·市场快照·大宗商品",
+        "stock_factor_data": "模板·市场快照·个股技术因子",
+        "daily_info_data": "模板·市场快照·全市场交易统计",
+        "limit_list_data": "模板·市场快照·每日涨跌停统计",
     }
 
     MARKET_SNAPSHOT_TEMPLATE_PARAMS = {
@@ -2007,6 +2017,185 @@ class UIBffHandler(BaseHandler):
             self.logger.error(f"load execution backtest capabilities failed: {exc}")
             return self.error_response("Failed to load execution backtest capabilities", 500)
 
+    @staticmethod
+    def _schedule_name(item: Dict[str, Any]) -> str:
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        return str(metadata.get("name") or item.get("job_type") or item.get("schedule_id") or "schedule").strip()
+
+    def _normalize_system_schedule_item(
+        self,
+        schedule: Dict[str, Any],
+        *,
+        latest_root_task: Optional[Dict[str, Any]] = None,
+        lineage_summary: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        latest_root_task = latest_root_task if isinstance(latest_root_task, dict) else {}
+        lineage_summary = lineage_summary if isinstance(lineage_summary, dict) else {}
+        return {
+            "schedule_id": str(schedule.get("id") or schedule.get("schedule_id") or ""),
+            "name": self._schedule_name(schedule),
+            "service": str(schedule.get("service") or ""),
+            "job_type": str(schedule.get("job_type") or ""),
+            "trigger": str(schedule.get("trigger") or ""),
+            "cron_expr": schedule.get("cron") or schedule.get("cron_expr"),
+            "interval_seconds": schedule.get("interval_seconds"),
+            "enabled": self._coerce_bool(schedule.get("enabled")),
+            "next_run_at": schedule.get("next_run_at"),
+            "last_triggered_at": schedule.get("last_triggered_at"),
+            "last_task_job_id": schedule.get("last_task_job_id"),
+            "last_task_status": latest_root_task.get("status") if latest_root_task else None,
+            "last_chain_depth": self._safe_int(lineage_summary.get("max_depth"), 0),
+            "last_chain_leaf_count": self._safe_int(lineage_summary.get("leaf_count"), 0),
+            "metadata": dict(schedule.get("metadata") or {}) if isinstance(schedule.get("metadata"), dict) else {},
+            "params": dict(schedule.get("params") or {}) if isinstance(schedule.get("params"), dict) else {},
+            "created_at": schedule.get("created_at"),
+            "updated_at": schedule.get("updated_at"),
+        }
+
+    def _normalize_system_schedule_detail_payload(self, detail: Dict[str, Any]) -> Dict[str, Any]:
+        schedule = detail.get("schedule") if isinstance(detail.get("schedule"), dict) else {}
+        return {
+            "schedule": self._normalize_system_schedule_item(
+                schedule,
+                latest_root_task=detail.get("latest_root_task") if isinstance(detail.get("latest_root_task"), dict) else None,
+                lineage_summary=detail.get("lineage_summary") if isinstance(detail.get("lineage_summary"), dict) else None,
+            ),
+            "latest_root_task": detail.get("latest_root_task") if isinstance(detail.get("latest_root_task"), dict) else None,
+            "recent_task_jobs": detail.get("recent_task_jobs") if isinstance(detail.get("recent_task_jobs"), list) else [],
+            "lineage_tree": detail.get("lineage_tree") if isinstance(detail.get("lineage_tree"), list) else [],
+            "lineage_nodes": detail.get("lineage_nodes") if isinstance(detail.get("lineage_nodes"), list) else [],
+            "lineage_edges": detail.get("lineage_edges") if isinstance(detail.get("lineage_edges"), list) else [],
+            "lineage_summary": detail.get("lineage_summary") if isinstance(detail.get("lineage_summary"), dict) else {},
+        }
+
+    def _schedule_sort_key(self, item: Dict[str, Any]) -> tuple[Any, ...]:
+        enabled = self._coerce_bool(item.get("enabled"))
+        next_run_ts = self._parse_any_timestamp(item.get("next_run_at"))
+        updated_ts = self._parse_any_timestamp(item.get("updated_at"))
+        has_due_time = enabled and next_run_ts > 0
+        overdue = has_due_time and next_run_ts <= time.time()
+        return (
+            0 if overdue else 1 if has_due_time else 2,
+            next_run_ts if has_due_time else float("inf"),
+            -updated_ts,
+            str(item.get("schedule_id") or ""),
+        )
+
+    async def _handle_system_schedules_list(self, request: web.Request) -> web.Response:
+        orchestrator = self.get_app_component(request, "task_orchestrator")
+        query = request.query
+        service = str(query.get("service") or "").strip().lower() or None
+        trigger = str(query.get("trigger") or "").strip().lower() or None
+        enabled_filter = str(query.get("enabled") or "").strip().lower()
+        search = str(query.get("search") or "").strip().lower()
+        limit = max(1, min(200, self._safe_int(query.get("limit"), 100)))
+        offset = max(0, self._safe_int(query.get("offset"), 0))
+
+        payload = await orchestrator.list_schedules(service=service, limit=1000, offset=0)
+        items = payload.get("items", []) if isinstance(payload, dict) else []
+        filtered: list[Dict[str, Any]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if trigger and str(item.get("trigger") or "").strip().lower() != trigger:
+                continue
+            if enabled_filter in {"enabled", "true", "1"} and not self._coerce_bool(item.get("enabled")):
+                continue
+            if enabled_filter in {"disabled", "false", "0"} and self._coerce_bool(item.get("enabled")):
+                continue
+            if search:
+                bag = " ".join(
+                    [
+                        str(item.get("id") or ""),
+                        str(item.get("service") or ""),
+                        str(item.get("job_type") or ""),
+                        str(item.get("trigger") or ""),
+                        str(item.get("cron") or ""),
+                        str(item.get("interval_seconds") or ""),
+                        self._schedule_name(item),
+                    ]
+                ).lower()
+                if search not in bag:
+                    continue
+            filtered.append(item)
+
+        filtered.sort(key=self._schedule_sort_key)
+        total = len(filtered)
+        page_items = filtered[offset : offset + limit]
+        enriched: list[Dict[str, Any]] = []
+        for item in page_items:
+            detail = await orchestrator.get_schedule_detail(str(item.get("id") or ""))
+            enriched.append(
+                self._normalize_system_schedule_item(
+                    detail.get("schedule") if isinstance(detail.get("schedule"), dict) else item,
+                    latest_root_task=detail.get("latest_root_task") if isinstance(detail.get("latest_root_task"), dict) else None,
+                    lineage_summary=detail.get("lineage_summary") if isinstance(detail.get("lineage_summary"), dict) else None,
+                )
+            )
+        return self.success_response({"items": enriched, "total": total, "limit": limit, "offset": offset})
+
+    async def _handle_system_schedule_detail(self, request: web.Request, schedule_id: str) -> web.Response:
+        orchestrator = self.get_app_component(request, "task_orchestrator")
+        detail = await orchestrator.get_schedule_detail(schedule_id)
+        return self.success_response(self._normalize_system_schedule_detail_payload(detail))
+
+    async def _handle_system_schedule_create(self, request: web.Request) -> web.Response:
+        body = await self.get_request_json(request)
+        if not isinstance(body, dict):
+            return self.error_response("Request body must be a JSON object", 400)
+        orchestrator = self.get_app_component(request, "task_orchestrator")
+        created = await orchestrator.create_schedule(body)
+        detail = await orchestrator.get_schedule_detail(str(created.get("id") or ""))
+        return self.success_response(self._normalize_system_schedule_detail_payload(detail), "Schedule created")
+
+    async def _handle_system_schedule_update(self, request: web.Request, schedule_id: str) -> web.Response:
+        body = await self.get_request_json(request)
+        if not isinstance(body, dict):
+            return self.error_response("Request body must be a JSON object", 400)
+        patch_payload: Dict[str, Any] = {}
+        for key in ("enabled", "params", "metadata", "cron", "interval_seconds"):
+            if key in body:
+                patch_payload[key] = body.get(key)
+        orchestrator = self.get_app_component(request, "task_orchestrator")
+        updated = await orchestrator.patch_schedule(schedule_id, patch_payload)
+        detail = await orchestrator.get_schedule_detail(str(updated.get("id") or schedule_id))
+        return self.success_response(self._normalize_system_schedule_detail_payload(detail), "Schedule updated")
+
+    async def _handle_system_schedule_delete(self, request: web.Request, schedule_id: str) -> web.Response:
+        orchestrator = self.get_app_component(request, "task_orchestrator")
+        deleted = await orchestrator.delete_schedule(schedule_id)
+        if not deleted:
+            return self.error_response("Schedule not found", 404)
+        return self.success_response({"schedule_id": schedule_id, "deleted": True}, "Schedule deleted")
+
+    async def _handle_system_schedule_trigger(self, request: web.Request, schedule_id: str) -> web.Response:
+        orchestrator = self.get_app_component(request, "task_orchestrator")
+        payload = await orchestrator.trigger_schedule(schedule_id)
+        return self.success_response(payload, "Schedule trigger requested")
+
+    async def _handle_system_schedule_toggle(self, request: web.Request, schedule_id: str) -> web.Response:
+        body = {}
+        if request.can_read_body:
+            maybe = await self.get_request_json(request)
+            if isinstance(maybe, dict):
+                body = maybe
+        orchestrator = self.get_app_component(request, "task_orchestrator")
+        current = await orchestrator.get_schedule_detail(schedule_id)
+        current_schedule = current.get("schedule") if isinstance(current.get("schedule"), dict) else {}
+        enabled = body.get("enabled")
+        next_enabled = bool(enabled) if isinstance(enabled, bool) else not self._coerce_bool(current_schedule.get("enabled"))
+        updated = await orchestrator.patch_schedule(schedule_id, {"enabled": next_enabled})
+        detail = await orchestrator.get_schedule_detail(str(updated.get("id") or schedule_id))
+        return self.success_response(self._normalize_system_schedule_detail_payload(detail), "Schedule updated")
+
+    async def _handle_system_job_lineage(self, request: web.Request, task_job_id: Optional[str] = None) -> web.Response:
+        task_job_id = task_job_id or request.match_info.get("task_job_id")
+        if not task_job_id:
+            return self.error_response("Missing task_job_id", 400)
+        orchestrator = self.get_app_component(request, "task_orchestrator")
+        payload = await orchestrator.get_task_job_lineage(task_job_id)
+        return self.success_response(payload)
+
     async def _handle_system_jobs_overview(self, request: web.Request) -> web.Response:
         orchestrator = self.get_app_component(request, "task_orchestrator")
         service = request.query.get("service")
@@ -2065,10 +2254,14 @@ class UIBffHandler(BaseHandler):
             alert_ids = [str(body.get("alert_id"))]
 
         system_monitor = self.get_app_component(request, "system_monitor")
-        acknowledged = []
         if not alert_ids:
-            return self.success_response({"acknowledged": "all", "items": []}, "Alerts acknowledged")
+            alert_ids = [
+                str(item.get("alert_id"))
+                for item in system_monitor.get_active_alerts()
+                if isinstance(item, dict) and str(item.get("alert_id") or "").strip()
+            ]
 
+        acknowledged = []
         for alert_id in alert_ids:
             result = system_monitor.acknowledge_alert(alert_id, str(body.get("notes", "")))
             acknowledged.append(result)
@@ -3589,17 +3782,27 @@ class UIBffHandler(BaseHandler):
 
         if method == "GET" and path == "/api/v1/ui/system/jobs/overview":
             return await self._handle_system_jobs_overview(request)
+        if method == "GET" and path == "/api/v1/ui/system/schedules":
+            return await self._handle_system_schedules_list(request)
         if method == "GET" and path == "/api/v1/ui/system/alerts":
             return await self._handle_system_alerts_list(request)
         if method == "POST" and path == "/api/v1/ui/system/alerts/ack":
             return await self._handle_system_alert_ack_all(request)
         if method == "POST":
+            if path == "/api/v1/ui/system/schedules":
+                return await self._handle_system_schedule_create(request)
             matched = re.match(r"^/api/v1/ui/system/jobs/(?P<task_job_id>[^/]+)/cancel$", path)
             if matched:
                 return await self._handle_system_cancel(request, matched.group("task_job_id"))
             matched = re.match(r"^/api/v1/ui/system/jobs/readiness/items/(?P<item_id>[^/]+)/trigger$", path)
             if matched:
                 return await self._handle_system_readiness_item_trigger(request, unquote(matched.group("item_id")))
+            matched = re.match(r"^/api/v1/ui/system/schedules/(?P<schedule_id>[^/]+)/trigger$", path)
+            if matched:
+                return await self._handle_system_schedule_trigger(request, matched.group("schedule_id"))
+            matched = re.match(r"^/api/v1/ui/system/schedules/(?P<schedule_id>[^/]+)/toggle$", path)
+            if matched:
+                return await self._handle_system_schedule_toggle(request, matched.group("schedule_id"))
             matched = re.match(r"^/api/v1/ui/system/alerts/(?P<alert_id>[^/]+)/ack$", path)
             if matched:
                 return await self._handle_system_alert_ack(request, matched.group("alert_id"))
@@ -3612,10 +3815,24 @@ class UIBffHandler(BaseHandler):
             matched = re.match(r"^/api/v1/ui/system/jobs/(?P<task_job_id>[^/]+)/history$", path)
             if matched:
                 return await self._handle_system_history(request, matched.group("task_job_id"))
+            matched = re.match(r"^/api/v1/ui/system/jobs/(?P<task_job_id>[^/]+)/lineage$", path)
+            if matched:
+                return await self._handle_system_job_lineage(request, matched.group("task_job_id"))
+            matched = re.match(r"^/api/v1/ui/system/schedules/(?P<schedule_id>[^/]+)$", path)
+            if matched:
+                return await self._handle_system_schedule_detail(request, matched.group("schedule_id"))
             if path == "/api/v1/ui/system/rules":
                 return await self._handle_system_rules_list(request)
             if path == "/api/v1/ui/system/health":
                 return await self._handle_system_health(request)
+        if method == "PATCH":
+            matched = re.match(r"^/api/v1/ui/system/schedules/(?P<schedule_id>[^/]+)$", path)
+            if matched:
+                return await self._handle_system_schedule_update(request, matched.group("schedule_id"))
+        if method == "DELETE":
+            matched = re.match(r"^/api/v1/ui/system/schedules/(?P<schedule_id>[^/]+)$", path)
+            if matched:
+                return await self._handle_system_schedule_delete(request, matched.group("schedule_id"))
 
         if method == "GET" and path == "/api/v1/ui/system/data/overview":
             return await self._handle_system_data_overview(request)

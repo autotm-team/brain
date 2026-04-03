@@ -36,6 +36,18 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
+def _cors_allowed_origins() -> list[str]:
+    raw = os.getenv("BRAIN_CORS_ALLOWED_ORIGINS", "").strip()
+    if raw:
+        return [item.strip() for item in raw.split(",") if item.strip()]
+    return [
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+        "http://127.0.0.1:4173",
+        "http://localhost:4173",
+    ]
+
+
 def _flowhub_bootstrap_schedule_specs() -> list[dict]:
     return [
         {
@@ -233,15 +245,17 @@ async def create_app(config: IntegrationConfig) -> web.Application:
 
     # 存储配置
     app['config'] = config
+    app['cors_allowed_origins'] = _cors_allowed_origins()
 
     # 设置CORS
     cors = cors_setup(app, defaults={
-        "*": ResourceOptions(
+        origin: ResourceOptions(
             allow_credentials=True,
             expose_headers="*",
             allow_headers="*",
             allow_methods="*"
         )
+        for origin in app['cors_allowed_origins']
     })
     app['cors_enabled'] = True
 
@@ -278,6 +292,7 @@ async def init_components(app: web.Application, config: IntegrationConfig):
         # 服务注册表
         app['service_registry'] = ServiceRegistry(config)
         app['task_orchestrator'] = TaskOrchestrator(app)
+        app['task_runtime_api'] = app['task_orchestrator']._get_task_api()
 
         # Redis客户端（供调度器/分析触发使用）
         try:
@@ -322,6 +337,10 @@ async def init_components(app: web.Application, config: IntegrationConfig):
                     job_type=str(schedule.get("job_type") or ""),
                     params=dict(schedule.get("params") or {}),
                     metadata=metadata,
+                    lineage_context={
+                        "root_schedule_id": schedule_id,
+                        "trigger_kind": "schedule",
+                    },
                 )
                 task_job_id = created.get("id")
             finally:
@@ -330,8 +349,10 @@ async def init_components(app: web.Application, config: IntegrationConfig):
         app['unified_scheduler'] = UnifiedScheduler(
             redis_client=app.get('redis'),
             namespace='asyncron:v2:brain',
+            storage_api=app.get("task_runtime_api"),
             on_dispatch=_dispatch_schedule,
             poll_interval_seconds=1,
+            timezone_name=config.service.scheduler_timezone,
         )
 
         # 核心组件（通过DI解析）
@@ -438,6 +459,21 @@ async def startup_handler(app: web.Application):
             app["orphan_task_monitor"] = asyncio.create_task(_orphan_task_monitor())
             logger.info("Orphan task monitor started")
 
+            async def _task_retention_monitor() -> None:
+                while True:
+                    try:
+                        deleted = await orchestrator.cleanup_completed_task_jobs(max_age_hours=24 * 30)
+                        if deleted:
+                            logger.info("Brain task retention cleanup removed %s completed task jobs", deleted)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as cleanup_err:
+                        logger.warning(f"Brain task retention cleanup failed: {cleanup_err}")
+                    await asyncio.sleep(3600)
+
+            app["task_retention_monitor"] = asyncio.create_task(_task_retention_monitor())
+            logger.info("Brain task retention monitor started")
+
         # Flowhub 抓取任务由 Brain 统一补齐与触发，Flowhub 本身不再自建调度。
         try:
             await _ensure_flowhub_bootstrap_schedules(app)
@@ -481,6 +517,14 @@ async def cleanup_handler(app: web.Application):
             orphan_task_monitor.cancel()
             try:
                 await orphan_task_monitor
+            except asyncio.CancelledError:
+                pass
+
+        task_retention_monitor = app.get("task_retention_monitor")
+        if task_retention_monitor:
+            task_retention_monitor.cancel()
+            try:
+                await task_retention_monitor
             except asyncio.CancelledError:
                 pass
 

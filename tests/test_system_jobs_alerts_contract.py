@@ -1,0 +1,142 @@
+import asyncio
+import json
+import logging
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+import types
+
+import pytest
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+EXTERNAL_ASYNCRON = PROJECT_ROOT / "external" / "asyncron"
+EXTERNAL_ECONDB = PROJECT_ROOT / "external" / "econdb"
+for path in (EXTERNAL_ASYNCRON, EXTERNAL_ECONDB, PROJECT_ROOT):
+    if str(path) not in sys.path:
+        sys.path.insert(0, str(path))
+
+if "tushare" not in sys.modules:
+    tushare_stub = types.ModuleType("tushare")
+    tushare_stub.pro_api = lambda *args, **kwargs: None
+    sys.modules["tushare"] = tushare_stub
+
+import econdb as _econdb  # type: ignore
+
+if not hasattr(_econdb, "TaskRuntimeDataAPI"):
+    class _TaskRuntimeDataAPI:  # pragma: no cover - import shim
+        pass
+
+    _econdb.TaskRuntimeDataAPI = _TaskRuntimeDataAPI  # type: ignore[attr-defined]
+
+from handlers.ui_bff import UIBffHandler
+from models import AlertInfo
+from monitors.system_monitor import SystemMonitor
+
+
+def _build_monitor() -> SystemMonitor:
+    config = SimpleNamespace(
+        monitoring=SimpleNamespace(
+            performance_threshold={
+                "cpu_usage": 0.8,
+                "memory_usage": 0.8,
+                "response_time": 1000.0,
+                "error_rate": 0.05,
+            },
+            enable_system_monitoring=False,
+            enable_performance_monitoring=False,
+        )
+    )
+    return SystemMonitor(config)
+
+
+class _DummyRequest:
+    can_read_body = True
+
+    def __init__(self):
+        self.app = {}
+
+
+def test_system_alert_ack_all_acknowledges_all_active_alerts():
+    acknowledged: list[str] = []
+
+    class _DummyMonitor:
+        def get_active_alerts(self):
+            return [{"alert_id": "alert-1"}, {"alert_id": "alert-2"}]
+
+        def acknowledge_alert(self, alert_id, notes=""):
+            acknowledged.append(alert_id)
+            return {"alert_id": alert_id, "notes": notes}
+
+    handler = UIBffHandler.__new__(UIBffHandler)
+    handler.logger = logging.getLogger("test-system-alert-ack-all")
+    handler.get_app_component = lambda request, key: _DummyMonitor()
+
+    async def _get_request_json(_request):
+        return {}
+
+    handler.get_request_json = _get_request_json
+
+    response = asyncio.run(handler._handle_system_alert_ack_all(_DummyRequest()))
+    payload = json.loads(response.text)
+
+    assert payload["success"] is True
+    assert payload["data"]["acknowledged"] == 2
+    assert acknowledged == ["alert-1", "alert-2"]
+
+
+def test_acknowledge_alert_marks_alert_as_acked_without_resolving():
+    monitor = _build_monitor()
+    monitor._alert_history.append(
+        AlertInfo(
+            alert_id="alert-1",
+            alert_level="P2",
+            alert_type="performance",
+            component="integration_layer",
+            message="High CPU usage",
+        )
+    )
+
+    payload = monitor.acknowledge_alert("alert-1", "checked")
+
+    assert payload["is_resolved"] is False
+    assert payload["resolution_time"] is None
+    assert payload["resolution_notes"] == "checked"
+    assert payload["metadata"]["acked"] is True
+    assert payload["metadata"]["acknowledged"] is True
+    assert payload["metadata"]["acknowledged_at"]
+
+
+def test_set_alert_rule_updates_existing_rule_and_preserves_contract_fields():
+    monitor = _build_monitor()
+
+    created = monitor.set_alert_rule(
+        {
+            "rule_id": "rule-1",
+            "name": "响应时间过高",
+            "component": "flowhub",
+            "condition": "response_time",
+            "threshold": 1200,
+            "alert_level": "P2",
+            "enabled": True,
+        }
+    )
+    updated = monitor.set_alert_rule(
+        {
+            "rule_id": "rule-1",
+            "name": "响应时间过高",
+            "component": "execution",
+            "condition": "response_time",
+            "threshold": 1800,
+            "alert_level": "P1",
+            "enabled": False,
+        }
+    )
+
+    assert len(monitor.get_alert_rules()) == 1
+    assert updated["rule_id"] == "rule-1"
+    assert updated["component"] == "execution"
+    assert updated["alert_level"] == "P1"
+    assert updated["enabled"] is False
+    assert updated["created_at"] == created["created_at"]
+    assert updated["updated_at"]
+    assert monitor._performance_thresholds["response_time"] == 1800.0

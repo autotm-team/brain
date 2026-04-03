@@ -9,7 +9,7 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from asyncron import request_envelope
@@ -19,7 +19,7 @@ ECONDB_PATH = PROJECT_ROOT / "external" / "econdb"
 if ECONDB_PATH.exists() and str(ECONDB_PATH) not in os.sys.path:
     os.sys.path.insert(0, str(ECONDB_PATH))
 
-from econdb import create_database_manager  # type: ignore
+from econdb import TaskRuntimeDataAPI, create_database_manager  # type: ignore
 
 
 logger = logging.getLogger(__name__)
@@ -134,6 +134,7 @@ class TaskOrchestrator:
         self._history: Dict[str, List[Dict[str, Any]]] = {}
         self._job_types_cache: Dict[str, Dict[str, Any]] = {}
         self._db_manager = None
+        self._task_api = None
         self._local_auto_chain_claims: set[str] = set()
         self._followup_watch_tasks: set[asyncio.Task] = set()
 
@@ -144,6 +145,7 @@ class TaskOrchestrator:
         params: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
         service_payload: Optional[Dict[str, Any]] = None,
+        lineage_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         service = (service or "").lower()
         if service not in self.SERVICES:
@@ -159,19 +161,29 @@ class TaskOrchestrator:
         if not service_job_id:
             raise RuntimeError(f"Unable to extract job_id from {service} response")
 
-        task_job_id = str(uuid.uuid4())
+        existing_task_job_id = await self._find_task_job_id(service, service_job_id)
+        task_job_id = existing_task_job_id or str(uuid.uuid4())
+        existing_record = await self._load_task_record(existing_task_job_id) if existing_task_job_id else None
         record = {
             "task_job_id": task_job_id,
             "service": service,
             "service_job_id": service_job_id,
             "job_type": job_type,
-            "created_at": self._utc_now(),
-            "params": normalized_params,
-            "metadata": normalized_metadata,
+            "created_at": (existing_record or {}).get("created_at") or self._utc_now(),
+            "params": normalized_params or ((existing_record or {}).get("params") if isinstance((existing_record or {}).get("params"), dict) else {}),
+            "metadata": {
+                **(((existing_record or {}).get("metadata")) if isinstance((existing_record or {}).get("metadata"), dict) else {}),
+                **normalized_metadata,
+            },
             "service_payload": dict(service_payload) if isinstance(service_payload, dict) else None,
             "request_payload_hash": request_payload_hash,
         }
         await self._save_task_record(record)
+        await self._save_task_lineage(
+            task_job_id,
+            metadata=record["metadata"],
+            lineage_context=lineage_context,
+        )
 
         job_payload = await self._safe_get_service_job(service, service_job_id)
         normalized = self._normalize_job(service, job_payload or {"job_id": service_job_id}, task_job_id=task_job_id)
@@ -179,7 +191,7 @@ class TaskOrchestrator:
         normalized["metadata"] = {**record["metadata"], **(normalized.get("metadata") or {})}
         await self._append_history(
             task_job_id,
-            "created",
+            "deduplicated_reuse" if existing_task_job_id else "created",
             normalized,
             request_payload_hash=request_payload_hash,
             upstream_status=202,
@@ -188,9 +200,9 @@ class TaskOrchestrator:
         return normalized
 
     def _schedule_followup_monitor(self, task_job_id: str, service: str, job_type: str) -> None:
-        if service not in {"flowhub", "execution"}:
+        if service not in {"flowhub", "execution", "macro"}:
             return
-        if job_type not in {"stock_basic_data", "batch_daily_ohlc", "batch_daily_basic", "batch_analyze", "index_daily_data", "industry_board"}:
+        if job_type not in {"stock_basic_data", "batch_daily_ohlc", "batch_daily_basic", "batch_analyze", "index_daily_data", "industry_board", "ui_snapshot_refresh"}:
             return
 
         async def _watch() -> None:
@@ -413,10 +425,16 @@ class TaskOrchestrator:
             job_type=str(current.get("job_type") or ""),
             params=dict(current.get("params") or {}),
             metadata=metadata,
+            lineage_context={
+                "root_schedule_id": schedule_id,
+                "trigger_kind": "schedule",
+            },
         )
         now = self._utc_now()
         if scheduler is not None:
             current = await scheduler.mark_triggered(schedule_id, created.get("id"))
+            if isinstance(current, dict):
+                self._brain_jobs[f"schedule:{schedule_id}"] = dict(current)
         else:
             current["last_triggered_at"] = now
             current["last_task_job_id"] = created.get("id")
@@ -490,6 +508,13 @@ class TaskOrchestrator:
             "limit": limit,
             "offset": offset,
             "errors": errors,
+        }
+
+    async def get_task_job_analytics(self, service: Optional[str] = None, window_key: Optional[str] = None) -> Dict[str, Any]:
+        task_api = self._get_task_api()
+        return {
+            "brain": task_api.brain_task_analytics(service=service, window_key=window_key),
+            "runtime": task_api.runtime_job_analytics(service_name=service, window_key=window_key),
         }
 
     async def _list_service_jobs(self, service: str, status: Optional[str], max_items: int) -> List[Dict[str, Any]]:
@@ -852,15 +877,16 @@ class TaskOrchestrator:
             if record.get("service") == service and record.get("service_job_id") == service_job_id:
                 return task_job_id
 
-        redis = self._redis()
-        if not redis:
-            return None
-        key = self._index_key(service, service_job_id)
         try:
-            mapped = await redis.get(key)
-            return mapped or None
+            row = self._get_task_api().get_brain_task_job_by_service_job(service, service_job_id)
+            if isinstance(row, dict):
+                task_job_id = str(row.get("task_job_id") or "")
+                if task_job_id:
+                    self._brain_jobs[task_job_id] = dict(row)
+                    return task_job_id
         except Exception:
-            return None
+            pass
+        return None
 
     def _normalize_job(self, service: str, job: Dict[str, Any], task_job_id: str) -> Dict[str, Any]:
         job = job if isinstance(job, dict) else {}
@@ -1048,14 +1074,17 @@ class TaskOrchestrator:
         if upstream_status is not None:
             entry["upstream_status"] = upstream_status
         self._history.setdefault(task_job_id, []).append(entry)
-
-        redis = self._redis()
-        if not redis:
-            return
         try:
-            key = self._history_key(task_job_id)
-            await redis.rpush(key, json.dumps(entry, ensure_ascii=False))
-            await redis.ltrim(key, -self.HISTORY_MAX, -1)
+            self._get_task_api().append_brain_task_job_history(
+                {
+                    "task_job_id": task_job_id,
+                    "event_type": event,
+                    "job_snapshot": dict(normalized_job),
+                    "request_payload_hash": request_payload_hash,
+                    "upstream_status": upstream_status,
+                    "created_at": datetime.now(timezone.utc),
+                }
+            )
         except Exception:
             return
 
@@ -1075,15 +1104,10 @@ class TaskOrchestrator:
     async def _save_task_record(self, record: Dict[str, Any]) -> None:
         task_job_id = record["task_job_id"]
         self._brain_jobs[task_job_id] = dict(record)
-
-        redis = self._redis()
-        if not redis:
-            return
         try:
-            await redis.set(self._record_key(task_job_id), json.dumps(record, ensure_ascii=False))
-            await redis.set(self._index_key(record["service"], record["service_job_id"]), task_job_id)
-            await redis.sadd(self._task_job_set_key(), task_job_id)
-        except Exception:
+            self._get_task_api().upsert_brain_task_job(record)
+        except Exception as exc:
+            logger.warning("Persist brain task record failed for %s: %s", task_job_id, exc)
             return
 
     async def _update_task_record_metadata(self, task_job_id: str, updates: Dict[str, Any]) -> None:
@@ -1095,10 +1119,332 @@ class TaskOrchestrator:
         record["metadata"] = metadata
         await self._save_task_record(record)
 
+    async def _load_task_link(self, task_job_id: str) -> Optional[Dict[str, Any]]:
+        cache_key = f"lineage:{task_job_id}"
+        local = self._brain_jobs.get(cache_key)
+        if isinstance(local, dict):
+            return dict(local)
+        try:
+            link = self._get_task_api().get_brain_task_job_link(task_job_id)
+        except Exception:
+            return None
+        if not isinstance(link, dict):
+            return None
+        self._brain_jobs[cache_key] = dict(link)
+        return dict(link)
+
+    async def _save_task_lineage(
+        self,
+        task_job_id: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+        lineage_context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        existing = await self._load_task_link(task_job_id)
+        if isinstance(existing, dict):
+            return existing
+        resolved = await self._resolve_lineage_context(
+            task_job_id,
+            metadata=metadata,
+            lineage_context=lineage_context,
+        )
+        try:
+            saved = self._get_task_api().upsert_brain_task_job_link(resolved)
+        except Exception as exc:
+            logger.warning("Persist task lineage failed for %s: %s", task_job_id, exc)
+            return None
+        if isinstance(saved, dict):
+            self._brain_jobs[f"lineage:{task_job_id}"] = dict(saved)
+            return dict(saved)
+        return None
+
+    async def _resolve_lineage_context(
+        self,
+        task_job_id: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+        lineage_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        raw_metadata = metadata if isinstance(metadata, dict) else {}
+        raw_context = lineage_context if isinstance(lineage_context, dict) else {}
+        parent_task_job_id = str(raw_context.get("parent_task_job_id") or "").strip() or None
+        parent_link = await self._load_task_link(parent_task_job_id) if parent_task_job_id else None
+        fallback_schedule_id = str(raw_metadata.get("schedule_id") or "").strip() or None
+        root_task_job_id = (
+            str(raw_context.get("root_task_job_id") or "").strip()
+            or (str(parent_link.get("root_task_job_id") or "").strip() if isinstance(parent_link, dict) else "")
+            or parent_task_job_id
+            or task_job_id
+        )
+        root_schedule_id = (
+            str(raw_context.get("root_schedule_id") or "").strip()
+            or (str(parent_link.get("root_schedule_id") or "").strip() if isinstance(parent_link, dict) else "")
+            or fallback_schedule_id
+            or None
+        )
+        trigger_kind = str(raw_context.get("trigger_kind") or "").strip().lower()
+        if trigger_kind not in {"manual", "schedule", "auto_chain"}:
+            if parent_task_job_id:
+                trigger_kind = "auto_chain"
+            elif root_schedule_id:
+                trigger_kind = "schedule"
+            else:
+                trigger_kind = "manual"
+        try:
+            depth = int(raw_context.get("depth")) if raw_context.get("depth") is not None else None
+        except Exception:
+            depth = None
+        if depth is None:
+            if isinstance(parent_link, dict):
+                depth = int(parent_link.get("depth") or 0) + 1
+            else:
+                depth = 1 if parent_task_job_id else 0
+        depth = max(0, depth)
+        return {
+            "child_task_job_id": task_job_id,
+            "parent_task_job_id": parent_task_job_id,
+            "root_task_job_id": root_task_job_id,
+            "root_schedule_id": root_schedule_id,
+            "trigger_kind": trigger_kind,
+            "depth": depth,
+            "created_at": datetime.utcnow(),
+        }
+
+    async def _build_child_lineage_context(self, parent_task_job_id: str) -> Dict[str, Any]:
+        parent_id = str(parent_task_job_id or "").strip()
+        if not parent_id:
+            return {"trigger_kind": "manual"}
+        parent_link = await self._load_task_link(parent_id)
+        return {
+            "parent_task_job_id": parent_id,
+            "root_task_job_id": str((parent_link or {}).get("root_task_job_id") or parent_id),
+            "root_schedule_id": (parent_link or {}).get("root_schedule_id"),
+            "trigger_kind": "auto_chain",
+            "depth": int((parent_link or {}).get("depth") or 0) + 1,
+        }
+
+    async def _clone_lineage_context(self, task_job_id: str) -> Optional[Dict[str, Any]]:
+        link = await self._load_task_link(task_job_id)
+        if not isinstance(link, dict):
+            return None
+        return {
+            "parent_task_job_id": link.get("parent_task_job_id"),
+            "root_task_job_id": link.get("root_task_job_id"),
+            "root_schedule_id": link.get("root_schedule_id"),
+            "trigger_kind": link.get("trigger_kind"),
+            "depth": int(link.get("depth") or 0),
+        }
+
+    async def get_task_job_lineage(self, task_job_id: str) -> Dict[str, Any]:
+        try:
+            _, _, mapped_task_job_id = await self._resolve_task_job_id(task_job_id)
+            resolved_id = mapped_task_job_id or task_job_id
+        except Exception:
+            resolved_id = task_job_id
+
+        link = await self._load_task_link(resolved_id)
+        if not isinstance(link, dict):
+            return await self._build_single_node_lineage(resolved_id)
+
+        root_task_job_id = str(link.get("root_task_job_id") or resolved_id).strip() or resolved_id
+        try:
+            link_rows = self._get_task_api().list_brain_task_job_links_by_root(root_task_job_id)
+        except Exception:
+            link_rows = []
+        if not link_rows:
+            return await self._build_single_node_lineage(resolved_id)
+
+        jobs_by_id: Dict[str, Dict[str, Any]] = {}
+        for row in link_rows:
+            child_id = str(row.get("child_task_job_id") or "").strip()
+            if not child_id:
+                continue
+            job_view = await self._build_local_task_view(child_id)
+            jobs_by_id[child_id] = dict(job_view) if isinstance(job_view, dict) else {"id": child_id}
+
+        node_map: Dict[str, Dict[str, Any]] = {}
+        for row in link_rows:
+            child_id = str(row.get("child_task_job_id") or "").strip()
+            if not child_id:
+                continue
+            job = jobs_by_id.get(child_id) or {"id": child_id}
+            node_map[child_id] = {
+                "task_job_id": child_id,
+                "parent_task_job_id": row.get("parent_task_job_id"),
+                "root_task_job_id": row.get("root_task_job_id"),
+                "root_schedule_id": row.get("root_schedule_id"),
+                "trigger_kind": row.get("trigger_kind"),
+                "depth": int(row.get("depth") or 0),
+                "created_at": row.get("created_at"),
+                "service": job.get("service"),
+                "job_type": job.get("job_type"),
+                "task_name": job.get("task_name"),
+                "status": job.get("status"),
+                "started_at": job.get("started_at"),
+                "completed_at": job.get("completed_at"),
+                "updated_at": job.get("updated_at"),
+                "job": job,
+                "children": [],
+            }
+
+        edges: List[Dict[str, Any]] = []
+        child_ids_by_parent: Dict[str, List[str]] = {}
+        for row in link_rows:
+            parent_id = str(row.get("parent_task_job_id") or "").strip()
+            child_id = str(row.get("child_task_job_id") or "").strip()
+            if not child_id:
+                continue
+            if parent_id:
+                child_ids_by_parent.setdefault(parent_id, []).append(child_id)
+                edges.append({"from_task_job_id": parent_id, "to_task_job_id": child_id})
+
+        def _build_tree(node_id: str) -> Dict[str, Any]:
+            node = dict(node_map.get(node_id) or {"task_job_id": node_id, "children": []})
+            node["children"] = [_build_tree(child_id) for child_id in child_ids_by_parent.get(node_id, [])]
+            return node
+
+        tree = [_build_tree(root_task_job_id)] if root_task_job_id in node_map else []
+        leaf_count = sum(1 for node in node_map.values() if not child_ids_by_parent.get(node["task_job_id"]))
+        max_depth = max((int(node.get("depth") or 0) for node in node_map.values()), default=0)
+        return {
+            "task_job_id": resolved_id,
+            "root_task_job_id": root_task_job_id,
+            "root_schedule_id": link.get("root_schedule_id"),
+            "nodes": list(node_map.values()),
+            "edges": edges,
+            "lineage_tree": tree,
+            "summary": {
+                "node_count": len(node_map),
+                "leaf_count": leaf_count,
+                "max_depth": max_depth,
+            },
+        }
+
+    async def _build_single_node_lineage(self, task_job_id: str) -> Dict[str, Any]:
+        job = await self._build_local_task_view(task_job_id)
+        job = dict(job) if isinstance(job, dict) else {"id": task_job_id}
+        metadata = job.get("metadata") if isinstance(job.get("metadata"), dict) else {}
+        root_schedule_id = str(metadata.get("schedule_id") or "").strip() or None
+        trigger_kind = "schedule" if root_schedule_id else "manual"
+        node = {
+            "task_job_id": task_job_id,
+            "parent_task_job_id": None,
+            "root_task_job_id": task_job_id,
+            "root_schedule_id": root_schedule_id,
+            "trigger_kind": trigger_kind,
+            "depth": 0,
+            "created_at": job.get("created_at"),
+            "service": job.get("service"),
+            "job_type": job.get("job_type"),
+            "task_name": job.get("task_name"),
+            "status": job.get("status"),
+            "started_at": job.get("started_at"),
+            "completed_at": job.get("completed_at"),
+            "updated_at": job.get("updated_at"),
+            "job": job,
+            "children": [],
+        }
+        return {
+            "task_job_id": task_job_id,
+            "root_task_job_id": task_job_id,
+            "root_schedule_id": root_schedule_id,
+            "nodes": [node],
+            "edges": [],
+            "lineage_tree": [node],
+            "summary": {
+                "node_count": 1,
+                "leaf_count": 1,
+                "max_depth": 0,
+            },
+        }
+
+    async def get_schedule_detail(self, schedule_id: str, recent_limit: int = 20) -> Dict[str, Any]:
+        scheduler = self._app.get("unified_scheduler")
+        if scheduler is not None:
+            schedule = await scheduler.get_schedule(schedule_id)
+            if isinstance(schedule, dict):
+                self._brain_jobs[f"schedule:{schedule_id}"] = dict(schedule)
+        else:
+            schedule = None
+        if not isinstance(schedule, dict):
+            schedule = await self._load_schedule(schedule_id)
+        if not isinstance(schedule, dict):
+            raise ValueError("Schedule not found")
+
+        last_task_job_id = str(schedule.get("last_task_job_id") or "").strip()
+        latest_root_task = None
+        lineage_payload = {
+            "task_job_id": None,
+            "root_task_job_id": None,
+            "root_schedule_id": schedule_id,
+            "nodes": [],
+            "edges": [],
+            "lineage_tree": [],
+            "summary": {
+                "node_count": 0,
+                "leaf_count": 0,
+                "max_depth": 0,
+            },
+        }
+        if last_task_job_id:
+            latest_root_task = await self._build_local_task_view(last_task_job_id)
+            lineage_payload = await self.get_task_job_lineage(last_task_job_id)
+
+        try:
+            root_links, total = self._get_task_api().list_brain_task_job_root_links_by_schedule(
+                schedule_id,
+                limit=recent_limit,
+                offset=0,
+            )
+        except Exception:
+            root_links, total = [], 0
+
+        recent_task_jobs: List[Dict[str, Any]] = []
+        for row in root_links:
+            root_id = str(row.get("child_task_job_id") or row.get("root_task_job_id") or "").strip()
+            if not root_id:
+                continue
+            job = await self._build_local_task_view(root_id)
+            if isinstance(job, dict):
+                recent_task_jobs.append(job)
+
+        return {
+            "schedule": schedule,
+            "latest_root_task": latest_root_task,
+            "recent_task_jobs": recent_task_jobs,
+            "lineage_tree": lineage_payload.get("lineage_tree") or [],
+            "lineage_nodes": lineage_payload.get("nodes") or [],
+            "lineage_edges": lineage_payload.get("edges") or [],
+            "lineage_summary": lineage_payload.get("summary") or {},
+            "recent_total": total,
+        }
+
     def _get_db_manager(self):
         if self._db_manager is None:
             self._db_manager = create_database_manager()
         return self._db_manager
+
+    def _get_task_api(self):
+        if self._task_api is None:
+            self._task_api = TaskRuntimeDataAPI(self._get_db_manager())
+        return self._task_api
+
+    async def cleanup_completed_task_jobs(self, max_age_hours: int = 24 * 30) -> int:
+        cutoff = datetime.utcnow() - timedelta(hours=max(1, int(max_age_hours)))
+        rows = self._get_task_api().list_brain_task_jobs_for_cleanup(
+            statuses=["succeeded", "failed", "cancelled"],
+            updated_before=cutoff,
+            limit=1000,
+        )
+        task_job_ids = [str(row.get("task_job_id") or "") for row in rows if row.get("task_job_id")]
+        if not task_job_ids:
+            return 0
+        deleted = self._get_task_api().delete_brain_task_jobs(task_job_ids)
+        for task_job_id in task_job_ids:
+            self._brain_jobs.pop(task_job_id, None)
+            self._brain_jobs.pop(f"lineage:{task_job_id}", None)
+            self._history.pop(task_job_id, None)
+        return int(deleted or 0)
 
     def _get_table_latest_date(self, table_name: str, column: str = "trade_date") -> Optional[str]:
         try:
@@ -1185,6 +1531,32 @@ class TaskOrchestrator:
         metadata = normalized.get("metadata") if isinstance(normalized.get("metadata"), dict) else {}
         trade_date = str(metadata.get("auto_chain_trade_date") or "").strip()
 
+        if service == "flowhub" and job_type in {"batch_daily_ohlc", "batch_daily_basic"}:
+            parent_task_job_id = str(metadata.get("auto_chain_parent_task_job_id") or "").strip()
+            if parent_task_job_id:
+                claim_key = self._auto_chain_claim_key("stock_daily_fetch", parent_task_job_id)
+                released = await self._release_auto_chain(claim_key)
+                if released:
+                    await self._append_history(task_job_id, "auto_chain_lock_released", normalized)
+                    logger.info(
+                        "Released stock_daily_fetch chain lock for parent task %s after %s failure (task_job_id=%s)",
+                        parent_task_job_id, job_type, task_job_id,
+                    )
+                    parent_view = await self._build_local_task_view(parent_task_job_id)
+                    if isinstance(parent_view, dict):
+                        await self._maybe_trigger_stock_daily_fetches(parent_task_job_id, parent_view)
+            return
+
+        if service == "macro" and job_type == "ui_snapshot_refresh" and trade_date:
+            released = await self._release_auto_chain(f"snapshot_refresh:{trade_date}")
+            if released:
+                await self._append_history(task_job_id, "auto_chain_lock_released", normalized)
+                logger.info(
+                    "Released snapshot_refresh chain lock for trade_date=%s after failure (task_job_id=%s)",
+                    trade_date, task_job_id,
+                )
+            return
+
         if service == "execution" and job_type == "batch_analyze" and trade_date:
             # 释放 daily_analysis 锁（与 _maybe_trigger_daily_analysis 中创建锁的逻辑对称）
             record = await self._load_task_record(task_job_id)
@@ -1270,6 +1642,17 @@ class TaskOrchestrator:
                 failed_task_job_id, exc,
             )
 
+    @staticmethod
+    def _extract_daily_fetch_trade_date(normalized: Dict[str, Any]) -> Optional[str]:
+        result = normalized.get("result") if isinstance(normalized.get("result"), dict) else {}
+        for key in ("latest_trade_date", "trade_date", "target_trade_date", "end_date"):
+            value = str(result.get(key) or "").strip()
+            if value:
+                return value
+        data_summary = result.get("data_summary") if isinstance(result.get("data_summary"), dict) else {}
+        value = str(data_summary.get("trade_date") or "").strip()
+        return value or None
+
     async def _maybe_trigger_stock_daily_fetches(self, task_job_id: str, normalized: Dict[str, Any]) -> None:
         metadata = normalized.get("metadata") if isinstance(normalized.get("metadata"), dict) else {}
         if str(metadata.get("bootstrap_source") or "").strip().lower() == "brain_initializer":
@@ -1291,6 +1674,7 @@ class TaskOrchestrator:
                 "auto_chain_source": "stock_basic_data",
                 "auto_chain_parent_task_job_id": task_job_id,
             },
+            lineage_context=await self._build_child_lineage_context(task_job_id),
         )
         basic_created = await self.create_task_job(
             service="flowhub",
@@ -1300,6 +1684,7 @@ class TaskOrchestrator:
                 "auto_chain_source": "stock_basic_data",
                 "auto_chain_parent_task_job_id": task_job_id,
             },
+            lineage_context=await self._build_child_lineage_context(task_job_id),
         )
         await self._update_task_record_metadata(
             task_job_id,
@@ -1374,6 +1759,7 @@ class TaskOrchestrator:
                 "auto_chain_trade_date": latest_ohlc,
                 **({"auto_chain_symbol_scope": list(source_symbols)} if source_symbols else {}),
             },
+            lineage_context=await self._build_child_lineage_context(task_job_id),
         )
         await self._update_task_record_metadata(
             task_job_id,
@@ -1430,12 +1816,6 @@ class TaskOrchestrator:
         self,
         source_task_job_id: Optional[str] = None,
     ) -> tuple[bool, str, Optional[str], Optional[str]]:
-        latest_ohlc = self._get_table_latest_date("stock_daily_data")
-        latest_basic = self._get_table_latest_date("stock_daily_basic")
-        if not latest_ohlc or not latest_basic:
-            return False, "missing_latest_trade_date", latest_ohlc, latest_basic
-        if latest_ohlc != latest_basic:
-            return False, "trade_date_not_aligned", latest_ohlc, latest_basic
         source_record = await self._load_task_record(source_task_job_id) if source_task_job_id else None
         source_params = source_record.get("params") if isinstance(source_record, dict) and isinstance(source_record.get("params"), dict) else {}
         scope_signature = self._scope_signature(source_params)
@@ -1455,24 +1835,32 @@ class TaskOrchestrator:
                 existing = scoped_jobs.get(job_type)
                 if existing is None or self._as_timestamp(record.get("created_at")) >= self._as_timestamp(existing.get("created_at")):
                     scoped_jobs[job_type] = record
+            trade_dates: Dict[str, Optional[str]] = {}
             for job_type in ("batch_daily_ohlc", "batch_daily_basic"):
                 record = scoped_jobs.get(job_type)
                 if not record:
-                    return False, f"paired_scope_missing:{job_type}", latest_ohlc, latest_basic
+                    return False, f"paired_scope_missing:{job_type}", trade_dates.get("batch_daily_ohlc"), trade_dates.get("batch_daily_basic")
                 payload = await self._safe_get_service_job("flowhub", str(record.get("service_job_id") or ""))
                 normalized = self._normalize_job(
                     "flowhub",
                     payload or {"job_id": record.get("service_job_id"), "status": "queued"},
                     task_job_id=str(record.get("task_job_id") or f"flowhub:{record.get('service_job_id')}"),
                 )
+                trade_dates[job_type] = self._extract_daily_fetch_trade_date(normalized)
                 if not self._job_result_ready_for_auto_chain(normalized):
-                    return False, f"paired_scope_not_ready:{job_type}:{normalized.get('status')}", latest_ohlc, latest_basic
+                    return False, f"paired_scope_not_ready:{job_type}:{normalized.get('status')}", trade_dates.get("batch_daily_ohlc"), trade_dates.get("batch_daily_basic")
+                if not trade_dates[job_type]:
+                    return False, f"missing_trade_date:{job_type}", trade_dates.get("batch_daily_ohlc"), trade_dates.get("batch_daily_basic")
+            latest_ohlc = trade_dates.get("batch_daily_ohlc")
+            latest_basic = trade_dates.get("batch_daily_basic")
+            if latest_ohlc != latest_basic:
+                return False, "trade_date_not_aligned", latest_ohlc, latest_basic
             return True, "", latest_ohlc, latest_basic
         try:
             recent_jobs = await self._list_service_jobs("flowhub", status=None, max_items=100)
         except Exception:
-            return False, "flowhub_jobs_unavailable", latest_ohlc, latest_basic
-        latest_status: Dict[str, tuple[float, str]] = {}
+            return False, "flowhub_jobs_unavailable", None, None
+        latest_jobs: Dict[str, Dict[str, Any]] = {}
         for raw_job in recent_jobs:
             job_type = str(raw_job.get("job_type") or "").strip()
             if job_type not in {"batch_daily_ohlc", "batch_daily_basic"}:
@@ -1487,28 +1875,26 @@ class TaskOrchestrator:
                 or normalized.get("completed_at")
                 or normalized.get("created_at")
             )
-            current = latest_status.get(job_type)
-            if current is None or ts >= current[0]:
-                latest_status[job_type] = (ts, str(normalized.get("status") or ""))
-        readiness: Dict[str, bool] = {}
-        for raw_job in recent_jobs:
-            job_type = str(raw_job.get("job_type") or "").strip()
-            if job_type not in {"batch_daily_ohlc", "batch_daily_basic"}:
-                continue
-            normalized = self._normalize_job(
-                "flowhub",
-                raw_job,
-                task_job_id=f"flowhub:{self._get_service_job_id(raw_job) or job_type}",
-            )
-            current = latest_status.get(job_type)
-            if current and str(normalized.get("status") or "") == current[1]:
-                readiness[job_type] = self._job_result_ready_for_auto_chain(normalized)
-        ohlc_status = latest_status.get("batch_daily_ohlc", (0.0, ""))[1]
-        basic_status = latest_status.get("batch_daily_basic", (0.0, ""))[1]
+            current = latest_jobs.get(job_type)
+            current_ts = self._as_timestamp(
+                current.get("updated_at") or current.get("completed_at") or current.get("created_at")
+            ) if isinstance(current, dict) else 0.0
+            if current is None or ts >= current_ts:
+                latest_jobs[job_type] = normalized
+        ohlc_job = latest_jobs.get("batch_daily_ohlc")
+        basic_job = latest_jobs.get("batch_daily_basic")
+        latest_ohlc = self._extract_daily_fetch_trade_date(ohlc_job or {})
+        latest_basic = self._extract_daily_fetch_trade_date(basic_job or {})
+        ohlc_status = str((ohlc_job or {}).get("status") or "")
+        basic_status = str((basic_job or {}).get("status") or "")
         if ohlc_status != "succeeded" or basic_status != "succeeded":
             return False, f"upstream_status_not_ready:ohlc={ohlc_status or 'missing'},basic={basic_status or 'missing'}", latest_ohlc, latest_basic
-        if not readiness.get("batch_daily_ohlc", False) or not readiness.get("batch_daily_basic", False):
+        if not self._job_result_ready_for_auto_chain(ohlc_job or {}) or not self._job_result_ready_for_auto_chain(basic_job or {}):
             return False, "upstream_result_not_ready", latest_ohlc, latest_basic
+        if not latest_ohlc or not latest_basic:
+            return False, "missing_trade_date", latest_ohlc, latest_basic
+        if latest_ohlc != latest_basic:
+            return False, "trade_date_not_aligned", latest_ohlc, latest_basic
         return True, "", latest_ohlc, latest_basic
 
     async def _maybe_trigger_candidate_sync(self, task_job_id: str, normalized: Dict[str, Any]) -> None:
@@ -1530,6 +1916,7 @@ class TaskOrchestrator:
                 "auto_chain_source": "batch_analyze",
                 "auto_chain_trade_date": trade_date,
             },
+            lineage_context=await self._build_child_lineage_context(task_job_id),
         )
         await self._update_task_record_metadata(
             task_job_id,
@@ -1553,20 +1940,17 @@ class TaskOrchestrator:
 
     def _resolve_snapshot_trade_date(self, normalized: Dict[str, Any]) -> Optional[str]:
         """Extract the trade_date from a completed job result."""
+        service = str(normalized.get("service") or "").strip().lower()
+        job_type = str(normalized.get("job_type") or "").strip()
         result = normalized.get("result") if isinstance(normalized.get("result"), dict) else {}
-        # batch_analyze stores it in last_trade_date
-        td = str(result.get("last_trade_date") or "").strip()
-        if td:
-            return td
-        # flowhub data jobs may store it in trade_date or latest_trade_date
-        td = str(result.get("trade_date") or result.get("latest_trade_date") or "").strip()
-        if td:
-            return td
-        # fallback: check DB tables
-        for table in ("analysis_results", "index_daily_data", "stock_daily_data"):
-            td = self._get_table_latest_date(table)
-            if td:
-                return td
+        if service == "execution" and job_type == "batch_analyze":
+            td = str(result.get("last_trade_date") or "").strip()
+            return td or None
+        if service == "flowhub" and job_type in {"index_daily_data", "industry_board"}:
+            for key in ("latest_trade_date", "trade_date"):
+                td = str(result.get(key) or "").strip()
+                if td:
+                    return td
         return None
 
     async def _try_converge_snapshot_prereq(
@@ -1652,6 +2036,7 @@ class TaskOrchestrator:
                     "auto_chain_trade_date": trade_date,
                     "auto_chain_prereqs": sorted(self.SNAPSHOT_PREREQ_FIELDS),
                 },
+                lineage_context=await self._build_child_lineage_context(task_job_id),
             )
             await self._update_task_record_metadata(
                 task_job_id,
@@ -1681,23 +2066,14 @@ class TaskOrchestrator:
         if isinstance(local, dict):
             return dict(local)
 
-        redis = self._redis()
-        if not redis:
-            return None
         try:
-            raw = await redis.get(self._record_key(task_job_id))
+            record = self._get_task_api().get_brain_task_job(task_job_id)
         except Exception:
             return None
-        if not raw:
+        if not isinstance(record, dict):
             return None
-        try:
-            record = json.loads(raw)
-        except Exception:
-            return None
-        if isinstance(record, dict):
-            self._brain_jobs[task_job_id] = dict(record)
-            return dict(record)
-        return None
+        self._brain_jobs[task_job_id] = dict(record)
+        return dict(record)
 
     async def _list_task_job_ids(self) -> List[str]:
         ids = {
@@ -1706,23 +2082,10 @@ class TaskOrchestrator:
             if isinstance(key, str) and not key.startswith("schedule:")
         }
 
-        redis = self._redis()
-        if redis:
-            try:
-                values = await redis.smembers(self._task_job_set_key())
-                ids.update(str(v) for v in values if isinstance(v, str) and v)
-            except Exception:
-                pass
-            if not ids:
-                try:
-                    async for key in redis.scan_iter(match="brain:task_job:*"):
-                        if not isinstance(key, str):
-                            continue
-                        suffix = key.removeprefix("brain:task_job:")
-                        if suffix and ":" not in suffix:
-                            ids.add(suffix)
-                except Exception:
-                    pass
+        try:
+            ids.update(self._get_task_api().list_brain_task_job_ids())
+        except Exception:
+            pass
         return sorted(ids)
 
     async def _get_history(self, task_job_id: str) -> List[Dict[str, Any]]:
@@ -1730,21 +2093,23 @@ class TaskOrchestrator:
         if local:
             return [dict(item) for item in local]
 
-        redis = self._redis()
-        if not redis:
-            return []
         try:
-            rows = await redis.lrange(self._history_key(task_job_id), 0, -1)
+            rows, _ = self._get_task_api().list_brain_task_job_history(task_job_id, limit=self.HISTORY_MAX, offset=0)
         except Exception:
             return []
         history: List[Dict[str, Any]] = []
         for row in rows:
-            try:
-                parsed = json.loads(row)
-            except Exception:
+            if not isinstance(row, dict):
                 continue
-            if isinstance(parsed, dict):
-                history.append(parsed)
+            history.append(
+                {
+                    "event": row.get("event_type"),
+                    "timestamp": row.get("created_at"),
+                    "job": row.get("job_snapshot") if isinstance(row.get("job_snapshot"), dict) else {},
+                    "request_payload_hash": row.get("request_payload_hash"),
+                    "upstream_status": row.get("upstream_status"),
+                }
+            )
         if history:
             self._history[task_job_id] = list(history)
         return history
@@ -1874,6 +2239,7 @@ class TaskOrchestrator:
             "params": record.get("params") if isinstance(record.get("params"), dict) else {},
             "metadata": recreate_metadata,
             "service_payload": record.get("service_payload") if isinstance(record.get("service_payload"), dict) else None,
+            "lineage_context": await self._clone_lineage_context(task_job_id),
         }
         try:
             created = await self.create_task_job(**create_kwargs)
@@ -1947,37 +2313,63 @@ class TaskOrchestrator:
         schedule_id = str(schedule.get("id") or "")
         if not schedule_id:
             return
-        redis = self._redis()
-        if not redis:
-            self._brain_jobs[f"schedule:{schedule_id}"] = dict(schedule)
-            return
-        await redis.set(self._schedule_key(schedule_id), json.dumps(schedule, ensure_ascii=False))
-        await redis.sadd(self._schedule_set_key(), schedule_id)
+        self._brain_jobs[f"schedule:{schedule_id}"] = dict(schedule)
+        self._get_task_api().upsert_brain_schedule(
+            {
+                "schedule_id": schedule_id,
+                "service": str(schedule.get("service") or ""),
+                "job_type": str(schedule.get("job_type") or ""),
+                "trigger": str(schedule.get("trigger") or ""),
+                "cron_expr": schedule.get("cron"),
+                "interval_seconds": schedule.get("interval_seconds"),
+                "enabled": bool(schedule.get("enabled", True)),
+                "params": dict(schedule.get("params") or {}),
+                "metadata": dict(schedule.get("metadata") or {}),
+                "next_run_at": self._datetime_or_none(schedule.get("next_run_at")),
+                "last_triggered_at": self._datetime_or_none(schedule.get("last_triggered_at")),
+                "last_task_job_id": schedule.get("last_task_job_id"),
+                "created_at": self._datetime_or_none(schedule.get("created_at")) or datetime.utcnow(),
+                "updated_at": self._datetime_or_none(schedule.get("updated_at")) or datetime.utcnow(),
+            }
+        )
 
     async def _load_schedule(self, schedule_id: str) -> Optional[Dict[str, Any]]:
-        redis = self._redis()
-        if not redis:
-            local = self._brain_jobs.get(f"schedule:{schedule_id}")
-            return dict(local) if isinstance(local, dict) else None
-        raw = await redis.get(self._schedule_key(schedule_id))
-        if not raw:
+        local = self._brain_jobs.get(f"schedule:{schedule_id}")
+        if isinstance(local, dict):
+            return dict(local)
+        row = self._get_task_api().get_brain_schedule(schedule_id)
+        if not isinstance(row, dict):
             return None
-        try:
-            parsed = json.loads(raw)
-        except Exception:
-            return None
-        return parsed if isinstance(parsed, dict) else None
+        schedule = {
+            "id": row.get("schedule_id"),
+            "service": row.get("service"),
+            "job_type": row.get("job_type"),
+            "trigger": row.get("trigger"),
+            "cron": row.get("cron_expr"),
+            "interval_seconds": row.get("interval_seconds"),
+            "enabled": bool(row.get("enabled", True)),
+            "params": dict(row.get("params") or {}),
+            "metadata": dict(row.get("metadata") or {}),
+            "next_run_at": self._as_timestamp(row.get("next_run_at")) if row.get("next_run_at") else None,
+            "last_triggered_at": self._as_timestamp(row.get("last_triggered_at")) if row.get("last_triggered_at") else None,
+            "last_task_job_id": row.get("last_task_job_id"),
+            "created_at": row.get("created_at"),
+            "updated_at": row.get("updated_at"),
+        }
+        self._brain_jobs[f"schedule:{schedule_id}"] = dict(schedule)
+        return schedule
 
     async def _list_schedule_ids(self) -> List[str]:
-        redis = self._redis()
-        if not redis:
-            ids: list[str] = []
-            for key in self._brain_jobs.keys():
-                if key.startswith("schedule:"):
-                    ids.append(key.split("schedule:", 1)[1])
-            return ids
-        values = await redis.smembers(self._schedule_set_key())
-        return [str(v) for v in values if isinstance(v, str) and v]
+        ids: list[str] = []
+        for key in self._brain_jobs.keys():
+            if key.startswith("schedule:"):
+                ids.append(key.split("schedule:", 1)[1])
+        try:
+            rows, _ = self._get_task_api().list_brain_schedules(limit=1000, offset=0)
+            ids.extend(str(row.get("schedule_id") or "") for row in rows if row.get("schedule_id"))
+        except Exception:
+            pass
+        return list(dict.fromkeys([schedule_id for schedule_id in ids if schedule_id]))
 
     @staticmethod
     def _utc_now() -> str:
@@ -2007,3 +2399,19 @@ class TaskOrchestrator:
             return int(value)
         except Exception:
             return default
+
+    @staticmethod
+    def _datetime_or_none(value: Any) -> Optional[datetime]:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.replace(tzinfo=None)
+        if isinstance(value, (int, float)):
+            return datetime.utcfromtimestamp(float(value))
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            return None

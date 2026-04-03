@@ -78,6 +78,7 @@ COPY --from=builder /app/routers/ ./routers/
 COPY --from=builder /app/routes/ ./routes/
 COPY --from=builder /app/validators/ ./validators/
 COPY --from=builder /app/initializers/ ./initializers/
+COPY --from=builder /app/scripts/ ./scripts/
 
 # 创建必要的目录
 RUN mkdir -p logs data config

@@ -1,7 +1,7 @@
 import sys
 from pathlib import Path
 
-import pytest
+import asyncio
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 EXTERNAL_ASYNCRON = PROJECT_ROOT / "external" / "asyncron"
@@ -13,8 +13,11 @@ for path in (EXTERNAL_ASYNCRON, EXTERNAL_ECONDB, PROJECT_ROOT):
 from task_orchestrator import TaskOrchestrator
 
 
-@pytest.mark.asyncio
-async def test_stock_basic_success_triggers_daily_jobs():
+def test_stock_basic_success_triggers_daily_jobs():
+    asyncio.run(_test_stock_basic_success_triggers_daily_jobs())
+
+
+async def _test_stock_basic_success_triggers_daily_jobs():
     orchestrator = TaskOrchestrator(app={})
     created = []
     metadata_updates = []
@@ -52,8 +55,11 @@ async def test_stock_basic_success_triggers_daily_jobs():
     assert history_events[0] == ("task-stock-basic", "auto_chain_created")
 
 
-@pytest.mark.asyncio
-async def test_stock_basic_bootstrap_task_does_not_trigger_daily_jobs():
+def test_stock_basic_bootstrap_task_does_not_trigger_daily_jobs():
+    asyncio.run(_test_stock_basic_bootstrap_task_does_not_trigger_daily_jobs())
+
+
+async def _test_stock_basic_bootstrap_task_does_not_trigger_daily_jobs():
     orchestrator = TaskOrchestrator(app={})
     created = []
 
