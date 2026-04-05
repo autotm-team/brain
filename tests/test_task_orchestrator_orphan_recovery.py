@@ -19,6 +19,147 @@ def _running_job(orchestrator: TaskOrchestrator, *, task_job_id: str, service: s
     )
 
 
+def test_normalize_job_keeps_top_level_success_when_result_status_is_business_state():
+    orchestrator = TaskOrchestrator(app={})
+
+    normalized = orchestrator._normalize_job(
+        "macro",
+        {
+            "job_id": "macro-job-1",
+            "job_type": "ui_macro_cycle_freeze",
+            "status": "succeeded",
+            "progress": 100,
+            "completed_at": "2026-04-05T00:00:00Z",
+            "result": {"status": "frozen", "id": "macro_snapshot_1"},
+            "metadata": {},
+        },
+        task_job_id="brain-task-macro-freeze",
+    )
+
+    assert normalized["status"] == "succeeded"
+    assert normalized["progress"] == 100
+
+
+def test_normalize_job_promotes_completed_job_with_result_even_if_top_level_status_is_queued():
+    orchestrator = TaskOrchestrator(app={})
+
+    normalized = orchestrator._normalize_job(
+        "execution",
+        {
+            "job_id": "execution-job-1",
+            "job_type": "ui_candidates_promote",
+            "status": "queued",
+            "progress": 100,
+            "completed_at": "2026-04-05T00:00:01Z",
+            "result": {"status": "queued", "id": "subject-1"},
+            "error": None,
+            "metadata": {"message": "ui_candidates_promote completed"},
+        },
+        task_job_id="brain-task-promote",
+    )
+
+    assert normalized["status"] == "succeeded"
+    assert normalized["progress"] == 100
+
+
+@pytest.mark.asyncio
+async def test_list_task_jobs_is_pure_read_and_does_not_trigger_followups():
+    orchestrator = TaskOrchestrator(app={})
+    side_effects = {"history": 0, "followups": 0}
+
+    async def fake_list_service_jobs(service, status=None, max_items=20):
+        if service != "execution":
+            return []
+        return [
+            {
+                "job_id": "svc-job-1",
+                "job_type": "batch_analyze",
+                "status": "succeeded",
+                "progress": 100,
+                "created_at": "2026-04-05T00:00:00Z",
+                "updated_at": "2026-04-05T00:00:10Z",
+                "metadata": {},
+            }
+        ]
+
+    async def fake_find_task_job_id(service, service_job_id):
+        return "brain-task-1"
+
+    async def fake_merge(task_job_id, normalized):
+        return dict(normalized)
+
+    async def fake_append_history_if_changed(task_job_id, normalized):
+        side_effects["history"] += 1
+
+    async def fake_followups(task_job_id, normalized):
+        side_effects["followups"] += 1
+
+    async def fake_list_local_task_jobs(*, services, status, seen_task_ids):
+        return []
+
+    orchestrator._list_service_jobs = fake_list_service_jobs
+    orchestrator._find_task_job_id = fake_find_task_job_id
+    orchestrator._merge_record_metadata = fake_merge
+    orchestrator._append_history_if_changed = fake_append_history_if_changed
+    orchestrator._maybe_trigger_followups = fake_followups
+    orchestrator._list_local_task_jobs = fake_list_local_task_jobs
+
+    payload = await orchestrator.list_task_jobs(service="execution", limit=10, offset=0)
+
+    assert payload["total"] == 1
+    assert side_effects == {"history": 0, "followups": 0}
+
+
+@pytest.mark.asyncio
+async def test_get_task_job_is_pure_read_but_internal_refresh_can_persist_followups():
+    orchestrator = TaskOrchestrator(app={})
+    side_effects = {"history": 0, "followups": 0}
+    upstream_payload = {
+        "data": {
+            "job_id": "svc-job-1",
+            "job_type": "batch_analyze",
+            "status": "succeeded",
+            "progress": 100,
+            "created_at": "2026-04-05T00:00:00Z",
+            "updated_at": "2026-04-05T00:00:10Z",
+            "metadata": {},
+        }
+    }
+
+    async def fake_resolve(task_job_id):
+        return ("execution", "svc-job-1", "brain-task-1")
+
+    async def fake_request(service, method, path, payload=None, params=None):
+        return dict(upstream_payload)
+
+    async def fake_merge(task_job_id, normalized):
+        return dict(normalized)
+
+    async def fake_append_history_if_changed(task_job_id, normalized):
+        side_effects["history"] += 1
+
+    async def fake_followups(task_job_id, normalized):
+        side_effects["followups"] += 1
+
+    orchestrator._resolve_task_job_id = fake_resolve
+    orchestrator._request_service = fake_request
+    orchestrator._merge_record_metadata = fake_merge
+    orchestrator._append_history_if_changed = fake_append_history_if_changed
+    orchestrator._maybe_trigger_followups = fake_followups
+
+    payload = await orchestrator.get_task_job("brain-task-1")
+    assert payload["status"] == "succeeded"
+    assert side_effects == {"history": 0, "followups": 0}
+
+    payload = await orchestrator._refresh_task_job_snapshot(
+        "brain-task-1",
+        persist_history=True,
+        trigger_followups=True,
+    )
+    assert payload["status"] == "succeeded"
+    assert side_effects == {"history": 1, "followups": 1}
+
+
 @pytest.mark.asyncio
 async def test_orphaned_running_task_is_cancelled_and_recreated():
     orchestrator = TaskOrchestrator(app={})

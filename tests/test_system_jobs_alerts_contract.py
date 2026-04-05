@@ -117,3 +117,25 @@ def test_set_alert_rule_updates_existing_rule_and_preserves_contract_fields():
     assert updated["created_at"] == created["created_at"]
     assert updated["updated_at"]
     assert monitor._performance_thresholds["response_time"] == 1800.0
+
+
+def test_schedule_item_normalization_uses_helper_without_type_error():
+    handler = UIBffHandler.__new__(UIBffHandler)
+    handler.logger = logging.getLogger("test-system-schedule-normalization")
+
+    payload = handler._normalize_system_schedule_item(
+        {
+            "id": "schedule-1",
+            "service": "flowhub",
+            "job_type": "stock_basic_data",
+            "trigger": "interval",
+            "interval_seconds": 3600,
+            "enabled": True,
+            "metadata": {"name": "Stock bootstrap"},
+            "params": {"incremental": True},
+        }
+    )
+
+    assert payload["schedule_id"] == "schedule-1"
+    assert payload["name"] == "Stock bootstrap"
+    assert payload["service"] == "flowhub"

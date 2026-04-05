@@ -40,6 +40,9 @@ class UpstreamServiceError(RuntimeError):
 class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
     SERVICES = ("flowhub", "execution", "macro", "portfolio")
     JOB_TYPES_CACHE_TTL_SECONDS = 60
+    INTERNAL_JOB_TYPES_BY_SERVICE = {
+        "execution": {"ui_candidates_sync_incremental"},
+    }
     JOB_TYPE_ZH_MAP = {
         # Flowhub data jobs
         "daily_ohlc": "个股日线行情(单标的)",
@@ -210,7 +213,11 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
             deadline = asyncio.get_running_loop().time() + 6 * 3600
             while asyncio.get_running_loop().time() < deadline:
                 try:
-                    payload = await self.get_task_job(task_job_id)
+                    payload = await self._refresh_task_job_snapshot(
+                        task_job_id,
+                        persist_history=True,
+                        trigger_followups=True,
+                    )
                     status = str(payload.get("status") or "").lower()
                     if status in {"succeeded", "failed", "cancelled"}:
                         return
@@ -491,8 +498,6 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
                     normalized = self._compact_job_for_list(normalized)
                     if mapped_id:
                         seen_task_ids.add(mapped_id)
-                        await self._append_history_if_changed(mapped_id, normalized)
-                        await self._maybe_trigger_followups(mapped_id, normalized)
                     if status and normalized.get("status") != self._normalize_status(status):
                         continue
                     jobs.append(normalized)
@@ -562,16 +567,23 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
 
         return jobs[:target]
 
-    async def get_task_job(self, task_job_id: str) -> Dict[str, Any]:
+    async def _refresh_task_job_snapshot(
+        self,
+        task_job_id: str,
+        *,
+        persist_history: bool,
+        trigger_followups: bool,
+    ) -> Dict[str, Any]:
         service, service_job_id, mapped_task_job_id = await self._resolve_task_job_id(task_job_id)
         try:
             payload = await self._request_service(service, "GET", f"/api/v1/jobs/{service_job_id}")
             normalized = self._normalize_job(service, self._extract_data(payload), task_job_id=mapped_task_job_id or task_job_id)
             if mapped_task_job_id:
                 normalized = await self._merge_record_metadata(mapped_task_job_id, normalized)
-            if mapped_task_job_id:
+            if mapped_task_job_id and persist_history:
                 await self._append_history_if_changed(mapped_task_job_id, normalized)
-                await self._maybe_trigger_followups(mapped_task_job_id, normalized)
+                if trigger_followups:
+                    await self._maybe_trigger_followups(mapped_task_job_id, normalized)
             return normalized
         except UpstreamServiceError as exc:
             if not mapped_task_job_id:
@@ -591,6 +603,13 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
                 upstream_status=exc.status,
             )
             return fallback
+
+    async def get_task_job(self, task_job_id: str) -> Dict[str, Any]:
+        return await self._refresh_task_job_snapshot(
+            task_job_id,
+            persist_history=False,
+            trigger_followups=False,
+        )
 
     async def scan_orphaned_task_jobs_once(self) -> Dict[str, Any]:
         scanned = 0
@@ -872,6 +891,7 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
     async def _fetch_service_job_type_set(self, service: str) -> set[str]:
         items = await self._fetch_service_job_types(service, use_cache=True)
         values = {str(item.get("job_type") or "").strip() for item in items}
+        values.update(self.INTERNAL_JOB_TYPES_BY_SERVICE.get(service, set()))
         return {x for x in values if x}
 
     @staticmethod
@@ -960,10 +980,18 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
         completed_at = job.get("completed_at")
         if updated_at is None:
             updated_at = completed_at or started_at or created_at
-        if completed_at is not None and isinstance(result, dict):
-            result_status = self._normalize_status(result.get("status"))
-            if result_status in {"succeeded", "failed", "cancelled"}:
-                status = result_status
+        if completed_at is not None and isinstance(result, dict) and status not in self.TERMINAL_STATUSES:
+            raw_result_status = str(result.get("status") or "").strip().lower()
+            if raw_result_status in self.TERMINAL_STATUSES:
+                status = raw_result_status
+        if completed_at is not None and status not in self.TERMINAL_STATUSES:
+            error_payload = job.get("error")
+            has_error = error_payload is not None and error_payload != "" and error_payload != {}
+            has_result = result is not None and result != "" and result != {}
+            if has_error:
+                status = "failed"
+            elif has_result:
+                status = "succeeded"
         progress = self._normalize_progress(job.get("progress"), status)
         if completed_at is not None and status in {"succeeded", "failed", "cancelled"}:
             progress = 100

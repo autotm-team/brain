@@ -18,7 +18,7 @@ except Exception:  # pragma: no cover - used only in full runtime
 
 
 class UIBffSystemOpsMixin:
-    def _schedule_name(item: Dict[str, Any]) -> str:
+    def _schedule_name(self, item: Dict[str, Any]) -> str:
         metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
         return str(metadata.get("name") or item.get("job_type") or item.get("schedule_id") or "schedule").strip()
 

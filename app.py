@@ -438,9 +438,12 @@ async def startup_handler(app: web.Application):
         except Exception as warmup_err:
             logger.warning(f"Task job types warmup failed: {warmup_err}")
 
-        if "unified_scheduler" in app:
+        scheduler_enabled = bool(getattr(app["config"].service, "scheduler_enabled", True))
+        if "unified_scheduler" in app and scheduler_enabled:
             await app["unified_scheduler"].start()
             logger.info("Unified scheduler started")
+        elif "unified_scheduler" in app:
+            logger.info("Unified scheduler startup skipped: SCHEDULER_ENABLED=false")
 
         orchestrator = app.get("task_orchestrator")
         if orchestrator:

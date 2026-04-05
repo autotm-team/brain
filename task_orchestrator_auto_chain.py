@@ -16,6 +16,10 @@ class TaskOrchestratorAutoChainMixin:
         status = str(normalized.get("status") or "")
         service = str(normalized.get("service") or "").strip().lower()
         job_type = str(normalized.get("job_type") or "").strip()
+        metadata = normalized.get("metadata") if isinstance(normalized.get("metadata"), dict) else {}
+
+        if bool(metadata.get("task_probe_disable_auto_chain")):
+            return
 
         if status in {"failed", "cancelled"}:
             try:
