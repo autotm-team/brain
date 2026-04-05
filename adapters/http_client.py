@@ -5,19 +5,33 @@ HTTP客户端基类
 """
 
 import asyncio
+import importlib.util
 import logging
 from typing import Dict, Any, Optional, Union
 from datetime import datetime
+from pathlib import Path
 
 import aiohttp
+
+def _load_local_module(module_filename: str, module_name: str):
+    module_path = Path(__file__).resolve().parents[1] / f"{module_filename}.py"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load local module: {module_filename}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
 
 try:
     from ..config import IntegrationConfig
     from ..exceptions import AdapterException, ConnectionException
 except Exception:
-    #
-    from config import IntegrationConfig
-    from exceptions import AdapterException, ConnectionException
+    config_module = _load_local_module("config", "brain_config_http")
+    exceptions_module = _load_local_module("exceptions", "brain_exceptions_http")
+    IntegrationConfig = config_module.IntegrationConfig
+    AdapterException = exceptions_module.AdapterException
+    ConnectionException = exceptions_module.ConnectionException
 
 
 class HttpClient:

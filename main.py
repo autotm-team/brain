@@ -107,7 +107,7 @@ async def main():
         
         logger.info(f"Integration Service started on http://{host}:{port}")
         logger.info(f"Health check: http://{host}:{port}/health")
-        logger.info(f"API documentation: http://{host}:{port}/api/v1/status")
+        logger.info(f"UI system health: http://{host}:{port}/api/v1/ui/system/health")
         
         # 设置信号处理
         def signal_handler():

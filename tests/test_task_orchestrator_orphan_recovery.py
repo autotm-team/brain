@@ -1,14 +1,4 @@
-import sys
-from pathlib import Path
-
 import pytest
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-EXTERNAL_ASYNCRON = PROJECT_ROOT / "external" / "asyncron"
-EXTERNAL_ECONDB = PROJECT_ROOT / "external" / "econdb"
-for path in (EXTERNAL_ASYNCRON, EXTERNAL_ECONDB, PROJECT_ROOT):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
 
 from task_orchestrator import TaskOrchestrator, UpstreamServiceError
 
@@ -57,7 +47,7 @@ async def test_orphaned_running_task_is_cancelled_and_recreated():
     async def fake_request(service, method, path, payload=None, params=None):
         raise UpstreamServiceError(service, method, path, 404, {"message": "missing"})
 
-    async def fake_create_task_job(service, job_type, params=None, metadata=None, service_payload=None):
+    async def fake_create_task_job(service, job_type, params=None, metadata=None, service_payload=None, lineage_context=None):
         created_calls.append(
             {
                 "service": service,
@@ -122,7 +112,7 @@ async def test_orphan_recreate_failure_keeps_task_active_for_retry():
     async def fake_request(service, method, path, payload=None, params=None):
         raise UpstreamServiceError(service, method, path, 404, {"message": "missing"})
 
-    async def fake_create_task_job(service, job_type, params=None, metadata=None, service_payload=None):
+    async def fake_create_task_job(service, job_type, params=None, metadata=None, service_payload=None, lineage_context=None):
         raise RuntimeError("temporary recreate failure")
 
     orchestrator._request_service = fake_request
@@ -174,7 +164,7 @@ async def test_orphan_recreate_replays_service_payload():
     async def fake_request(service, method, path, payload=None, params=None):
         raise UpstreamServiceError(service, method, path, 404, {"message": "missing"})
 
-    async def fake_create_task_job(service, job_type, params=None, metadata=None, service_payload=None):
+    async def fake_create_task_job(service, job_type, params=None, metadata=None, service_payload=None, lineage_context=None):
         created_calls.append(
             {
                 "service": service,
@@ -223,7 +213,7 @@ async def test_upstream_5xx_does_not_trigger_recreate():
     async def fake_request(service, method, path, payload=None, params=None):
         raise UpstreamServiceError(service, method, path, 504, {"message": "timeout"})
 
-    async def fake_create_task_job(service, job_type, params=None, metadata=None, service_payload=None):
+    async def fake_create_task_job(service, job_type, params=None, metadata=None, service_payload=None, lineage_context=None):
         created_calls.append(job_type)
         return {"id": "unexpected"}
 
@@ -268,7 +258,7 @@ async def test_orphan_recreate_is_capped_after_three_attempts():
     async def fake_request(service, method, path, payload=None, params=None):
         raise UpstreamServiceError(service, method, path, 404, {"message": "missing"})
 
-    async def fake_create_task_job(service, job_type, params=None, metadata=None, service_payload=None):
+    async def fake_create_task_job(service, job_type, params=None, metadata=None, service_payload=None, lineage_context=None):
         raise AssertionError("should not recreate when capped")
 
     orchestrator._request_service = fake_request

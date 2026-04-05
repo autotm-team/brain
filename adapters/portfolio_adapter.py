@@ -5,15 +5,41 @@
 """
 
 import asyncio
+import importlib.util
 import logging
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Any, Optional
 
-from interfaces import ISystemAdapter
-from config import IntegrationConfig
-from exceptions import AdapterException, ConnectionException, HealthCheckException
-from adapters.http_client import HttpClient
-from adapters.portfolio_request_mapper import PortfolioRequestMapper
+def _load_local_module(module_filename: str, module_name: str):
+    module_path = Path(__file__).resolve().parents[1] / f"{module_filename}.py"
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load local module: {module_filename}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+try:
+    from ..interfaces import ISystemAdapter
+    from ..config import IntegrationConfig
+    from ..exceptions import AdapterException, ConnectionException, HealthCheckException
+    from .http_client import HttpClient
+    from .portfolio_request_mapper import PortfolioRequestMapper
+except Exception:
+    interfaces_module = _load_local_module("interfaces", "brain_interfaces")
+    config_module = _load_local_module("config", "brain_config")
+    exceptions_module = _load_local_module("exceptions", "brain_exceptions")
+
+    ISystemAdapter = interfaces_module.ISystemAdapter
+    IntegrationConfig = config_module.IntegrationConfig
+    AdapterException = exceptions_module.AdapterException
+    ConnectionException = exceptions_module.ConnectionException
+    HealthCheckException = exceptions_module.HealthCheckException
+
+    from adapters.http_client import HttpClient
+    from adapters.portfolio_request_mapper import PortfolioRequestMapper
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +65,7 @@ class PortfolioAdapter(ISystemAdapter):
         # HTTP客户端和请求映射器
         self._http_client: Optional[HttpClient] = None
         self._request_mapper = PortfolioRequestMapper(
-            default_portfolio_id=getattr(config.adapter, 'default_portfolio_id', 'default_portfolio')
+            default_portfolio_id=getattr(config.adapter, 'default_portfolio_id', None)
         )
 
         # 组合系统配置
@@ -57,6 +83,7 @@ class PortfolioAdapter(ISystemAdapter):
             'failed_requests': 0,
             'average_response_time': 0.0
         }
+        self._resolved_portfolio_id: Optional[str] = None
 
         logger.info("PortfolioAdapter initialized with HTTP client integration")
     
@@ -266,7 +293,7 @@ class PortfolioAdapter(ISystemAdapter):
                 response = await self._send_portfolio_request(request)
                 
                 # 处理响应
-                processed_response = await self.handle_response(response)
+                processed_response = await self.handle_response(response, request.get('type', 'unknown'))
                 
                 # 更新统计
                 response_time = (datetime.now() - start_time).total_seconds()
@@ -286,7 +313,7 @@ class PortfolioAdapter(ISystemAdapter):
                 await asyncio.sleep(self._portfolio_system_config['retry_delay'] * retry_count)
                 logger.warning(f"Portfolio request failed, retrying ({retry_count}/{max_retries}): {e}")
     
-    async def handle_response(self, response: Any) -> Any:
+    async def handle_response(self, response: Any, request_type: str) -> Any:
         """处理响应
         
         Args:
@@ -300,20 +327,23 @@ class PortfolioAdapter(ISystemAdapter):
             if not self._validate_response_format(response):
                 raise AdapterException("PortfolioAdapter", "Invalid response format")
             
-            # 提取组合指令数据
-            portfolio_instruction = self._extract_portfolio_instruction(response)
-            
-            # 标准化数据格式
-            standardized_instruction = self._standardize_portfolio_instruction(portfolio_instruction)
-            
-            return standardized_instruction
+            response_data = self._extract_response_data(response)
+
+            if request_type == 'portfolio_optimization':
+                return self._standardize_portfolio_instruction(response_data)
+            if request_type == 'risk_assessment':
+                return self._standardize_risk_assessment(response_data)
+            if request_type == 'status_request':
+                return self._standardize_system_status(response_data)
+            return response_data
             
         except Exception as e:
             logger.error(f"Failed to handle portfolio response: {e}")
             raise AdapterException("PortfolioAdapter", f"Response handling failed: {e}")
     
     async def request_portfolio_optimization(self, macro_state: Dict[str, Any], 
-                                           constraints: Dict[str, Any]) -> Dict[str, Any]:
+                                           constraints: Dict[str, Any],
+                                           portfolio_id: Optional[str] = None) -> Dict[str, Any]:
         """请求组合优化
         
         Args:
@@ -324,8 +354,10 @@ class PortfolioAdapter(ISystemAdapter):
             Dict[str, Any]: 组合优化结果
         """
         try:
+            resolved_portfolio_id = await self._resolve_portfolio_id(portfolio_id)
             request = {
                 'type': 'portfolio_optimization',
+                'portfolio_id': resolved_portfolio_id,
                 'macro_state': macro_state,
                 'constraints': constraints,
                 'timestamp': datetime.now().isoformat(),
@@ -341,7 +373,7 @@ class PortfolioAdapter(ISystemAdapter):
             logger.error(f"Portfolio optimization request failed: {e}")
             raise AdapterException("PortfolioAdapter", f"Optimization request failed: {e}")
     
-    async def request_risk_assessment(self, portfolio_data: Dict[str, Any]) -> Dict[str, Any]:
+    async def request_risk_assessment(self, portfolio_data: Dict[str, Any], portfolio_id: Optional[str] = None) -> Dict[str, Any]:
         """请求风险评估
         
         Args:
@@ -351,8 +383,10 @@ class PortfolioAdapter(ISystemAdapter):
             Dict[str, Any]: 风险评估结果
         """
         try:
+            resolved_portfolio_id = await self._resolve_portfolio_id(portfolio_id or portfolio_data.get('portfolio_id'))
             request = {
                 'type': 'risk_assessment',
+                'portfolio_id': resolved_portfolio_id,
                 'portfolio_data': portfolio_data,
                 'timestamp': datetime.now().isoformat(),
                 'request_id': f"risk_req_{datetime.now().timestamp()}"
@@ -454,8 +488,8 @@ class PortfolioAdapter(ISystemAdapter):
         required_fields = ['status']
         return all(field in response for field in required_fields)
     
-    def _extract_portfolio_instruction(self, response: Dict[str, Any]) -> Dict[str, Any]:
-        """提取组合指令数据"""
+    def _extract_response_data(self, response: Dict[str, Any]) -> Dict[str, Any]:
+        """提取成功响应的数据内容"""
         if response.get('status') != 'success':
             raise AdapterException("PortfolioAdapter", f"Portfolio operation failed: {response.get('error', 'Unknown error')}")
         
@@ -467,6 +501,9 @@ class PortfolioAdapter(ISystemAdapter):
             'target_position': float(instruction.get('target_position', 0.5)),
             'sector_weights': instruction.get('sector_weights', {}),
             'risk_constraints': instruction.get('risk_constraints', {}),
+            'weights': instruction.get('weights', {}),
+            'positions': instruction.get('positions', {}),
+            'symbols': instruction.get('symbols', []),
             'rebalance_threshold': float(instruction.get('rebalance_threshold', 0.05)),
             'execution_priority': instruction.get('execution_priority', 3),
             'expected_return': float(instruction.get('expected_return', 0.0)),
@@ -497,6 +534,27 @@ class PortfolioAdapter(ISystemAdapter):
                     }
         
         return standardized
+
+    def _standardize_risk_assessment(self, risk_data: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            'var_1d': float(risk_data.get('var_1d', 0.0)),
+            'var_5d': float(risk_data.get('var_5d', 0.0)),
+            'expected_shortfall': float(risk_data.get('expected_shortfall', 0.0)),
+            'beta': float(risk_data.get('beta', 0.0)),
+            'tracking_error': float(risk_data.get('tracking_error', 0.0)),
+            'information_ratio': float(risk_data.get('information_ratio', 0.0)),
+            'risk_score': float(risk_data.get('risk_score', 0.0)),
+            'raw_metrics': risk_data.get('raw_metrics', {}),
+        }
+
+    def _standardize_system_status(self, status_data: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            'status': status_data.get('status', 'unknown'),
+            'last_optimization': status_data.get('last_optimization'),
+            'active_portfolios': int(status_data.get('active_portfolios', 0)),
+            'total_aum': float(status_data.get('total_aum', 0.0)),
+            'portfolio_ids': status_data.get('portfolio_ids', []),
+        }
     
     def _update_request_statistics(self, success: bool, response_time: float) -> None:
         """更新请求统计"""
@@ -512,3 +570,58 @@ class PortfolioAdapter(ISystemAdapter):
             self._request_statistics['average_response_time'] = (
                 (current_avg * (total_successful - 1) + response_time) / total_successful
             )
+
+    async def _resolve_portfolio_id(self, requested_portfolio_id: Optional[str] = None) -> str:
+        """解析要发送给 portfolio 服务的目标组合 ID。"""
+        explicit_id = requested_portfolio_id or getattr(self.config.adapter, 'default_portfolio_id', None)
+        if explicit_id:
+            if await self._portfolio_exists(explicit_id):
+                self._resolved_portfolio_id = explicit_id
+                return explicit_id
+            raise AdapterException("PortfolioAdapter", f"Configured portfolio_id does not exist: {explicit_id}")
+
+        if self._resolved_portfolio_id and await self._portfolio_exists(self._resolved_portfolio_id):
+            return self._resolved_portfolio_id
+
+        portfolios = await self._list_portfolios()
+        if not portfolios:
+            raise AdapterException(
+                "PortfolioAdapter",
+                "No portfolio exists in portfolio service. Create one first or configure adapter.default_portfolio_id.",
+            )
+
+        active_portfolios = [
+            item for item in portfolios
+            if str(item.get('status', '')).lower() in {'active', 'pending_execution', 'rebalancing'}
+        ]
+        candidates = active_portfolios or portfolios
+
+        if len(candidates) == 1:
+            portfolio_id = str(candidates[0].get('portfolio_id') or '').strip()
+            if portfolio_id:
+                self._resolved_portfolio_id = portfolio_id
+                return portfolio_id
+
+        raise AdapterException(
+            "PortfolioAdapter",
+            "Multiple portfolios exist. Specify portfolio_id explicitly or configure adapter.default_portfolio_id.",
+        )
+
+    async def _portfolio_exists(self, portfolio_id: str) -> bool:
+        if not self._http_client:
+            raise AdapterException("PortfolioAdapter", "HTTP client not initialized")
+        try:
+            response = await self._http_client.get(f'/api/v1/portfolios/{portfolio_id}')
+            return isinstance(response, dict) and response.get('status') == 'success'
+        except Exception:
+            return False
+
+    async def _list_portfolios(self) -> List[Dict[str, Any]]:
+        if not self._http_client:
+            raise AdapterException("PortfolioAdapter", "HTTP client not initialized")
+        response = await self._http_client.get('/api/v1/portfolios')
+        if not isinstance(response, dict):
+            return []
+        data = response.get('data', {})
+        items = data.get('items') if isinstance(data, dict) else []
+        return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []

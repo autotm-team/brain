@@ -44,20 +44,3 @@ def setup_task_routes(app: web.Application, cors: CorsConfig = None):
     route = app.router.add_get('/api/v1/task-jobs/{task_job_id}/history', task_handler.get_task_job_history)
     if cors:
         cors.add(route)
-
-    # 统一调度接口
-    route = app.router.add_post('/api/v1/schedules', task_handler.create_schedule)
-    if cors:
-        cors.add(route)
-    route = app.router.add_get('/api/v1/schedules', task_handler.list_schedules)
-    if cors:
-        cors.add(route)
-    route = app.router.add_patch('/api/v1/schedules/{schedule_id}', task_handler.patch_schedule)
-    if cors:
-        cors.add(route)
-    route = app.router.add_delete('/api/v1/schedules/{schedule_id}', task_handler.delete_schedule)
-    if cors:
-        cors.add(route)
-    route = app.router.add_post('/api/v1/schedules/{schedule_id}/trigger', task_handler.trigger_schedule)
-    if cors:
-        cors.add(route)

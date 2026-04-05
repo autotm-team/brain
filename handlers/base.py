@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 from aiohttp import web
+from serializers import to_jsonable
 
 
 class BaseHandler:
@@ -30,7 +31,7 @@ class BaseHandler:
         """
         response_data = {
             'success': True,
-            'data': data,
+            'data': to_jsonable(data),
             'message': message,
             'timestamp': datetime.utcnow().isoformat() + 'Z'
         }
@@ -54,8 +55,12 @@ class BaseHandler:
             'error_code': error_code,
             'timestamp': datetime.utcnow().isoformat() + 'Z'
         }
-        
+
         return web.json_response(response_data, status=code)
+
+    def not_implemented_response(self, message: str = "当前接口尚未实现") -> web.Response:
+        """统一的未实现响应。"""
+        return self.error_response(message, 501, "NOT_IMPLEMENTED")
     
     async def get_request_json(self, request: web.Request) -> Dict[str, Any]:
         """获取请求JSON数据

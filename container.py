@@ -11,22 +11,18 @@ from typing import Dict, Type, TypeVar, Callable, Any, Optional
 
 try:
     from .interfaces import (
-        ISystemCoordinator, ISignalRouter, IDataFlowManager,
-        ITemporalValidationCoordinator
+        ISystemCoordinator, ISignalRouter, IDataFlowManager
     )
     from .coordinators.system_coordinator import SystemCoordinator
     from .routers.signal_router import SignalRouter
     from .managers.data_flow_manager import DataFlowManager
-    from .validators.temporal_validation_coordinator import TemporalValidationCoordinator
 except Exception:
     from interfaces import (
-        ISystemCoordinator, ISignalRouter, IDataFlowManager,
-        ITemporalValidationCoordinator
+        ISystemCoordinator, ISignalRouter, IDataFlowManager
     )
     from coordinators.system_coordinator import SystemCoordinator
     from routers.signal_router import SignalRouter
     from managers.data_flow_manager import DataFlowManager
-    from validators.temporal_validation_coordinator import TemporalValidationCoordinator
 
 logger = logging.getLogger(__name__)
 
@@ -131,7 +127,6 @@ class DIServiceRegistry:
         container.register_singleton(ISystemCoordinator, SystemCoordinator)
         container.register_singleton(ISignalRouter, SignalRouter)
         container.register_singleton(IDataFlowManager, DataFlowManager)
-        container.register_singleton(ITemporalValidationCoordinator, TemporalValidationCoordinator)
         
         logger.info("Core services registered successfully")
 

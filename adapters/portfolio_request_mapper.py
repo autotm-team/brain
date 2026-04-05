@@ -17,7 +17,7 @@ class PortfolioRequestMapper:
     将brain层期望的通用请求格式转换为portfolio服务的具体RESTful API调用。
     """
     
-    def __init__(self, default_portfolio_id: str = "default_portfolio"):
+    def __init__(self, default_portfolio_id: Optional[str] = None):
         """
         初始化映射器
         
@@ -52,7 +52,9 @@ class PortfolioRequestMapper:
     
     def _map_portfolio_optimization(self, request: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
         """映射组合优化请求"""
-        portfolio_id = request.get('portfolio_id', self.default_portfolio_id)
+        portfolio_id = request.get('portfolio_id') or self.default_portfolio_id
+        if not portfolio_id:
+            raise ValueError("portfolio_id is required for portfolio optimization requests")
         macro_state = request.get('macro_state', {})
         constraints = request.get('constraints', {})
         
@@ -62,7 +64,11 @@ class PortfolioRequestMapper:
         # 构造请求体
         request_body = {
             'objective': 'max_sharpe',  # 默认目标
-            'constraints': constraints,
+            'constraints': {
+                'max_weight': constraints.get('max_single_stock'),
+                'max_portfolio_risk': constraints.get('var_limit'),
+                'sector_limits': constraints.get('sector_limits', {}),
+            },
             'expected_returns': {},  # 可以从macro_state中提取
             'macro_context': macro_state  # 传递宏观背景信息
         }
@@ -78,8 +84,10 @@ class PortfolioRequestMapper:
     
     def _map_risk_assessment(self, request: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
         """映射风险评估请求"""
-        portfolio_id = request.get('portfolio_id', self.default_portfolio_id)
         portfolio_data = request.get('portfolio_data', {})
+        portfolio_id = request.get('portfolio_id') or portfolio_data.get('portfolio_id') or self.default_portfolio_id
+        if not portfolio_id:
+            raise ValueError("portfolio_id is required for risk assessment requests")
         
         # 默认获取风险指标，如果需要特定风险计算，可以扩展
         api_path = f"portfolios/{portfolio_id}/risk/metrics"
@@ -94,9 +102,7 @@ class PortfolioRequestMapper:
     
     def _map_status_request(self, request: Dict[str, Any]) -> Tuple[str, str, Dict[str, Any]]:
         """映射状态查询请求"""
-        portfolio_id = request.get('portfolio_id', self.default_portfolio_id)
-        
-        api_path = f"portfolios/{portfolio_id}"
+        api_path = "portfolios"
         
         logger.debug(f"Mapped status request to: GET {api_path}")
         return ("GET", api_path, {})
@@ -186,51 +192,89 @@ class PortfolioRequestMapper:
     
     def _map_optimization_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
         """映射优化响应"""
-        if 'optimization_result' in response:
-            optimization_result = response['optimization_result']
+        payload = self._unwrap_success_data(response)
+        optimization_result = payload.get('optimization_result') if isinstance(payload, dict) else None
+        if isinstance(optimization_result, dict):
+            optimal_weights = optimization_result.get('optimal_weights', {}) or {}
+            success = bool(optimization_result.get('success', False))
             return {
-                'status': 'success',
+                'status': 'success' if success else 'error',
                 'data': {
-                    'target_position': optimization_result.get('target_position', 0.8),
-                    'sector_weights': optimization_result.get('sector_weights', {}),
-                    'risk_constraints': optimization_result.get('risk_constraints', {}),
+                    'target_position': float(sum(float(weight) for weight in optimal_weights.values())) if optimal_weights else 0.0,
+                    'weights': optimal_weights,
+                    'positions': optimal_weights,
+                    'symbols': list(optimal_weights.keys()),
+                    'sector_weights': payload.get('sector_weights', {}),
+                    'risk_constraints': {
+                        'constraints_satisfied': optimization_result.get('constraints_satisfied', False),
+                        'constraint_violations': optimization_result.get('constraint_violations', []),
+                    },
                     'expected_return': optimization_result.get('expected_return', 0.0),
-                    'expected_volatility': optimization_result.get('expected_volatility', 0.0),
+                    'expected_volatility': optimization_result.get('expected_risk', 0.0),
                     'sharpe_ratio': optimization_result.get('sharpe_ratio', 0.0),
-                    'rebalance_threshold': optimization_result.get('rebalance_threshold', 0.05)
+                    'rebalance_threshold': payload.get('rebalance_threshold', 0.05)
                 },
-                'timestamp': datetime.now().isoformat()
+                'error': None if success else optimization_result.get('convergence_info', {}).get('message', 'optimization failed'),
+                'timestamp': response.get('timestamp', datetime.now().isoformat())
             }
         return response
     
     def _map_risk_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
         """映射风险评估响应"""
-        if 'risk_metrics' in response:
-            risk_metrics = response['risk_metrics']
+        payload = self._unwrap_success_data(response)
+        risk_metrics = payload.get('risk_metrics') if isinstance(payload, dict) else None
+        if isinstance(risk_metrics, dict):
+            var_1d = float(risk_metrics.get('portfolio_var_1d', risk_metrics.get('var_1d', 0.0)))
+            var_5d = float(risk_metrics.get('portfolio_var_5d', risk_metrics.get('var_5d', 0.0)))
+            expected_shortfall = float(risk_metrics.get('portfolio_cvar_1d', risk_metrics.get('expected_shortfall', 0.0)))
+            concentration = float(risk_metrics.get('concentration_ratio', 0.0))
+            correlation = float(risk_metrics.get('avg_correlation', 0.0))
+            risk_score = min(1.0, max(var_1d / 0.05, concentration / 0.1, correlation / 0.8))
             return {
                 'status': 'success',
                 'data': {
-                    'var_1d': risk_metrics.get('var_1d', 0.015),
-                    'var_5d': risk_metrics.get('var_5d', 0.035),
-                    'expected_shortfall': risk_metrics.get('expected_shortfall', 0.025),
+                    'var_1d': var_1d,
+                    'var_5d': var_5d,
+                    'expected_shortfall': expected_shortfall,
                     'beta': risk_metrics.get('beta', 1.0),
                     'tracking_error': risk_metrics.get('tracking_error', 0.03),
                     'information_ratio': risk_metrics.get('information_ratio', 0.5),
-                    'risk_score': risk_metrics.get('risk_score', 0.6)
+                    'risk_score': risk_score,
+                    'raw_metrics': risk_metrics
                 },
-                'timestamp': datetime.now().isoformat()
+                'timestamp': response.get('timestamp', datetime.now().isoformat())
             }
         return response
     
     def _map_status_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
         """映射状态响应"""
-        if 'portfolio' in response:
-            portfolio = response['portfolio']
+        payload = self._unwrap_success_data(response)
+        if isinstance(payload, dict) and isinstance(payload.get('portfolio'), dict):
+            portfolio = payload['portfolio']
             return {
-                'status': 'running',
-                'last_optimization': portfolio.get('last_updated', datetime.now().isoformat()),
-                'active_portfolios': 1,
-                'total_aum': portfolio.get('total_value', 1000000000)
+                'status': 'success',
+                'data': {
+                    'status': portfolio.get('status', 'running'),
+                    'last_optimization': portfolio.get('updated_time', datetime.now().isoformat()),
+                    'active_portfolios': 1,
+                    'total_aum': float(portfolio.get('total_value', 0.0)),
+                    'portfolio_ids': [portfolio.get('portfolio_id')] if portfolio.get('portfolio_id') else []
+                },
+                'timestamp': response.get('timestamp', datetime.now().isoformat())
+            }
+        if isinstance(payload, dict) and isinstance(payload.get('items'), list):
+            items = [item for item in payload.get('items', []) if isinstance(item, dict)]
+            updated_times = [str(item.get('updated_time') or '') for item in items if item.get('updated_time')]
+            return {
+                'status': 'success',
+                'data': {
+                    'status': 'running',
+                    'last_optimization': max(updated_times) if updated_times else datetime.now().isoformat(),
+                    'active_portfolios': len(items),
+                    'total_aum': float(sum(float(item.get('total_value', 0.0)) for item in items)),
+                    'portfolio_ids': [item.get('portfolio_id') for item in items if item.get('portfolio_id')]
+                },
+                'timestamp': response.get('timestamp', datetime.now().isoformat())
             }
         return response
     
@@ -243,3 +287,10 @@ class PortfolioRequestMapper:
             'system': data.get('service', 'portfolio_management'),
             'version': data.get('version', response.get('version', '1.0.0'))
         }
+
+    @staticmethod
+    def _unwrap_success_data(response: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(response, dict):
+            return {}
+        data = response.get('data', {})
+        return data if isinstance(data, dict) else {}

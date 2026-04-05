@@ -148,7 +148,7 @@ class MacroAdapter(ISystemAdapter):
             elif action == 'trigger_analysis':
                 return await self._http_client.post('analysis', request.get('params', {}))
             elif action == 'get_indicators':
-                params = {'indicators': request.get('indicators', [])}
+                params = self._serialize_indicator_params(request.get('indicators'))
                 return await self._http_client.get('indicators', params)
             elif action == 'get_cycle_position':
                 return await self._http_client.get('cycle/position')
@@ -208,13 +208,18 @@ class MacroAdapter(ISystemAdapter):
             Dict[str, Any]: 经济指标数据
         """
         try:
-            params = {'indicators': indicators} if indicators else {}
+            params = self._serialize_indicator_params(indicators)
             response = await self._http_client.get('indicators', params)
             return response.get('data', {})
 
         except Exception as e:
             logger.error(f"Failed to get economic indicators: {e}")
             raise
+
+    @staticmethod
+    def _serialize_indicator_params(indicators: Optional[List[Any]]) -> Dict[str, Any]:
+        tokens = [str(item).strip() for item in (indicators or []) if str(item).strip()]
+        return {'indicators': ",".join(tokens)} if tokens else {}
 
     async def get_market_cycle_position(self) -> Dict[str, Any]:
         """获取市场周期位置

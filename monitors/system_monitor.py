@@ -91,6 +91,10 @@ class SystemMonitor:
 
         logger.info("SystemMonitor initialized")
 
+    def is_running(self) -> bool:
+        """暴露给 HTTP 层的运行状态。"""
+        return self._is_running
+
     def set_component_references(self, **components):
         """设置组件引用
 
@@ -188,6 +192,7 @@ class SystemMonitor:
             self._current_system_status.macro_system_status = component_health.get('macro_adapter', SystemHealthStatus.CRITICAL)
             self._current_system_status.portfolio_system_status = component_health.get('portfolio_adapter', SystemHealthStatus.CRITICAL)
             self._current_system_status.strategy_system_status = component_health.get('strategy_adapter', SystemHealthStatus.CRITICAL)
+            self._current_system_status.tactical_system_status = component_health.get('signal_router', SystemHealthStatus.CRITICAL)
             self._current_system_status.data_pipeline_status = component_health.get('data_flow_manager', SystemHealthStatus.CRITICAL)
             
             # 计算整体健康状态
@@ -609,19 +614,24 @@ class SystemMonitor:
     async def _check_strategy_adapter_health(self) -> SystemHealthStatus:
         """检查策略适配器健康状态"""
         try:
-            if self._strategy_adapter is None:
+            strategy_adapter = self._strategy_adapter
+            if strategy_adapter is None and self._system_coordinator is not None:
+                strategy_adapter = getattr(self._system_coordinator, '_strategy_adapter', None)
+            if strategy_adapter is None and self._signal_router is not None:
+                strategy_adapter = getattr(self._signal_router, '_strategy_adapter', None)
+            if strategy_adapter is None:
                 return SystemHealthStatus.CRITICAL
 
             # 检查适配器连接状态
-            if hasattr(self._strategy_adapter, 'health_check'):
-                health_ok = await self._strategy_adapter.health_check()
+            if hasattr(strategy_adapter, 'health_check'):
+                health_ok = await strategy_adapter.health_check()
                 if health_ok:
                     return SystemHealthStatus.HEALTHY
                 else:
                     return SystemHealthStatus.CRITICAL
 
             # 检查连接状态
-            if hasattr(self._strategy_adapter, '_is_connected') and not self._strategy_adapter._is_connected:
+            if hasattr(strategy_adapter, '_is_connected') and not strategy_adapter._is_connected:
                 return SystemHealthStatus.CRITICAL
 
             return SystemHealthStatus.HEALTHY
@@ -633,19 +643,22 @@ class SystemMonitor:
     async def _check_portfolio_adapter_health(self) -> SystemHealthStatus:
         """检查组合适配器健康状态"""
         try:
-            if self._portfolio_adapter is None:
+            portfolio_adapter = self._portfolio_adapter
+            if portfolio_adapter is None and self._system_coordinator is not None:
+                portfolio_adapter = getattr(self._system_coordinator, '_portfolio_adapter', None)
+            if portfolio_adapter is None:
                 return SystemHealthStatus.WARNING  # 组合适配器可能是可选的
 
             # 检查适配器连接状态
-            if hasattr(self._portfolio_adapter, 'health_check'):
-                health_ok = await self._portfolio_adapter.health_check()
+            if hasattr(portfolio_adapter, 'health_check'):
+                health_ok = await portfolio_adapter.health_check()
                 if health_ok:
                     return SystemHealthStatus.HEALTHY
                 else:
                     return SystemHealthStatus.DEGRADED
 
             # 检查连接状态
-            if hasattr(self._portfolio_adapter, '_is_connected') and not self._portfolio_adapter._is_connected:
+            if hasattr(portfolio_adapter, '_is_connected') and not portfolio_adapter._is_connected:
                 return SystemHealthStatus.DEGRADED
 
             return SystemHealthStatus.HEALTHY
@@ -657,19 +670,22 @@ class SystemMonitor:
     async def _check_macro_adapter_health(self) -> SystemHealthStatus:
         """检查宏观适配器健康状态"""
         try:
-            if self._macro_adapter is None:
+            macro_adapter = self._macro_adapter
+            if macro_adapter is None and self._system_coordinator is not None:
+                macro_adapter = getattr(self._system_coordinator, '_macro_adapter', None)
+            if macro_adapter is None:
                 return SystemHealthStatus.WARNING  # 宏观适配器可能是可选的
 
             # 检查适配器连接状态
-            if hasattr(self._macro_adapter, 'health_check'):
-                health_ok = await self._macro_adapter.health_check()
+            if hasattr(macro_adapter, 'health_check'):
+                health_ok = await macro_adapter.health_check()
                 if health_ok:
                     return SystemHealthStatus.HEALTHY
                 else:
                     return SystemHealthStatus.DEGRADED
 
             # 检查连接状态
-            if hasattr(self._macro_adapter, '_is_connected') and not self._macro_adapter._is_connected:
+            if hasattr(macro_adapter, '_is_connected') and not macro_adapter._is_connected:
                 return SystemHealthStatus.DEGRADED
 
             return SystemHealthStatus.HEALTHY
@@ -694,6 +710,8 @@ class SystemMonitor:
         # 如果有任何组件处于警告状态，整体状态为警告
         elif any(status == SystemHealthStatus.WARNING for status in component_statuses):
             self._current_system_status.overall_health = SystemHealthStatus.WARNING
+        elif any(status == SystemHealthStatus.DEGRADED for status in component_statuses):
+            self._current_system_status.overall_health = SystemHealthStatus.DEGRADED
         # 否则整体状态为健康
         else:
             self._current_system_status.overall_health = SystemHealthStatus.HEALTHY

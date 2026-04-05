@@ -1,14 +1,4 @@
-import sys
-from pathlib import Path
-
 import asyncio
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-EXTERNAL_ASYNCRON = PROJECT_ROOT / "external" / "asyncron"
-EXTERNAL_ECONDB = PROJECT_ROOT / "external" / "econdb"
-for path in (EXTERNAL_ASYNCRON, EXTERNAL_ECONDB, PROJECT_ROOT):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
 
 from task_orchestrator import TaskOrchestrator
 
@@ -26,7 +16,7 @@ async def _test_stock_basic_success_triggers_daily_jobs():
     async def fake_claim(key):
         return True
 
-    async def fake_create_task_job(service, job_type, params=None, metadata=None, service_payload=None):
+    async def fake_create_task_job(service, job_type, params=None, metadata=None, service_payload=None, lineage_context=None):
         created.append((service, job_type, params or {}, metadata or {}))
         return {"id": f"{job_type}-task"}
 
@@ -63,7 +53,7 @@ async def _test_stock_basic_bootstrap_task_does_not_trigger_daily_jobs():
     orchestrator = TaskOrchestrator(app={})
     created = []
 
-    async def fake_create_task_job(service, job_type, params=None, metadata=None, service_payload=None):
+    async def fake_create_task_job(service, job_type, params=None, metadata=None, service_payload=None, lineage_context=None):
         created.append(job_type)
         return {"id": f"{job_type}-task"}
 

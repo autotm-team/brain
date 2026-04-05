@@ -26,13 +26,3 @@ def setup_health_routes(app: web.Application, cors: CorsConfig = None):
     route = app.router.add_get('/health', health_handler.health_check)
     if cors:
         cors.add(route)
-    
-    # 详细状态信息
-    route = app.router.add_get('/api/v1/status', health_handler.detailed_status)
-    if cors:
-        cors.add(route)
-    
-    # API信息
-    route = app.router.add_get('/api/v1/info', health_handler.api_info)
-    if cors:
-        cors.add(route)

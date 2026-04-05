@@ -49,7 +49,7 @@ class ServiceRegistry:
                 'name': 'portfolio',
                 'url': self.config.service.portfolio_service_url,
                 'health_endpoint': '/api/v1/health',
-                'api_prefix': '/api/v1/portfolio',
+                'api_prefix': '/api/v1/portfolios',
                 'status': 'unknown',
                 'last_check': None,
                 'error_count': 0

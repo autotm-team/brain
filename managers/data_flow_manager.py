@@ -160,6 +160,8 @@ class DataFlowManager(IDataFlowManager):
         try:
             if not self._is_running:
                 raise DataFlowException("DataFlowManager is not running")
+            if self._pipeline_status.status == "paused":
+                return self._pipeline_status
 
             logger.debug("Orchestrating data pipeline...")
 
@@ -177,15 +179,17 @@ class DataFlowManager(IDataFlowManager):
 
             # 更新管道状态
             with self._flow_lock:
+                previous_update_time = self._pipeline_status.last_update_time
                 self._pipeline_status.data_quality_score = quality_report.get('overall_score', 0.0)
                 self._pipeline_status.cache_hit_rate = self._cache_manager.get_hit_rate()
-                self._pipeline_status.last_update_time = datetime.now()
+                current_time = datetime.now()
 
                 # 计算吞吐量和延迟
                 if self._flow_statistics['total_requests'] > 0:
+                    elapsed = max((current_time - previous_update_time).total_seconds(), 1.0)
                     self._pipeline_status.throughput = (
                         self._flow_statistics['successful_requests'] /
-                        (datetime.now() - self._pipeline_status.last_update_time).total_seconds()
+                        elapsed
                     )
                     self._pipeline_status.latency = self._flow_statistics['average_latency']
                     self._pipeline_status.error_rate = (
@@ -200,6 +204,7 @@ class DataFlowManager(IDataFlowManager):
                     self._pipeline_status.status = 'degraded'
                 else:
                     self._pipeline_status.status = 'warning'
+                self._pipeline_status.last_update_time = current_time
 
             logger.debug("Data pipeline orchestration completed")
             return self._pipeline_status
@@ -376,6 +381,155 @@ class DataFlowManager(IDataFlowManager):
     async def get_cache_statistics(self) -> Dict[str, Any]:
         """获取缓存统计（异步接口以兼容调用方）"""
         return self._cache_manager.get_statistics()
+
+    async def collect_performance_metrics(self) -> Dict[str, Any]:
+        """兼容 HTTP 层的性能指标收集入口。"""
+        status = await self.orchestrate_data_pipeline()
+        return {
+            'pipeline': {
+                'pipeline_id': status.pipeline_id,
+                'status': status.status,
+                'throughput': status.throughput,
+                'latency': status.latency,
+                'error_rate': status.error_rate,
+                'cache_hit_rate': status.cache_hit_rate,
+                'data_quality_score': status.data_quality_score,
+                'active_connections': status.active_connections,
+                'processed_records': status.processed_records,
+                'failed_records': status.failed_records,
+                'last_update_time': status.last_update_time.isoformat(),
+            },
+            'flow_statistics': self.get_flow_statistics(),
+        }
+
+    async def clear_cache(self) -> Dict[str, Any]:
+        """兼容 HTTP 层的缓存清理入口。"""
+        cleared = await self._cache_manager.clear()
+        return {
+            'cleared': bool(cleared),
+            'cache_statistics': await self.get_cache_statistics(),
+        }
+
+    async def trigger_data_sync(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """触发一次数据同步与状态刷新。"""
+        payload = payload if isinstance(payload, dict) else {}
+        targets = payload.get('sources') if isinstance(payload.get('sources'), list) else []
+        now = datetime.now()
+
+        with self._flow_lock:
+            if targets:
+                for source in targets:
+                    if source in self._data_sources:
+                        self._data_sources[source]['status'] = 'active'
+                        self._data_sources[source]['last_update'] = now
+            else:
+                for source_info in self._data_sources.values():
+                    source_info['status'] = 'active'
+                    source_info['last_update'] = now
+
+        status = await self.orchestrate_data_pipeline()
+        return {
+            'triggered': True,
+            'targets': targets or list(self._data_sources.keys()),
+            'status': status.status,
+            'last_update_time': status.last_update_time.isoformat(),
+        }
+
+    async def list_dataflows(self) -> List[Dict[str, Any]]:
+        """返回 Brain 当前维护的数据流视图。"""
+        items = []
+        with self._flow_lock:
+            items.append(
+                {
+                    'flow_id': 'pipeline',
+                    'type': 'pipeline',
+                    'status': self._pipeline_status.status,
+                    'data_sources': list(self._pipeline_status.data_sources),
+                    'last_update_time': self._pipeline_status.last_update_time.isoformat(),
+                }
+            )
+            for source_name, source_info in self._data_sources.items():
+                last_update = source_info.get('last_update')
+                items.append(
+                    {
+                        'flow_id': source_name,
+                        'type': 'source',
+                        'status': source_info.get('status', 'unknown'),
+                        'health_score': source_info.get('health_score', 0.0),
+                        'connection_count': source_info.get('connection_count', 0),
+                        'last_update_time': last_update.isoformat() if hasattr(last_update, 'isoformat') else None,
+                    }
+                )
+        return items
+
+    async def control_dataflow(self, flow_id: Optional[str], action: Optional[str]) -> Dict[str, Any]:
+        """执行最小可用的数据流控制动作。"""
+        flow_id = str(flow_id or '').strip()
+        action = str(action or '').strip().lower()
+        if not flow_id:
+            raise DataFlowException("Missing flow_id")
+        if action not in {'pause', 'resume', 'start', 'stop', 'enable', 'disable', 'sync'}:
+            raise DataFlowException(f"Unsupported dataflow action: {action}")
+
+        if flow_id in {'pipeline', self._pipeline_status.pipeline_id}:
+            if action == 'pause':
+                self._pipeline_status.status = 'paused'
+            elif action == 'resume':
+                self._pipeline_status.status = 'running'
+            elif action == 'start':
+                await self.start()
+            elif action == 'stop':
+                await self.stop()
+            elif action == 'sync':
+                return await self.trigger_data_sync({})
+            else:
+                raise DataFlowException(f"Action '{action}' is not supported for pipeline")
+            self._pipeline_status.last_update_time = datetime.now()
+            return {
+                'flow_id': flow_id,
+                'action': action,
+                'status': self._pipeline_status.status,
+            }
+
+        if flow_id not in self._data_sources:
+            raise DataFlowException(f"Unknown dataflow: {flow_id}")
+
+        if action in {'enable', 'start', 'resume', 'sync'}:
+            self._data_sources[flow_id]['status'] = 'active'
+            self._data_sources[flow_id]['last_update'] = datetime.now()
+            if action == 'sync':
+                return await self.trigger_data_sync({'sources': [flow_id]})
+        elif action in {'disable', 'stop', 'pause'}:
+            self._data_sources[flow_id]['status'] = 'inactive'
+
+        return {
+            'flow_id': flow_id,
+            'action': action,
+            'status': self._data_sources[flow_id]['status'],
+        }
+
+    async def delete_dataflow(self, flow_id: Optional[str]) -> Dict[str, Any]:
+        """删除一个非核心数据源流。"""
+        flow_id = str(flow_id or '').strip()
+        if not flow_id:
+            raise DataFlowException("Missing flow_id")
+        if flow_id in {'pipeline', self._pipeline_status.pipeline_id}:
+            raise DataFlowException("Pipeline flow cannot be deleted")
+        if flow_id not in self._data_sources:
+            raise DataFlowException(f"Unknown dataflow: {flow_id}")
+
+        with self._flow_lock:
+            self._data_sources.pop(flow_id, None)
+            self._data_dependencies.pop(flow_id, None)
+            for deps in self._data_dependencies.values():
+                deps.discard(flow_id)
+            self._pipeline_status.data_sources = list(self._data_sources.keys())
+
+        return {
+            'flow_id': flow_id,
+            'deleted': True,
+            'remaining': list(self._data_sources.keys()),
+        }
 
 
     def get_flow_statistics(self) -> Dict[str, Any]:

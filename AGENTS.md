@@ -18,12 +18,18 @@
 - Language: Python 3, use 4-space indentation and PEP 8 naming.
 - Formatters/linters: Black, Flake8, and mypy are listed in `requirements.txt`.
 - Tests follow `test_*.py` naming; fixtures live in `tests/conftest.py`.
+- Do not add placeholder success handlers. If an endpoint is unsupported, return an explicit `501/NOT_IMPLEMENTED`.
+- Keep handlers thin: parse request, call one service/mixin/application layer entry, return response.
+- Do not use runtime `sys.path` patching to reach local dependencies; rely on installed packages or explicit test bootstrapping.
+- Do not add single files above roughly 2000 lines to active request paths.
 
 ## Testing Guidelines
 - Frameworks: pytest + pytest-asyncio.
 - Unit tests in `tests/unit/`; integration tests at `tests/test_*`.
 - Prefer descriptive test names that reflect behavior, e.g., `test_strategy_integration.py`.
 - Run a focused test: `pytest tests/unit/test_<name>.py`.
+- Keep async tests runnable even in lightweight local environments by using the shared `tests/conftest.py` bootstrap instead of per-file import hacks.
+- Add smoke coverage for route registration or app creation when changing startup wiring.
 
 ## Commit & Pull Request Guidelines
 - Commit messages in history use scoped prefixes like `feat:`, `test:`, `docker:`, `external:`, `readme:`, `init:`, `ignore:`.

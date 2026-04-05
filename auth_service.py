@@ -10,9 +10,7 @@ import json
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 import secrets
-import sys
 import uuid
 from typing import Any, Dict, Optional
 
@@ -21,18 +19,20 @@ try:
 except ImportError:
     bcrypt = None
 
-
-PROJECT_ROOT = Path(__file__).resolve().parent
-ECONDB_PATH = PROJECT_ROOT / "external" / "econdb"
-if ECONDB_PATH.exists() and str(ECONDB_PATH) not in sys.path:
-    sys.path.insert(0, str(ECONDB_PATH))
-
-from econdb import (  # type: ignore
-    UISystemDataAPI,
-    SystemAuditDTO,
-    SystemAuthSessionDTO,
-    create_database_manager,
-)
+_ECONDB_IMPORT_ERROR: Exception | None = None
+try:
+    from econdb import (  # type: ignore
+        UISystemDataAPI,
+        SystemAuditDTO,
+        SystemAuthSessionDTO,
+        create_database_manager,
+    )
+except Exception as exc:  # pragma: no cover - surfaced only in misconfigured runtime
+    UISystemDataAPI = None  # type: ignore[assignment]
+    SystemAuditDTO = None  # type: ignore[assignment]
+    SystemAuthSessionDTO = None  # type: ignore[assignment]
+    create_database_manager = None  # type: ignore[assignment]
+    _ECONDB_IMPORT_ERROR = exc
 
 
 class AuthError(RuntimeError):
@@ -57,6 +57,10 @@ class AuthService:
     """Auth service backed by econdb + optional Redis revocation index."""
 
     def __init__(self, config, redis_client=None):
+        if UISystemDataAPI is None or SystemAuditDTO is None or SystemAuthSessionDTO is None or create_database_manager is None:
+            raise RuntimeError(
+                "econdb runtime dependencies are unavailable; install service dependencies before using AuthService"
+            ) from _ECONDB_IMPORT_ERROR
         self._config = config
         self._redis = redis_client
         self._db_manager = create_database_manager()

@@ -25,6 +25,7 @@ class EventType(Enum):
 class SystemHealthStatus(Enum):
     """系统健康状态枚举"""
     HEALTHY = "healthy"
+    DEGRADED = "degraded"
     WARNING = "warning"
     CRITICAL = "critical"
     OFFLINE = "offline"
@@ -104,6 +105,11 @@ class AnalysisCycleResult:
         """检查是否完成"""
         return self.status == "completed" and self.end_time is not None
 
+    @property
+    def success(self) -> bool:
+        """兼容旧调用方：completed 视为成功。"""
+        return self.status == "completed"
+
 
 @dataclass
 class ValidationResult:
@@ -171,9 +177,16 @@ class ResourceAllocation:
     network_allocation: Dict[str, float]  # 各组件网络带宽分配
     storage_allocation: Dict[str, float]  # 各组件存储分配
     priority_weights: Dict[str, float]  # 优先级权重
+    strategy: str = "balanced"
+    is_active: bool = True
     allocation_time: datetime = field(default_factory=datetime.now)
     effectiveness_score: float = 0.0  # 分配效果评分
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def created_time(self) -> datetime:
+        """兼容旧调用方的别名。"""
+        return self.allocation_time
 
 
 @dataclass

@@ -1,29 +1,6 @@
 import json
 import logging
-import sys
-from pathlib import Path
 from types import SimpleNamespace
-import types
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-EXTERNAL_ASYNCRON = PROJECT_ROOT / "external" / "asyncron"
-EXTERNAL_ECONDB = PROJECT_ROOT / "external" / "econdb"
-for path in (EXTERNAL_ASYNCRON, EXTERNAL_ECONDB, PROJECT_ROOT):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
-
-if "tushare" not in sys.modules:
-    tushare_stub = types.ModuleType("tushare")
-    tushare_stub.pro_api = lambda *args, **kwargs: None
-    sys.modules["tushare"] = tushare_stub
-
-import econdb as _econdb  # type: ignore
-
-if not hasattr(_econdb, "TaskRuntimeDataAPI"):
-    class _TaskRuntimeDataAPI:  # pragma: no cover - import shim
-        pass
-
-    _econdb.TaskRuntimeDataAPI = _TaskRuntimeDataAPI  # type: ignore[attr-defined]
 
 from handlers.auth import AuthHandler
 

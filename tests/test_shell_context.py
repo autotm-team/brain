@@ -1,16 +1,7 @@
 import json
 import logging
-import sys
-from pathlib import Path
 
 import pytest
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-EXTERNAL_ASYNCRON = PROJECT_ROOT / "external" / "asyncron"
-EXTERNAL_ECONDB = PROJECT_ROOT / "external" / "econdb"
-for path in (EXTERNAL_ASYNCRON, EXTERNAL_ECONDB, PROJECT_ROOT):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
 
 from handlers.ui_bff import UIBffHandler
 
