@@ -11,8 +11,6 @@ import time
 from datetime import datetime
 from typing import Dict, List, Any, Optional
 
-from asyncron import request_envelope
-
 from interfaces import ISystemAdapter
 from config import IntegrationConfig
 from exceptions import AdapterException, ConnectionException, HealthCheckException
@@ -195,62 +193,11 @@ class StrategyAdapter(ISystemAdapter):
         Returns:
             Any: 响应结果
         """
-        if not self._is_connected:
-            raise AdapterException("StrategyAdapter", "Not connected to strategy system")
-
-        if not self._http_client:
-            raise AdapterException("StrategyAdapter", "HTTP client not initialized")
-
-        start_time = datetime.now()
-        retry_count = 0
-        max_retries = self._strategy_system_config['max_retries']
-
-        while retry_count <= max_retries:
-            try:
-                self._request_statistics['total_requests'] += 1
-
-                # 使用请求映射器转换请求格式
-                mapped_request = self._request_mapper.map_strategy_analysis_request(request)
-
-                response = await self._http_client.post(
-                    '/api/v1/jobs',
-                    request_envelope(
-                        {
-                            'job_type': 'batch_analyze',
-                            'params': mapped_request,
-                        }
-                    ),
-                )
-
-                # 如果是异步任务，等待 Job 完成后再处理结果
-                job_id = self._extract_job_id(response)
-                if job_id:
-                    job = await self._wait_for_job_completion(job_id, timeout=1800)
-                    execution_payload = self._build_analysis_payload(job.get('result'))
-                    processed_response = await self.handle_response({
-                        'success': True,
-                        'data': execution_payload
-                    })
-                else:
-                    processed_response = await self.handle_response(response)
-
-                # 更新统计
-                response_time = (datetime.now() - start_time).total_seconds()
-                self._update_request_statistics(True, response_time)
-
-                logger.debug(f"Strategy request completed successfully, response time: {response_time:.3f}s")
-                return processed_response
-
-            except Exception as e:
-                retry_count += 1
-                if retry_count > max_retries:
-                    self._update_request_statistics(False, 0)
-                    logger.error(f"Strategy request failed after {max_retries} retries: {e}")
-                    raise AdapterException("StrategyAdapter", f"Request failed: {e}")
-
-                # 等待重试
-                await asyncio.sleep(self._strategy_system_config['retry_delay'] * retry_count)
-                logger.warning(f"Strategy request failed, retrying ({retry_count}/{max_retries}): {e}")
+        raise AdapterException(
+            "StrategyAdapter",
+            "Brain control plane must create execution jobs via TaskOrchestrator.create_task_job(...); "
+            "direct strategy job submission is disabled",
+        )
 
     async def handle_response(self, response: Any) -> Any:
         """处理响应
@@ -312,6 +259,41 @@ class StrategyAdapter(ISystemAdapter):
                 (current_avg * (total_successful - 1) + response_time) / total_successful
             )
 
+    def build_strategy_analysis_params(
+        self,
+        portfolio_instruction: Dict[str, Any],
+        symbols: List[str],
+        callback_url: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        request = {
+            "portfolio_instruction": portfolio_instruction,
+            "symbols": symbols,
+        }
+        if callback_url:
+            request["callback_url"] = callback_url
+        return self._request_mapper.map_strategy_analysis_request(request)
+
+    def build_backtest_validation_params(
+        self,
+        symbols: List[str],
+        strategy_config: Dict[str, Any],
+        callback_url: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        request = {
+            "symbols": symbols,
+            "strategy_config": strategy_config,
+        }
+        if callback_url:
+            request["callback_url"] = callback_url
+        return self._request_mapper.map_backtest_request(request)
+
+    async def normalize_analysis_job_result(self, job_result: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        execution_payload = self._build_analysis_payload(job_result)
+        return await self.handle_response({"success": True, "data": execution_payload})
+
+    def normalize_backtest_job_result(self, job_result: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        return self._request_mapper.map_backtest_response({"success": True, "data": job_result or {}})
+
     # 主要业务方法
     async def request_strategy_analysis(self, portfolio_instruction: Dict[str, Any],
                                       symbols: List[str], callback_url: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -357,47 +339,11 @@ class StrategyAdapter(ISystemAdapter):
         Returns:
             Dict[str, Any]: 回测验证结果
         """
-        try:
-            if not self._http_client:
-                raise AdapterException("StrategyAdapter", "HTTP client not initialized")
-
-            # 构造回测请求
-            backtest_request_payload = {
-                'symbols': symbols,
-                'strategy_config': strategy_config
-            }
-            if callback_url:
-                backtest_request_payload['callback_url'] = callback_url
-            backtest_request = self._request_mapper.map_backtest_request(backtest_request_payload)
-
-            response = await self._http_client.post(
-                '/api/v1/jobs',
-                request_envelope(
-                    {
-                        'job_type': 'run_backtest',
-                        'params': backtest_request,
-                    }
-                ),
-            )
-
-            job_id = self._extract_job_id(response)
-            if job_id:
-                job = await self._wait_for_job_completion(job_id, timeout=1800)
-                result = {
-                    'success': True,
-                    'data': job.get('result', {})
-                }
-            else:
-                result = response
-
-            mapped_result = self._request_mapper.map_backtest_response(result)
-
-            logger.info(f"Backtest validation completed for {len(symbols)} symbols")
-            return mapped_result
-
-        except Exception as e:
-            logger.error(f"Backtest validation request failed: {e}")
-            raise AdapterException("StrategyAdapter", f"Backtest validation failed: {e}")
+        raise AdapterException(
+            "StrategyAdapter",
+            "Brain control plane must create execution jobs via TaskOrchestrator.create_task_job(...); "
+            "direct backtest job submission is disabled",
+        )
 
     async def request_realtime_validation(self, pool_config: Dict[str, Any]) -> Dict[str, Any]:
         """请求实时验证

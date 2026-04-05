@@ -17,7 +17,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from asyncron import request_envelope
 
 try:
     from ..config import IntegrationConfig
@@ -259,17 +258,7 @@ class DataInitializationCoordinator:
                 service_job_id,
             )
             return service_job_id or task_job_id
-        resp = await adapter.send_request({
-            "method": "POST",
-            "endpoint": "/api/v1/jobs",
-            "payload": request_envelope({
-                "job_type": job_type,
-                "params": dict(params or {}),
-            }),
-        })
-        service_job_id = str(resp.get("job_id") or "")
-        await self._ensure_task_job_mapping(job_type, params, service_job_id)
-        return service_job_id
+        raise RuntimeError("TaskOrchestrator is required for bootstrap flowhub jobs; direct service job submission is disabled")
 
     async def _ensure_task_job_mapping(
         self,

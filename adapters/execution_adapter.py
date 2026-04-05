@@ -9,7 +9,6 @@ import logging
 import time
 from typing import Dict, Any, List, Optional
 
-from asyncron import request_envelope
 from config import IntegrationConfig
 from adapters.http_client import HttpClient
 
@@ -18,6 +17,13 @@ logger = logging.getLogger(__name__)
 
 class ExecutionAdapter:
     """Execution服务适配器"""
+
+    @staticmethod
+    def _raise_control_plane_submission_disabled(job_type: str) -> None:
+        raise RuntimeError(
+            "Brain control plane must create execution jobs via "
+            f"TaskOrchestrator.create_task_job(...); direct execution submission is disabled for {job_type}"
+        )
 
     def __init__(self, config: IntegrationConfig):
         """初始化适配器
@@ -54,40 +60,7 @@ class ExecutionAdapter:
         Raises:
             Exception: 调用失败时抛出异常
         """
-        try:
-            symbols = analysis_params.get('symbols', None)
-            analyzers = analysis_params.get('analyzers', ['all'])
-            config = analysis_params.get('config', {})
-
-            # 构建请求体
-            request_body = {
-                'analyzers': analyzers,
-                'config': config
-            }
-
-            # 只有在明确提供symbols时才添加到请求体中
-            if symbols is not None:
-                request_body['symbols'] = symbols
-                logger.info(f"Triggering batch analysis for {len(symbols)} symbols with analyzers: {analyzers}")
-            else:
-                logger.info(f"Triggering batch analysis for ALL stocks with analyzers: {analyzers}")
-
-            response = await self._http_client.post(
-                '/api/v1/jobs',
-                request_envelope(
-                    {
-                        'job_type': 'batch_analyze',
-                        'params': request_body,
-                    }
-                ),
-            )
-
-            logger.info(f"Batch analysis triggered successfully: {response}")
-            return response.get('data', {})
-
-        except Exception as e:
-            logger.error(f"Failed to trigger batch analysis: {e}")
-            raise
+        self._raise_control_plane_submission_disabled("batch_analyze")
 
     async def get_job_status(self, job_id: str) -> Dict[str, Any]:
         """获取执行任务状态（统一Job接口）"""
@@ -112,15 +85,7 @@ class ExecutionAdapter:
 
     async def submit_ui_job(self, job_type: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """提交 execution UI 任务（统一 jobs 契约）。"""
-        payload = request_envelope({
-            "job_type": job_type,
-            "params": params if isinstance(params, dict) else {},
-        })
-        response = await self._http_client.post("/api/v1/jobs", payload)
-        data = response.get("data") if isinstance(response, dict) and isinstance(response.get("data"), dict) else response
-        if not isinstance(data, dict):
-            data = {}
-        return data
+        self._raise_control_plane_submission_disabled(job_type)
 
     async def sync_candidates_from_analysis(self, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """触发“分析结果 -> 候选池”同步任务。"""

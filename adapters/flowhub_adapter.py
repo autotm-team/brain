@@ -99,13 +99,13 @@ class FlowhubAdapter(ISystemAdapter):
         })
 
     async def list_tasks(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
-        raise AdapterException("FlowhubAdapter", "Flowhub task schedules were removed; use brain /api/v1/schedules")
+        raise AdapterException("FlowhubAdapter", "Flowhub task schedules were removed; use brain /api/v1/ui/system/schedules")
 
     async def create_task(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        raise AdapterException("FlowhubAdapter", "Flowhub task schedules were removed; use brain /api/v1/schedules")
+        raise AdapterException("FlowhubAdapter", "Flowhub task schedules were removed; use brain /api/v1/ui/system/schedules")
 
     async def run_task(self, task_id: str) -> Dict[str, Any]:
-        raise AdapterException("FlowhubAdapter", "Flowhub task schedules were removed; use brain /api/v1/schedules/{id}/trigger")
+        raise AdapterException("FlowhubAdapter", "Flowhub task schedules were removed; use brain /api/v1/ui/system/schedules/{id}/trigger")
 
     async def ensure_task(
         self,
@@ -117,7 +117,7 @@ class FlowhubAdapter(ISystemAdapter):
         enabled: Optional[bool] = None,
         allow_overlap: Optional[bool] = None,
     ) -> Dict[str, Any]:
-        raise AdapterException("FlowhubAdapter", "Flowhub task schedules were removed; use brain /api/v1/schedules")
+        raise AdapterException("FlowhubAdapter", "Flowhub task schedules were removed; use brain /api/v1/ui/system/schedules")
 
     async def connect_to_system(self) -> bool:
         """连接到Flowhub数据抓取服务
@@ -207,32 +207,11 @@ class FlowhubAdapter(ISystemAdapter):
         Returns:
             Dict[str, Any]: 任务创建结果
         """
-        try:
-            await self._ensure_http_client()
-
-            # 映射请求格式
-            flowhub_request = self._request_mapper.map_batch_stock_data_request(request)
-            logger.info(f"Creating batch stock data job with request: {flowhub_request}")
-
-            # 发送统一任务创建请求
-            response = await self._http_client.post('/api/v1/jobs', data=self._job_request('batch_daily_ohlc', flowhub_request))
-            response_data = self._unwrap_data(response) if isinstance(response, dict) else {}
-
-            # 映射响应格式
-            mapped_response = self._request_mapper.map_job_response(response_data or {}, 'batch_stock_data')
-
-            # 更新统计
-            self._request_statistics['total_requests'] += 1
-            self._request_statistics['successful_requests'] += 1
-
-            logger.info(f"Batch stock data job created successfully: {mapped_response['job_id']}")
-            return mapped_response
-
-        except Exception as e:
-            self._request_statistics['total_requests'] += 1
-            self._request_statistics['failed_requests'] += 1
-            logger.error(f"Failed to create batch stock data job: {e}")
-            raise AdapterException("FlowhubAdapter", f"Batch stock data job creation failed: {e}")
+        raise AdapterException(
+            "FlowhubAdapter",
+            "Brain control plane must create flowhub jobs via TaskOrchestrator.create_task_job(...); "
+            "direct flowhub job submission is disabled",
+        )
 
     async def create_batch_basic_data_job(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """创建批量基础数据抓取任务
@@ -243,32 +222,11 @@ class FlowhubAdapter(ISystemAdapter):
         Returns:
             Dict[str, Any]: 任务创建结果
         """
-        try:
-            await self._ensure_http_client()
-
-            # 映射请求格式
-            flowhub_request = self._request_mapper.map_batch_basic_data_request(request)
-            logger.info(f"Creating batch basic data job with request: {flowhub_request}")
-
-            # 发送统一任务创建请求
-            response = await self._http_client.post('/api/v1/jobs', data=self._job_request('batch_daily_basic', flowhub_request))
-            response_data = self._unwrap_data(response) if isinstance(response, dict) else {}
-
-            # 映射响应格式
-            mapped_response = self._request_mapper.map_job_response(response_data or {}, 'batch_basic_data')
-
-            # 更新统计
-            self._request_statistics['total_requests'] += 1
-            self._request_statistics['successful_requests'] += 1
-
-            logger.info(f"Batch basic data job created successfully: {mapped_response['job_id']}")
-            return mapped_response
-
-        except Exception as e:
-            self._request_statistics['total_requests'] += 1
-            self._request_statistics['failed_requests'] += 1
-            logger.error(f"Failed to create batch basic data job: {e}")
-            raise AdapterException("FlowhubAdapter", f"Batch basic data job creation failed: {e}")
+        raise AdapterException(
+            "FlowhubAdapter",
+            "Brain control plane must create flowhub jobs via TaskOrchestrator.create_task_job(...); "
+            "direct flowhub job submission is disabled",
+        )
 
     async def get_job_status(self, job_id: str) -> Dict[str, Any]:
         """获取任务执行状态
@@ -537,6 +495,12 @@ class FlowhubAdapter(ISystemAdapter):
         if method == 'GET':
             return await self._http_client.get(endpoint, params=payload)
         if method == 'POST':
+            if endpoint == '/api/v1/jobs':
+                raise AdapterException(
+                    "FlowhubAdapter",
+                    "Brain control plane must create flowhub jobs via TaskOrchestrator.create_task_job(...); "
+                    "direct flowhub job submission is disabled",
+                )
             resp = await self._http_client.post(endpoint, data=payload)
             data = self._unwrap_data(resp)
             return data if isinstance(data, dict) else resp
@@ -577,47 +541,11 @@ class FlowhubAdapter(ISystemAdapter):
         Returns:
             Dict[str, Any]: 任务创建结果
         """
-        try:
-            # 构建请求参数
-            params = {
-                'update_mode': update_mode
-            }
-
-            # 添加数据类型特定参数
-            if 'symbols' in kwargs:
-                params['symbols'] = kwargs['symbols']
-            if 'index_code' in kwargs:
-                # 单个指数代码转换为列表
-                params['index_codes'] = [kwargs['index_code']]
-            if 'index_codes' in kwargs:
-                params['index_codes'] = kwargs['index_codes']
-            if 'start_date' in kwargs:
-                params['start_date'] = kwargs['start_date']
-            if 'end_date' in kwargs:
-                params['end_date'] = kwargs['end_date']
-            if 'trade_date' in kwargs:
-                params['trade_date'] = kwargs['trade_date']
-
-            normalized_type = self._normalize_data_type(data_type)
-            if normalized_type not in {'adj_factors', 'index_components'}:
-                raise ValueError(f"Unsupported portfolio data type: {data_type}")
-
-            await self._ensure_http_client()
-            response = await self._http_client.post('/api/v1/jobs', data=self._job_request(normalized_type, params))
-            response_data = self._unwrap_data(response) if isinstance(response, dict) else {}
-
-            # 更新统计信息
-            self._request_statistics['total_requests'] += 1
-            self._request_statistics['successful_requests'] += 1
-
-            logger.info(f"Portfolio data job created for {data_type}: {(response_data or {}).get('job_id')}")
-            return response_data if isinstance(response_data, dict) else {}
-
-        except Exception as e:
-            self._request_statistics['total_requests'] += 1
-            self._request_statistics['failed_requests'] += 1
-            logger.error(f"Failed to create portfolio data job for {data_type}: {e}")
-            raise AdapterException("FlowhubAdapter", f"Portfolio data job creation failed for {data_type}: {e}")
+        raise AdapterException(
+            "FlowhubAdapter",
+            "Brain control plane must create flowhub jobs via TaskOrchestrator.create_task_job(...); "
+            f"direct flowhub job submission is disabled for {data_type}",
+        )
 
     # ==================== 市场数据任务创建方法 ====================
 
@@ -635,40 +563,11 @@ class FlowhubAdapter(ISystemAdapter):
         Returns:
             Dict[str, Any]: 任务创建结果
         """
-        try:
-            # 构建请求参数
-            params = {
-                'update_mode': update_mode
-            }
-
-            # 默认主要指数
-            if index_codes is None:
-                index_codes = ['000001.SH', '399001.SZ', '000300.SH', '399006.SZ', '000016.SH', '399005.SZ']
-
-            params['index_codes'] = index_codes
-
-            if start_date:
-                params['start_date'] = start_date
-            if end_date:
-                params['end_date'] = end_date
-
-            # 发送请求
-            await self._ensure_http_client()
-            response = await self._http_client.post('/api/v1/jobs', data=self._job_request('index_daily_data', params))
-            response_data = self._unwrap_data(response) if isinstance(response, dict) else {}
-
-            # 更新统计信息
-            self._request_statistics['total_requests'] += 1
-            self._request_statistics['successful_requests'] += 1
-
-            logger.info(f"Index daily data job created: {(response_data or {}).get('job_id')}")
-            return response_data if isinstance(response_data, dict) else {}
-
-        except Exception as e:
-            self._request_statistics['total_requests'] += 1
-            self._request_statistics['failed_requests'] += 1
-            logger.error(f"Failed to create index daily data job: {e}")
-            raise AdapterException("FlowhubAdapter", f"Index daily data job creation failed: {e}")
+        raise AdapterException(
+            "FlowhubAdapter",
+            "Brain control plane must create flowhub jobs via TaskOrchestrator.create_task_job(...); "
+            "direct flowhub job submission is disabled for index_daily_data",
+        )
 
     async def create_industry_board_job(self, source: str = 'em',
                                        update_mode: str = 'incremental') -> Dict[str, Any]:
@@ -681,30 +580,11 @@ class FlowhubAdapter(ISystemAdapter):
         Returns:
             Dict[str, Any]: 任务创建结果
         """
-        try:
-            # 构建请求参数
-            params = {
-                'source': source,
-                'update_mode': update_mode
-            }
-
-            # 发送请求
-            await self._ensure_http_client()
-            response = await self._http_client.post('/api/v1/jobs', data=self._job_request('industry_board', params))
-            response_data = self._unwrap_data(response) if isinstance(response, dict) else {}
-
-            # 更新统计信息
-            self._request_statistics['total_requests'] += 1
-            self._request_statistics['successful_requests'] += 1
-
-            logger.info(f"Industry board job created: {(response_data or {}).get('job_id')}")
-            return response_data if isinstance(response_data, dict) else {}
-
-        except Exception as e:
-            self._request_statistics['total_requests'] += 1
-            self._request_statistics['failed_requests'] += 1
-            logger.error(f"Failed to create industry board job: {e}")
-            raise AdapterException("FlowhubAdapter", f"Industry board job creation failed: {e}")
+        raise AdapterException(
+            "FlowhubAdapter",
+            "Brain control plane must create flowhub jobs via TaskOrchestrator.create_task_job(...); "
+            "direct flowhub job submission is disabled for industry_board",
+        )
 
     async def create_concept_board_job(self, source: str = 'em',
                                       update_mode: str = 'incremental') -> Dict[str, Any]:
@@ -717,30 +597,11 @@ class FlowhubAdapter(ISystemAdapter):
         Returns:
             Dict[str, Any]: 任务创建结果
         """
-        try:
-            # 构建请求参数
-            params = {
-                'source': source,
-                'update_mode': update_mode
-            }
-
-            # 发送请求
-            await self._ensure_http_client()
-            response = await self._http_client.post('/api/v1/jobs', data=self._job_request('concept_board', params))
-            response_data = self._unwrap_data(response) if isinstance(response, dict) else {}
-
-            # 更新统计信息
-            self._request_statistics['total_requests'] += 1
-            self._request_statistics['successful_requests'] += 1
-
-            logger.info(f"Concept board job created: {(response_data or {}).get('job_id')}")
-            return response_data if isinstance(response_data, dict) else {}
-
-        except Exception as e:
-            self._request_statistics['total_requests'] += 1
-            self._request_statistics['failed_requests'] += 1
-            logger.error(f"Failed to create concept board job: {e}")
-            raise AdapterException("FlowhubAdapter", f"Concept board job creation failed: {e}")
+        raise AdapterException(
+            "FlowhubAdapter",
+            "Brain control plane must create flowhub jobs via TaskOrchestrator.create_task_job(...); "
+            "direct flowhub job submission is disabled for concept_board",
+        )
 
     # ==================== 宏观数据任务创建方法 ====================
 
@@ -759,45 +620,8 @@ class FlowhubAdapter(ISystemAdapter):
         Returns:
             Dict[str, Any]: 任务创建结果
         """
-        try:
-            await self._ensure_http_client()
-            # 构建请求参数 - 只包含 incremental 标志
-            normalized_type = self._normalize_data_type(data_type)
-            params = {
-                'incremental': incremental,
-            }
-
-            # 不再传递任何日期范围参数（start_date, end_date, start_quarter, end_quarter,
-            # start_month, end_month, start_year, end_year）
-            # 所有日期范围由 Flowhub 的 econdb_client 根据数据库状态和 MacroDataConfig 自动确定
-
-            # 添加数据类型特定参数（非日期参数）
-            if 'index_types' in kwargs:
-                params['index_types'] = kwargs['index_types']
-            if 'rate_types' in kwargs:
-                params['rate_types'] = kwargs['rate_types']
-            if 'index_codes' in kwargs:
-                params['index_codes'] = kwargs['index_codes']
-            if 'flow_types' in kwargs:
-                params['flow_types'] = kwargs['flow_types']
-            if 'commodity_types' in kwargs:
-                params['commodity_types'] = kwargs['commodity_types']
-            if 'indicators' in kwargs:
-                params['indicators'] = kwargs['indicators']
-
-            # 发送统一任务创建请求
-            response = await self._http_client.post('/api/v1/jobs', data=self._job_request(normalized_type, params))
-            response_data = self._unwrap_data(response) if isinstance(response, dict) else {}
-
-            # 更新统计信息
-            self._request_statistics['total_requests'] += 1
-            self._request_statistics['successful_requests'] += 1
-
-            logger.info(f"Macro data job created for {data_type}: {(response_data or {}).get('job_id')}")
-            return response_data if isinstance(response_data, dict) else {}
-
-        except Exception as e:
-            self._request_statistics['total_requests'] += 1
-            self._request_statistics['failed_requests'] += 1
-            logger.error(f"Failed to create macro data job for {data_type}: {e}")
-            raise AdapterException("FlowhubAdapter", f"Macro data job creation failed for {data_type}: {e}")
+        raise AdapterException(
+            "FlowhubAdapter",
+            "Brain control plane must create flowhub jobs via TaskOrchestrator.create_task_job(...); "
+            f"direct flowhub job submission is disabled for {data_type}",
+        )

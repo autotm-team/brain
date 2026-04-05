@@ -330,21 +330,24 @@ async def init_components(app: web.Application, config: IntegrationConfig):
                 return
             metadata = dict(schedule.get("metadata") or {})
             metadata["schedule_id"] = schedule_id
-            task_job_id = None
-            try:
-                created = await orchestrator.create_task_job(
-                    service=str(schedule.get("service") or ""),
-                    job_type=str(schedule.get("job_type") or ""),
-                    params=dict(schedule.get("params") or {}),
-                    metadata=metadata,
-                    lineage_context={
-                        "root_schedule_id": schedule_id,
-                        "trigger_kind": "schedule",
-                    },
-                )
-                task_job_id = created.get("id")
-            finally:
-                await scheduler.mark_triggered(schedule_id, task_job_id)
+            created = await orchestrator.create_task_job(
+                service=str(schedule.get("service") or ""),
+                job_type=str(schedule.get("job_type") or ""),
+                params=dict(schedule.get("params") or {}),
+                metadata=metadata,
+                lineage_context={
+                    "root_schedule_id": schedule_id,
+                    "trigger_kind": "schedule",
+                },
+            )
+            task_job_id = str(created.get("id") or "").strip()
+            if not task_job_id:
+                raise RuntimeError(f"schedule dispatch did not return task job id: {schedule_id}")
+            await scheduler.mark_triggered(
+                schedule_id,
+                task_job_id,
+                dispatch_token=str(payload.get("dispatch_token") or "").strip() or None,
+            )
 
         app['unified_scheduler'] = UnifiedScheduler(
             redis_client=app.get('redis'),
@@ -359,6 +362,10 @@ async def init_components(app: web.Application, config: IntegrationConfig):
         app['coordinator'] = await app['container'].resolve(ISystemCoordinator)
         app['signal_router'] = await app['container'].resolve(ISignalRouter)
         app['data_flow_manager'] = await app['container'].resolve(IDataFlowManager)
+        if hasattr(app['coordinator'], 'set_task_orchestrator'):
+            app['coordinator'].set_task_orchestrator(app.get('task_orchestrator'))
+        if hasattr(app['signal_router'], 'set_task_orchestrator'):
+            app['signal_router'].set_task_orchestrator(app.get('task_orchestrator'))
 
         # 系统监控器
         app['system_monitor'] = SystemMonitor(config)

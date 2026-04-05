@@ -1,19 +1,7 @@
-import sys
 import asyncio
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-EXTERNAL_ASYNCRON = PROJECT_ROOT / "external" / "asyncron"
-EXTERNAL_ECONDB = PROJECT_ROOT / "external" / "econdb"
-for path in (EXTERNAL_ASYNCRON, EXTERNAL_ECONDB, PROJECT_ROOT):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
-
-sys.modules.setdefault("tushare", SimpleNamespace())
-sys.modules.setdefault("akshare", SimpleNamespace())
 
 from task_orchestrator import TaskOrchestrator
 
@@ -113,6 +101,7 @@ class _FakeServiceRuntime:
     def __init__(self) -> None:
         self.counter = 0
         self.jobs = {}
+        self.history = {}
 
     async def request(self, service, method, path, payload=None, params=None):
         if method == "POST" and path == "/api/v1/jobs":
@@ -133,6 +122,14 @@ class _FakeServiceRuntime:
             }
             self.jobs[job_id] = job
             return {"data": {"job_id": job_id}}
+        if method == "GET" and path.endswith("/history") and path.startswith("/api/v1/jobs/"):
+            job_id = path.split("/api/v1/jobs/", 1)[1].rsplit("/history", 1)[0]
+            return {
+                "data": {
+                    "job_id": job_id,
+                    "history": [dict(item) for item in self.history.get(job_id, [])],
+                }
+            }
         if method == "GET" and path.startswith("/api/v1/jobs/"):
             job_id = path.rsplit("/", 1)[-1]
             return {"data": dict(self.jobs[job_id])}
@@ -187,6 +184,72 @@ async def _test_task_orchestrator_uses_pg_backed_control_plane_storage():
 
     deleted = await orchestrator.cleanup_completed_task_jobs(max_age_hours=1)
     assert deleted == 0
+
+
+def test_task_job_history_merges_control_plane_and_service_runtime_sources():
+    asyncio.run(_test_task_job_history_merges_control_plane_and_service_runtime_sources())
+
+
+async def _test_task_job_history_merges_control_plane_and_service_runtime_sources():
+    orchestrator = TaskOrchestrator(app={})
+    fake_api = _FakeTaskRuntimeAPI()
+    fake_runtime = _FakeServiceRuntime()
+    orchestrator._task_api = fake_api
+    orchestrator._request_service = fake_runtime.request
+    orchestrator._safe_get_service_job = lambda *args, **kwargs: asyncio.sleep(0, result=None)
+
+    record = {
+        "task_job_id": "brain-task-merged",
+        "service": "execution",
+        "service_job_id": "execution-job-1",
+        "job_type": "batch_analyze",
+        "status": "queued",
+        "progress": 0,
+        "params": {"symbols": ["000001.SZ"]},
+        "metadata": {"source": "test"},
+        "created_at": "2026-03-31T00:00:00Z",
+        "updated_at": "2026-03-31T00:00:00Z",
+    }
+    await orchestrator._save_task_record(record)
+    fake_api.append_brain_task_job_history(
+        {
+            "task_job_id": "brain-task-merged",
+            "event_type": "created",
+            "job_snapshot": {
+                "id": "brain-task-merged",
+                "service": "execution",
+                "service_job_id": "execution-job-1",
+                "job_type": "batch_analyze",
+                "status": "queued",
+                "progress": 0,
+            },
+            "created_at": "2026-03-31T00:00:01Z",
+        }
+    )
+    fake_runtime.history["execution-job-1"] = [
+        {
+            "event": "checkpoint",
+            "timestamp": "2026-03-31T00:00:01Z",
+            "payload": {"label": "accepted"},
+        },
+        {
+            "event": "progress",
+            "timestamp": "2026-03-31T00:00:02Z",
+            "payload": {"progress": 25, "message": "running"},
+        },
+    ]
+
+    payload = await orchestrator.get_task_job_history("brain-task-merged")
+
+    history = payload["history"]
+    assert [item["event"] for item in history] == ["created", "checkpoint", "progress"]
+    assert [item["source"] for item in history] == [
+        "brain_control_plane",
+        "service_runtime",
+        "service_runtime",
+    ]
+    assert history[1]["service_job_id"] == "execution-job-1"
+    assert history[2]["payload"]["progress"] == 25
 
 
 def test_task_orchestrator_persists_schedule_and_auto_chain_lineage():

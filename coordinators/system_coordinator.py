@@ -73,6 +73,7 @@ class SystemCoordinator(ISystemCoordinator):
 
         # 适配器实例
         self._strategy_adapter: Optional[StrategyAdapter] = None
+        self._task_orchestrator: Optional[Any] = None
 
         # 管理器实例
         self._data_flow_manager: Optional[DataFlowManager] = None
@@ -81,6 +82,10 @@ class SystemCoordinator(ISystemCoordinator):
         self._monitoring_task: Optional[asyncio.Task] = None
         
         logger.info("SystemCoordinator initialized")
+
+    def set_task_orchestrator(self, task_orchestrator: Any) -> None:
+        """注入 Brain 统一任务控制面。"""
+        self._task_orchestrator = task_orchestrator
     
     async def start(self) -> bool:
         """启动系统协调器
@@ -340,6 +345,11 @@ class SystemCoordinator(ISystemCoordinator):
                     allocation = self._create_balanced_allocation(allocation_id)
                 
                 self._resource_allocation = allocation
+                self._resource_allocation.strategy = strategy
+                self._resource_allocation.metadata = {
+                    **(self._resource_allocation.metadata or {}),
+                    "strategy": strategy,
+                }
                 logger.info(f"Resource allocation completed: {allocation_id}, strategy: {strategy}")
                 return allocation
                 
@@ -472,13 +482,44 @@ class SystemCoordinator(ISystemCoordinator):
         try:
             if not self._strategy_adapter:
                 raise CycleExecutionException(cycle_id, "strategy_analysis", "StrategyAdapter not initialized")
+            if not self._task_orchestrator:
+                raise CycleExecutionException(cycle_id, "strategy_analysis", "TaskOrchestrator not initialized")
 
             # 从组合指令中提取股票代码
             symbols = self._extract_symbols_from_instruction(portfolio_instruction)
 
-            # 调用真实的StrategyAdapter进行策略分析
-            logger.info(f"Executing strategy analysis for cycle {cycle_id} with {len(symbols)} symbols")
-            analysis_results = await self._strategy_adapter.request_strategy_analysis(portfolio_instruction, symbols)
+            logger.info(
+                "Dispatching strategy analysis through Brain control plane for cycle %s with %s symbols",
+                cycle_id,
+                len(symbols),
+            )
+            params = self._strategy_adapter.build_strategy_analysis_params(
+                portfolio_instruction if isinstance(portfolio_instruction, dict) else {},
+                symbols,
+            )
+            created = await self._task_orchestrator.create_task_job(
+                service="execution",
+                job_type="batch_analyze",
+                params=params,
+                metadata={
+                    "control_plane_source": "system_coordinator",
+                    "cycle_id": cycle_id,
+                    "stage": "strategy_analysis",
+                },
+            )
+            task_job_id = str(created.get("id") or "").strip()
+            if not task_job_id:
+                raise CycleExecutionException(cycle_id, "strategy_analysis", "TaskOrchestrator did not return task_job_id")
+
+            logger.info("Strategy analysis dispatched for cycle %s as task_job_id=%s", cycle_id, task_job_id)
+            completed = await self._wait_for_task_job_terminal(
+                cycle_id,
+                "strategy_analysis",
+                task_job_id,
+            )
+            analysis_results = await self._strategy_adapter.normalize_analysis_job_result(
+                completed.get("result") if isinstance(completed.get("result"), dict) else {},
+            )
 
             logger.info(f"Strategy analysis completed for cycle {cycle_id}, got {len(analysis_results)} results")
             return analysis_results
@@ -492,14 +533,42 @@ class SystemCoordinator(ISystemCoordinator):
         try:
             if not self._strategy_adapter:
                 raise CycleExecutionException(cycle_id, "strategy_validation", "StrategyAdapter not initialized")
+            if not self._task_orchestrator:
+                raise CycleExecutionException(cycle_id, "strategy_validation", "TaskOrchestrator not initialized")
 
             # 从分析结果中提取股票代码和构建策略配置
             symbols = [result.get('symbol') for result in analysis_results if result.get('symbol')]
             strategy_config = self._build_strategy_config_from_results(analysis_results)
 
-            # 调用真实的StrategyAdapter进行回测验证
-            logger.info(f"Executing strategy validation for cycle {cycle_id} with {len(symbols)} symbols")
-            validation_result = await self._strategy_adapter.request_backtest_validation(symbols, strategy_config)
+            logger.info(
+                "Dispatching strategy validation through Brain control plane for cycle %s with %s symbols",
+                cycle_id,
+                len(symbols),
+            )
+            params = self._strategy_adapter.build_backtest_validation_params(symbols, strategy_config)
+            created = await self._task_orchestrator.create_task_job(
+                service="execution",
+                job_type="run_backtest",
+                params=params,
+                metadata={
+                    "control_plane_source": "system_coordinator",
+                    "cycle_id": cycle_id,
+                    "stage": "strategy_validation",
+                },
+            )
+            task_job_id = str(created.get("id") or "").strip()
+            if not task_job_id:
+                raise CycleExecutionException(cycle_id, "strategy_validation", "TaskOrchestrator did not return task_job_id")
+
+            logger.info("Strategy validation dispatched for cycle %s as task_job_id=%s", cycle_id, task_job_id)
+            completed = await self._wait_for_task_job_terminal(
+                cycle_id,
+                "strategy_validation",
+                task_job_id,
+            )
+            validation_result = self._strategy_adapter.normalize_backtest_job_result(
+                completed.get("result") if isinstance(completed.get("result"), dict) else {},
+            )
 
             logger.info(f"Strategy validation completed for cycle {cycle_id}")
             return validation_result
@@ -507,6 +576,54 @@ class SystemCoordinator(ISystemCoordinator):
         except Exception as e:
             logger.error(f"Strategy validation failed for cycle {cycle_id}: {e}")
             raise CycleExecutionException(cycle_id, "strategy_validation", str(e))
+
+    async def _wait_for_task_job_terminal(
+        self,
+        cycle_id: str,
+        stage: str,
+        task_job_id: str,
+        *,
+        poll_interval_seconds: float = 1.0,
+    ) -> Dict[str, Any]:
+        timeout_seconds = self._resolve_task_stage_timeout_seconds(stage)
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        last_payload: Dict[str, Any] = {}
+
+        while True:
+            payload = await self._task_orchestrator.get_task_job(task_job_id)
+            if isinstance(payload, dict):
+                last_payload = payload
+            status = str((payload or {}).get("status") or "").strip().lower()
+            if status == "succeeded":
+                return payload
+            if status in {"failed", "cancelled"}:
+                message = (
+                    str((payload or {}).get("message") or "").strip()
+                    or str(((payload or {}).get("error") or {}).get("message") or "").strip()
+                    or f"task_job_id={task_job_id} finished with status={status}"
+                )
+                raise CycleExecutionException(cycle_id, stage, message, details={"task_job_id": task_job_id, "payload": payload})
+            if asyncio.get_running_loop().time() >= deadline:
+                raise CycleExecutionException(
+                    cycle_id,
+                    stage,
+                    f"Timed out waiting for task_job_id={task_job_id}",
+                    details={"task_job_id": task_job_id, "payload": last_payload},
+                )
+            await asyncio.sleep(max(0.1, float(poll_interval_seconds)))
+
+    def _resolve_task_stage_timeout_seconds(self, stage: str) -> int:
+        coordinator_config = getattr(self.config, "system_coordinator", None)
+        cycle_timeout = max(1, int(getattr(coordinator_config, "cycle_timeout", 300) or 300))
+        stage_token = str(stage or "").strip().lower()
+        stage_timeout_map = {
+            "strategy_analysis": getattr(coordinator_config, "strategy_analysis_timeout_seconds", 1800),
+            "strategy_validation": getattr(coordinator_config, "strategy_validation_timeout_seconds", 1800),
+        }
+        stage_timeout = stage_timeout_map.get(stage_token)
+        if stage_timeout is None:
+            return cycle_timeout
+        return max(cycle_timeout, max(1, int(stage_timeout or cycle_timeout)))
 
     async def _wait_for_active_cycles(self) -> None:
         """等待活跃周期完成"""
@@ -595,6 +712,8 @@ class SystemCoordinator(ISystemCoordinator):
             self._system_status.overall_health = SystemHealthStatus.CRITICAL
         elif any(status == SystemHealthStatus.WARNING for status in statuses):
             self._system_status.overall_health = SystemHealthStatus.WARNING
+        elif any(status == SystemHealthStatus.DEGRADED for status in statuses):
+            self._system_status.overall_health = SystemHealthStatus.DEGRADED
         else:
             self._system_status.overall_health = SystemHealthStatus.HEALTHY
 

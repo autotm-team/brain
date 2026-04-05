@@ -24,6 +24,7 @@ from routers.conflict_resolver import ConflictResolver
 from routers.signal_processor import SignalProcessor
 from adapters.strategy_adapter import StrategyAdapter
 from adapters.portfolio_adapter import PortfolioAdapter
+from serializers import to_jsonable
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +62,7 @@ class SignalRouter(ISignalRouter):
 
         # 适配器实例
         self._strategy_adapter: Optional[StrategyAdapter] = None
+        self._task_orchestrator: Optional[Any] = None
 
         # 路由规则和策略
         self._routing_rules: Dict[str, Dict[str, Any]] = {}
@@ -74,6 +76,10 @@ class SignalRouter(ISignalRouter):
         self._cleanup_task: Optional[asyncio.Task] = None
         
         logger.info("SignalRouter initialized")
+
+    def set_task_orchestrator(self, task_orchestrator: Any) -> None:
+        """注入 Brain 统一任务控制面。"""
+        self._task_orchestrator = task_orchestrator
     
     async def start(self) -> bool:
         """启动信号路由器
@@ -134,6 +140,105 @@ class SignalRouter(ISignalRouter):
         except Exception as e:
             logger.error(f"Error stopping SignalRouter: {e}")
             return False
+
+    def is_running(self) -> bool:
+        """暴露给 HTTP 层的运行状态。"""
+        return self._is_running
+
+    async def route_signal(self, signal_payload: Dict[str, Any]) -> Dict[str, Any]:
+        """兼容 HTTP 层的通用信号路由入口。"""
+        if not self._is_running:
+            raise SignalRouterException("SignalRouter is not running")
+
+        signal = await self._signal_processor._convert_to_standard_signal(signal_payload)
+        validation_result = await self._validate_signal(signal)
+        conflicts = await self.detect_signal_conflicts([signal])
+        resolutions = await self.resolve_signal_conflicts(conflicts) if conflicts.get('has_conflicts') else []
+
+        target = str(signal.target or "").lower()
+        source = str(signal.source or "").lower()
+        if 'portfolio' in target or 'macro' in source:
+            routed = await self._route_to_portfolio_layer(signal)
+            target_layer = 'portfolio'
+        elif 'strategy' in target or 'portfolio' in source:
+            routed = await self._route_to_strategy_layer(signal)
+            target_layer = 'strategy'
+        else:
+            routed = await self._signal_processor.process_signal(signal)
+            target_layer = target or 'unknown'
+
+        routing_result = SignalRoutingResult(
+            routing_id=str(uuid.uuid4()),
+            source_layer=source or 'unknown',
+            target_layer=target_layer,
+            original_signals=[signal_payload],
+            routed_signals=[routed],
+            conflicts_detected=conflicts.get('conflicts', []),
+            conflicts_resolved=to_jsonable(resolutions),
+        )
+        self._record_routing_result(routing_result)
+
+        return {
+            'routing': to_jsonable(routing_result),
+            'validation': to_jsonable(validation_result),
+            'result': to_jsonable(routed),
+        }
+
+    async def get_signal_conflicts(self) -> Dict[str, Any]:
+        """返回最近路由中记录的冲突摘要。"""
+        items: List[Dict[str, Any]] = []
+        with self._routing_lock:
+            for entry in reversed(list(self._signal_history)):
+                if entry.conflicts_detected:
+                    items.extend(to_jsonable(entry.conflicts_detected))
+        return {
+            'items': items,
+            'total': len(items),
+            'statistics': self._conflict_resolver.get_conflict_statistics(),
+        }
+
+    async def resolve_conflicts(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """兼容 HTTP 层的冲突解决入口。"""
+        if payload.get('has_conflicts'):
+            conflicts = payload
+        else:
+            signals = payload.get('signals') if isinstance(payload.get('signals'), list) else []
+            conflicts = await self.detect_signal_conflicts(signals)
+        resolved = await self.resolve_signal_conflicts(conflicts)
+        return {
+            'resolved': to_jsonable(resolved),
+            'resolved_count': len(resolved),
+        }
+
+    async def get_signal_history(self, query_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """返回最近信号路由历史。"""
+        query_params = query_params if isinstance(query_params, dict) else {}
+        limit = max(1, int(query_params.get('limit', 50)))
+        offset = max(0, int(query_params.get('offset', 0)))
+
+        with self._routing_lock:
+            history_items = [to_jsonable(item) for item in reversed(list(self._signal_history))]
+
+        total = len(history_items)
+        return {
+            'items': history_items[offset: offset + limit],
+            'total': total,
+            'limit': limit,
+            'offset': offset,
+        }
+
+    async def get_signal_statistics(self) -> Dict[str, Any]:
+        """返回统一的信号路由统计。"""
+        return {
+            'routing': self.get_routing_statistics(),
+            'processing': self._signal_processor.get_processing_statistics(),
+            'conflicts': self._conflict_resolver.get_conflict_statistics(),
+        }
+
+    async def cleanup_expired_signals(self) -> Dict[str, Any]:
+        """清理过期信号并返回清理结果。"""
+        removed = await self._cleanup_expired_signals()
+        return {'removed': removed}
     
     async def route_macro_signals(self, macro_state: Any) -> Any:
         """路由宏观信号
@@ -415,17 +520,44 @@ class SignalRouter(ISignalRouter):
         try:
             if not self._strategy_adapter:
                 raise SignalRouterException("StrategyAdapter not initialized")
+            if not self._task_orchestrator:
+                raise SignalRouterException("TaskOrchestrator not initialized")
 
             # 从信号中提取股票代码和组合指令
             symbols = self._extract_symbols_from_signal(signal)
             portfolio_instruction = signal.data
 
-            # 调用真实的StrategyAdapter进行策略分析
-            logger.debug(f"Routing signal {signal.signal_id} to strategy layer with {len(symbols)} symbols")
-            analysis_results = await self._strategy_adapter.request_strategy_analysis(portfolio_instruction, symbols)
+            logger.debug(
+                "Routing signal %s to strategy control plane with %s symbols",
+                signal.signal_id,
+                len(symbols),
+            )
+            params = self._strategy_adapter.build_strategy_analysis_params(
+                portfolio_instruction if isinstance(portfolio_instruction, dict) else {},
+                symbols,
+            )
+            created = await self._task_orchestrator.create_task_job(
+                service="execution",
+                job_type="batch_analyze",
+                params=params,
+                metadata={
+                    "control_plane_source": "signal_router",
+                    "signal_id": signal.signal_id,
+                    "stage": "strategy_analysis",
+                },
+            )
 
-            logger.debug(f"Strategy layer routing completed for signal {signal.signal_id}")
-            return analysis_results
+            logger.debug("Strategy layer routing dispatched for signal %s as task_job_id=%s", signal.signal_id, created.get("id"))
+            return {
+                "mode": "control_plane_async",
+                "task_job_id": created.get("id"),
+                "service_job_id": created.get("service_job_id"),
+                "service": created.get("service") or "execution",
+                "job_type": created.get("job_type") or "batch_analyze",
+                "status": created.get("status"),
+                "signal_id": signal.signal_id,
+                "symbols": symbols,
+            }
 
         except Exception as e:
             logger.error(f"Strategy layer routing failed for signal {signal.signal_id}: {e}")
@@ -490,15 +622,18 @@ class SignalRouter(ISignalRouter):
             if queue.qsize() > queue.maxsize * 0.8:
                 logger.warning(f"Signal queue {name} is nearly full: {queue.qsize()}/{queue.maxsize}")
     
-    async def _cleanup_expired_signals(self) -> None:
+    async def _cleanup_expired_signals(self) -> int:
         """清理过期信号"""
         current_time = datetime.now()
         expiry_time = timedelta(seconds=self.config.signal_router.signal_expiry_time)
+        removed = 0
         
         # 清理历史记录中的过期信号
         while (self._signal_history and
                current_time - self._signal_history[0].timestamp > expiry_time):
             self._signal_history.popleft()
+            removed += 1
+        return removed
 
     async def _initialize_strategy_adapter(self) -> None:
         """初始化StrategyAdapter"""

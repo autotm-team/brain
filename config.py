@@ -21,6 +21,8 @@ class SystemCoordinatorConfig:
     """系统协调器配置"""
     max_concurrent_cycles: int = 3
     cycle_timeout: int = 300  # 秒
+    strategy_analysis_timeout_seconds: int = 1800  # 秒
+    strategy_validation_timeout_seconds: int = 1800  # 秒
     retry_attempts: int = 3
     retry_delay: float = 1.0  # 秒
     health_check_interval: int = 30  # 秒
@@ -93,6 +95,7 @@ class AdapterConfig:
     pool_size: int = 10
     enable_health_check: bool = True
     health_check_interval: int = 60  # 秒
+    default_portfolio_id: Optional[str] = None
 
 
 @dataclass
@@ -103,10 +106,10 @@ class ServiceConfig:
     debug: bool = False
 
     # 服务发现配置
-    macro_service_url: str = "http://macro-service:8080"
-    portfolio_service_url: str = "http://portfolio-service:8080"
-    execution_service_url: str = "http://execution-service:8087"
-    flowhub_service_url: str = "http://flowhub-service:8080"
+    macro_service_url: str = "http://macro:8080"
+    portfolio_service_url: str = "http://portfolio:8080"
+    execution_service_url: str = "http://execution:8087"
+    flowhub_service_url: str = "http://flowhub:8080"
 
     # 定时任务配置
     scheduler_enabled: bool = True
@@ -238,6 +241,8 @@ class IntegrationConfig:
             'system_coordinator': {
                 'max_concurrent_cycles': 3,
                 'cycle_timeout': 300,
+                'strategy_analysis_timeout_seconds': 1800,
+                'strategy_validation_timeout_seconds': 1800,
                 'retry_attempts': 3,
                 'retry_delay': 1.0,
                 'health_check_interval': 30,
@@ -294,16 +299,17 @@ class IntegrationConfig:
                 'enable_connection_pooling': True,
                 'pool_size': 10,
                 'enable_health_check': True,
-                'health_check_interval': 60
+                'health_check_interval': 60,
+                'default_portfolio_id': None
             },
             'service': {
                 'host': '0.0.0.0',
                 'port': 8088,
                 'debug': False,
-                'macro_service_url': 'http://macro-service:8080',
-                'portfolio_service_url': 'http://portfolio-service:8080',
-                'execution_service_url': 'http://execution-service:8087',
-                'flowhub_service_url': 'http://flowhub-service:8080',
+                'macro_service_url': 'http://macro:8080',
+                'portfolio_service_url': 'http://portfolio:8080',
+                'execution_service_url': 'http://execution:8087',
+                'flowhub_service_url': 'http://flowhub:8080',
                 'scheduler_enabled': True,
                 'scheduler_timezone': 'Asia/Shanghai',
                 'daily_data_fetch_cron': 'at:16:30',
@@ -396,6 +402,8 @@ class IntegrationConfig:
             # 原有配置
             'INTEGRATION_MAX_CONCURRENT_CYCLES': ('system_coordinator', 'max_concurrent_cycles', int),
             'INTEGRATION_CYCLE_TIMEOUT': ('system_coordinator', 'cycle_timeout', int),
+            'INTEGRATION_STRATEGY_ANALYSIS_TIMEOUT_SECONDS': ('system_coordinator', 'strategy_analysis_timeout_seconds', int),
+            'INTEGRATION_STRATEGY_VALIDATION_TIMEOUT_SECONDS': ('system_coordinator', 'strategy_validation_timeout_seconds', int),
             'INTEGRATION_SIGNAL_TIMEOUT': ('signal_router', 'signal_timeout', int),
             'INTEGRATION_CACHE_SIZE_MB': ('data_flow_manager', 'cache_size_mb', int),
             'INTEGRATION_ENABLE_MONITORING': ('monitoring', 'enable_system_monitoring', bool),
@@ -408,6 +416,7 @@ class IntegrationConfig:
             'PORTFOLIO_SERVICE_URL': ('service', 'portfolio_service_url', str),
             'EXECUTION_SERVICE_URL': ('service', 'execution_service_url', str),
             'FLOWHUB_SERVICE_URL': ('service', 'flowhub_service_url', str),
+            'DEFAULT_PORTFOLIO_ID': ('adapter', 'default_portfolio_id', str),
             'SCHEDULER_ENABLED': ('service', 'scheduler_enabled', bool),
             'SCHEDULER_TIMEZONE': ('service', 'scheduler_timezone', str),
             'SCHEDULER_DAILY_CRON': ('service', 'daily_data_fetch_cron', str),
@@ -639,6 +648,8 @@ class IntegrationConfig:
             validations = [
                 (self.system_coordinator.max_concurrent_cycles > 0, "max_concurrent_cycles must be positive"),
                 (self.system_coordinator.cycle_timeout > 0, "cycle_timeout must be positive"),
+                (self.system_coordinator.strategy_analysis_timeout_seconds > 0, "strategy_analysis_timeout_seconds must be positive"),
+                (self.system_coordinator.strategy_validation_timeout_seconds > 0, "strategy_validation_timeout_seconds must be positive"),
                 (0 < self.system_coordinator.emergency_stop_threshold < 1, "emergency_stop_threshold must be between 0 and 1"),
                 (self.signal_router.max_signal_queue_size > 0, "max_signal_queue_size must be positive"),
                 (self.data_flow_manager.cache_size_mb > 0, "cache_size_mb must be positive"),
