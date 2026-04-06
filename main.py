@@ -13,7 +13,7 @@ from pathlib import Path
 from aiohttp import web
 
 from app import create_app
-from config import IntegrationConfig
+from config import IntegrationConfig, get_settings
 
 try:
     from econdb.schema_validator import validate_schema_on_startup
@@ -73,7 +73,7 @@ async def main():
     try:
         # 加载配置
         environment = sys.argv[1] if len(sys.argv) > 1 else "development"
-        config = IntegrationConfig(environment=environment)
+        config = get_settings(environment=environment, force_reload=True)
         
         # 设置日志
         setup_logging(config)

@@ -767,10 +767,13 @@ class UIBffHandler(
 
     async def _handle_system_settings_list(self, request: web.Request) -> web.Response:
         api = self._get_system_api()
+        control_plane_service = self._app.get("control_plane_settings") if self._app is not None else None
         payload = {
             "settings": api.list_settings(),
             "presets": api.list_presets(),
         }
+        if control_plane_service is not None:
+            payload["control_plane"] = await control_plane_service.snapshot()
         return self.success_response(payload)
 
     async def _handle_system_settings_upsert(self, request: web.Request, key: Optional[str] = None) -> web.Response:

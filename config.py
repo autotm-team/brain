@@ -7,6 +7,7 @@ Brain runtime settings.
 from __future__ import annotations
 
 import json
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -22,8 +23,6 @@ DEFAULT_CORS_ALLOWED_ORIGINS = [
 ]
 
 COMMON_MODEL_CONFIG = SettingsConfigDict(
-    env_file=".env",
-    env_file_encoding="utf-8",
     case_sensitive=False,
     extra="ignore",
 )
@@ -561,3 +560,14 @@ class BrainSettings:
 
 class IntegrationConfig(BrainSettings):
     """Backward-compatible name retained for the rest of the brain service."""
+
+
+@lru_cache()
+def _cached_settings(environment: str = "development") -> IntegrationConfig:
+    return IntegrationConfig(environment=environment)
+
+
+def get_settings(environment: str = "development", force_reload: bool = False) -> IntegrationConfig:
+    if force_reload:
+        _cached_settings.cache_clear()
+    return _cached_settings(environment)

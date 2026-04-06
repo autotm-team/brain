@@ -486,7 +486,9 @@ class SignalRouter(ISignalRouter):
         try:
             # 获取组合适配器
             if not hasattr(self, '_portfolio_adapter') or self._portfolio_adapter is None:
-                config = getattr(self, 'config', IntegrationConfig())
+                from config import get_settings
+
+                config = getattr(self, 'config', get_settings())
                 self._portfolio_adapter = PortfolioAdapter(config)
                 await self._portfolio_adapter.connect_to_system()
 

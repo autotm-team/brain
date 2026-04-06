@@ -24,22 +24,22 @@ from monitors.system_monitor import SystemMonitor
 from initializers.data_initializer import DataInitializationCoordinator
 from task_orchestrator import TaskOrchestrator
 from auth_service import AuthService
+from control_plane_settings import BrainControlPlaneSettingsService
 
 logger = logging.getLogger(__name__)
 
-def _flowhub_bootstrap_schedule_specs(config: IntegrationConfig) -> list[dict]:
-    defaults = config.control_plane
+def _flowhub_bootstrap_schedule_specs(defaults: dict) -> list[dict]:
     return [
         {
             "bootstrap_key": "research_daily_stock_basic",
             "job_type": "stock_basic_data",
-            "cron": defaults.flowhub_research_stock_basic_cron,
+            "cron": defaults["research_stock_basic_cron"],
             "params": {"update_mode": "incremental"},
         },
         {
             "bootstrap_key": "strategy_daily_index_daily",
             "job_type": "index_daily_data",
-            "cron": defaults.flowhub_strategy_index_daily_cron,
+            "cron": defaults["strategy_index_daily_cron"],
             "params": {
                 "update_mode": "incremental",
                 "index_codes": ["000300.SH", "000905.SH", "000852.SH", "000001.SH", "399001.SZ", "399006.SZ"],
@@ -48,13 +48,13 @@ def _flowhub_bootstrap_schedule_specs(config: IntegrationConfig) -> list[dict]:
         {
             "bootstrap_key": "strategy_daily_trade_calendar",
             "job_type": "trade_calendar_data",
-            "cron": defaults.flowhub_strategy_trade_cal_cron,
+            "cron": defaults["strategy_trade_cal_cron"],
             "params": {"exchange": "SSE", "update_mode": "incremental"},
         },
         {
             "bootstrap_key": "strategy_weekly_index_components",
             "job_type": "index_components",
-            "cron": defaults.flowhub_strategy_index_components_cron,
+            "cron": defaults["strategy_index_components_cron"],
             "params": {
                 "update_mode": "snapshot",
                 "index_codes": ["000300.SH", "000905.SH", "000852.SH", "000001.SH", "399001.SZ", "399006.SZ"],
@@ -63,25 +63,25 @@ def _flowhub_bootstrap_schedule_specs(config: IntegrationConfig) -> list[dict]:
         {
             "bootstrap_key": "strategy_monthly_sw_industry",
             "job_type": "sw_industry_data",
-            "cron": defaults.flowhub_strategy_sw_industry_cron,
+            "cron": defaults["strategy_sw_industry_cron"],
             "params": {"src": "SW2021", "update_mode": "incremental", "include_members": True},
         },
         {
             "bootstrap_key": "research_daily_suspend",
             "job_type": "suspend_data",
-            "cron": defaults.flowhub_research_suspend_cron,
+            "cron": defaults["research_suspend_cron"],
             "params": {"update_mode": "incremental"},
         },
         {
             "bootstrap_key": "research_daily_st_status",
             "job_type": "st_status_data",
-            "cron": defaults.flowhub_research_st_status_cron,
+            "cron": defaults["research_st_status_cron"],
             "params": {"update_mode": "incremental"},
         },
         {
             "bootstrap_key": "research_daily_stk_limit",
             "job_type": "stk_limit_data",
-            "cron": defaults.flowhub_research_stk_limit_cron,
+            "cron": defaults["research_stk_limit_cron"],
             "params": {"update_mode": "incremental"},
         },
     ]
@@ -125,7 +125,11 @@ async def _list_all_flowhub_schedules(orchestrator: TaskOrchestrator) -> list[di
 
 async def _ensure_flowhub_bootstrap_schedules(app: web.Application) -> None:
     config: IntegrationConfig = app["config"]
-    if not config.control_plane.flowhub_bootstrap_enabled:
+    control_plane_service = app.get("control_plane_settings")
+    if control_plane_service is None:
+        return
+    bootstrap_defaults = await control_plane_service.get_flowhub_bootstrap_defaults()
+    if not bool(bootstrap_defaults.get("enabled", True)):
         logger.info("Skip flowhub bootstrap schedules: BRAIN_FLOWHUB_BOOTSTRAP_ENABLED=false")
         return
 
@@ -163,7 +167,7 @@ async def _ensure_flowhub_bootstrap_schedules(app: web.Application) -> None:
             existing_keys[key] = item
 
     created_ids: list[str] = []
-    for spec in _flowhub_bootstrap_schedule_specs(config):
+    for spec in _flowhub_bootstrap_schedule_specs(bootstrap_defaults):
         key = spec["bootstrap_key"]
         if key in existing_keys:
             continue
@@ -198,7 +202,7 @@ async def _ensure_flowhub_bootstrap_schedules(app: web.Application) -> None:
         )
         return
 
-    if not config.control_plane.flowhub_bootstrap_trigger_created:
+    if not bool(bootstrap_defaults.get("trigger_created", True)):
         return
 
     for schedule_id in created_ids:
@@ -297,6 +301,10 @@ async def init_components(app: web.Application, config: IntegrationConfig):
         app['auth_service'] = AuthService(config=config, redis_client=app.get('redis'))
         await app['auth_service'].initialize()
         logger.info("Auth service initialized")
+
+        app["control_plane_settings"] = BrainControlPlaneSettingsService(config)
+        await app["control_plane_settings"].ensure_seeded()
+        logger.info("Control-plane settings initialized")
 
         async def _dispatch_schedule(payload: dict) -> None:
             schedule = payload.get("schedule") if isinstance(payload, dict) else {}
@@ -565,7 +573,9 @@ def create_test_app(config: IntegrationConfig = None) -> web.Application:
         web.Application: 测试应用实例
     """
     if config is None:
-        config = IntegrationConfig(environment="testing")
+        from config import get_settings
+
+        config = get_settings(environment="testing", force_reload=True)
 
     # 在新的事件循环中创建应用
     loop = asyncio.new_event_loop()
