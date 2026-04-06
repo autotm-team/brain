@@ -38,4 +38,5 @@
 
 ## Configuration & Service Dependencies
 - This service integrates with macro/portfolio/execution/flowhub and depends on Redis and TimescaleDB.
-- Configure service URLs via environment variables such as `MACRO_SERVICE_URL`, `PORTFOLIO_SERVICE_URL`, `EXECUTION_SERVICE_URL`, `FLOWHUB_SERVICE_URL`.
+- Runtime settings are environment-variable driven via `config.py`.
+- Preferred downstream URL variables are `BRAIN_MACRO_SERVICE_URL`, `BRAIN_PORTFOLIO_SERVICE_URL`, `BRAIN_EXECUTION_SERVICE_URL`, `BRAIN_FLOWHUB_SERVICE_URL`.

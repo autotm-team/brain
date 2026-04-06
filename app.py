@@ -7,7 +7,6 @@ Integration Service 应用工厂
 import logging
 import asyncio
 import inspect
-import os
 from aiohttp import web
 from aiohttp_cors import setup as cors_setup, ResourceOptions
 
@@ -28,38 +27,18 @@ from auth_service import AuthService
 
 logger = logging.getLogger(__name__)
 
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
-
-
-def _cors_allowed_origins() -> list[str]:
-    raw = os.getenv("BRAIN_CORS_ALLOWED_ORIGINS", "").strip()
-    if raw:
-        return [item.strip() for item in raw.split(",") if item.strip()]
-    return [
-        "http://127.0.0.1:5173",
-        "http://localhost:5173",
-        "http://127.0.0.1:4173",
-        "http://localhost:4173",
-    ]
-
-
-def _flowhub_bootstrap_schedule_specs() -> list[dict]:
+def _flowhub_bootstrap_schedule_specs(config: IntegrationConfig) -> list[dict]:
     return [
         {
             "bootstrap_key": "research_daily_stock_basic",
             "job_type": "stock_basic_data",
-            "cron": os.getenv("FLOWHUB_RESEARCH_STOCK_BASIC_CRON", "20 17 * * 1-5"),
+            "cron": config.service.flowhub_research_stock_basic_cron,
             "params": {"update_mode": "incremental"},
         },
         {
             "bootstrap_key": "strategy_daily_index_daily",
             "job_type": "index_daily_data",
-            "cron": os.getenv("FLOWHUB_STRATEGY_INDEX_DAILY_CRON", "30 18 * * 1-5"),
+            "cron": config.service.flowhub_strategy_index_daily_cron,
             "params": {
                 "update_mode": "incremental",
                 "index_codes": ["000300.SH", "000905.SH", "000852.SH", "000001.SH", "399001.SZ", "399006.SZ"],
@@ -68,13 +47,13 @@ def _flowhub_bootstrap_schedule_specs() -> list[dict]:
         {
             "bootstrap_key": "strategy_daily_trade_calendar",
             "job_type": "trade_calendar_data",
-            "cron": os.getenv("FLOWHUB_STRATEGY_TRADE_CAL_CRON", "35 18 * * 1-5"),
+            "cron": config.service.flowhub_strategy_trade_cal_cron,
             "params": {"exchange": "SSE", "update_mode": "incremental"},
         },
         {
             "bootstrap_key": "strategy_weekly_index_components",
             "job_type": "index_components",
-            "cron": os.getenv("FLOWHUB_STRATEGY_INDEX_COMPONENTS_CRON", "30 16 * * 6"),
+            "cron": config.service.flowhub_strategy_index_components_cron,
             "params": {
                 "update_mode": "snapshot",
                 "index_codes": ["000300.SH", "000905.SH", "000852.SH", "000001.SH", "399001.SZ", "399006.SZ"],
@@ -83,25 +62,25 @@ def _flowhub_bootstrap_schedule_specs() -> list[dict]:
         {
             "bootstrap_key": "strategy_monthly_sw_industry",
             "job_type": "sw_industry_data",
-            "cron": os.getenv("FLOWHUB_STRATEGY_SW_INDUSTRY_CRON", "30 16 1 * *"),
+            "cron": config.service.flowhub_strategy_sw_industry_cron,
             "params": {"src": "SW2021", "update_mode": "incremental", "include_members": True},
         },
         {
             "bootstrap_key": "research_daily_suspend",
             "job_type": "suspend_data",
-            "cron": os.getenv("FLOWHUB_RESEARCH_SUSPEND_CRON", "40 18 * * 1-5"),
+            "cron": config.service.flowhub_research_suspend_cron,
             "params": {"update_mode": "incremental"},
         },
         {
             "bootstrap_key": "research_daily_st_status",
             "job_type": "st_status_data",
-            "cron": os.getenv("FLOWHUB_RESEARCH_ST_STATUS_CRON", "45 18 * * 1-5"),
+            "cron": config.service.flowhub_research_st_status_cron,
             "params": {"update_mode": "incremental"},
         },
         {
             "bootstrap_key": "research_daily_stk_limit",
             "job_type": "stk_limit_data",
-            "cron": os.getenv("FLOWHUB_RESEARCH_STK_LIMIT_CRON", "50 18 * * 1-5"),
+            "cron": config.service.flowhub_research_stk_limit_cron,
             "params": {"update_mode": "incremental"},
         },
     ]
@@ -144,7 +123,8 @@ async def _list_all_flowhub_schedules(orchestrator: TaskOrchestrator) -> list[di
 
 
 async def _ensure_flowhub_bootstrap_schedules(app: web.Application) -> None:
-    if not _env_bool("BRAIN_FLOWHUB_BOOTSTRAP_ENABLED", True):
+    config: IntegrationConfig = app["config"]
+    if not config.service.flowhub_bootstrap_enabled:
         logger.info("Skip flowhub bootstrap schedules: BRAIN_FLOWHUB_BOOTSTRAP_ENABLED=false")
         return
 
@@ -182,7 +162,7 @@ async def _ensure_flowhub_bootstrap_schedules(app: web.Application) -> None:
             existing_keys[key] = item
 
     created_ids: list[str] = []
-    for spec in _flowhub_bootstrap_schedule_specs():
+    for spec in _flowhub_bootstrap_schedule_specs(config):
         key = spec["bootstrap_key"]
         if key in existing_keys:
             continue
@@ -210,7 +190,6 @@ async def _ensure_flowhub_bootstrap_schedules(app: web.Application) -> None:
     if not created_ids:
         return
 
-    config = app.get("config")
     init_on_startup = bool(getattr(getattr(config, "service", None), "init_data_on_startup", True))
     if init_on_startup:
         logger.info(
@@ -218,7 +197,7 @@ async def _ensure_flowhub_bootstrap_schedules(app: web.Application) -> None:
         )
         return
 
-    if not _env_bool("BRAIN_FLOWHUB_BOOTSTRAP_TRIGGER_CREATED", True):
+    if not config.service.flowhub_bootstrap_trigger_created:
         return
 
     for schedule_id in created_ids:
@@ -245,7 +224,8 @@ async def create_app(config: IntegrationConfig) -> web.Application:
 
     # 存储配置
     app['config'] = config
-    app['cors_allowed_origins'] = _cors_allowed_origins()
+    app['cors_allowed_origins'] = config.service.cors_allowed_origins
+    logger.info("Brain config loaded: %s", config.masked_summary())
 
     # 设置CORS
     cors = cors_setup(app, defaults={

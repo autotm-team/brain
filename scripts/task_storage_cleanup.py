@@ -4,17 +4,25 @@
 from __future__ import annotations
 
 import asyncio
+import argparse
 import json
-import os
 try:
     import redis.asyncio as redis
 except Exception as exc:  # pragma: no cover
     raise SystemExit(f"redis.asyncio import failed: {exc}")
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Cleanup legacy Redis task-control-plane keys after PostgreSQL cutover")
+    parser.add_argument("--redis-url", required=True, help="Redis URL")
+    parser.add_argument("--dry-run", action="store_true", help="Only print matched keys")
+    return parser.parse_args()
+
+
 async def main() -> None:
-    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-    dry_run = os.getenv("DRY_RUN", "true").lower() in {"1", "true", "yes", "on"}
+    args = parse_args()
+    redis_url = args.redis_url
+    dry_run = bool(args.dry_run)
     client = redis.from_url(redis_url, encoding="utf-8", decode_responses=True)
     try:
         await client.ping()

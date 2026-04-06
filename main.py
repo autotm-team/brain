@@ -6,7 +6,6 @@ Integration Service 微服务主入口
 
 import asyncio
 import logging
-import os
 import signal
 import sys
 from pathlib import Path
@@ -22,20 +21,18 @@ except Exception:
     validate_schema_on_startup = None
 
 
-def validate_schema_requirements() -> None:
-    enforce = os.getenv("DB_SCHEMA_ENFORCE", "true").lower() == "true"
-    if not enforce:
+def validate_schema_requirements(config: IntegrationConfig) -> None:
+    if not config.db_schema.enforce:
         return
     if validate_schema_on_startup is None:
         msg = "schema validator unavailable while DB_SCHEMA_ENFORCE=true"
-        if os.getenv("DB_SCHEMA_EXIT_ON_FAILURE", "true").lower() == "true":
+        if config.db_schema.exit_on_failure:
             logging.getLogger(__name__).error(msg + "; refusing to start")
             sys.exit(1)
         logging.getLogger(__name__).warning(msg + "; skip startup schema validation")
         return
-    required_version = os.getenv("DB_SCHEMA_REQUIRED_VERSION", "V001")
     validate_schema_on_startup(
-        required_version=required_version,
+        required_version=config.db_schema.required_version,
         required_tables=[
             "schema_migrations",
             "ui_user_accounts",
@@ -43,7 +40,7 @@ def validate_schema_requirements() -> None:
             "ui_permissions",
             "ui_auth_sessions",
         ],
-        exit_on_failure=os.getenv("DB_SCHEMA_EXIT_ON_FAILURE", "true").lower() == "true",
+        exit_on_failure=config.db_schema.exit_on_failure,
     )
 
 
@@ -90,7 +87,7 @@ async def main():
             sys.exit(1)
 
         # 启动前 schema 强校验（默认开启）
-        validate_schema_requirements()
+        validate_schema_requirements(config)
 
         # 创建应用
         app = await create_app(config)

@@ -7,7 +7,6 @@ import base64
 import hashlib
 import hmac
 import json
-import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import secrets
@@ -68,7 +67,7 @@ class AuthService:
 
         service_cfg = getattr(config, "service", None)
         self._issuer = getattr(service_cfg, "auth_issuer", "autotm-brain")
-        self._secret = getattr(service_cfg, "auth_jwt_secret", None) or os.getenv("BRAIN_AUTH_JWT_SECRET") or secrets.token_urlsafe(48)
+        self._secret = getattr(service_cfg, "auth_jwt_secret", None) or secrets.token_urlsafe(48)
         self._access_ttl = int(getattr(service_cfg, "auth_access_token_ttl_seconds", 900) or 900)
         self._refresh_ttl = int(getattr(service_cfg, "auth_refresh_token_ttl_seconds", 604800) or 604800)
         self._lock_enabled = bool(getattr(service_cfg, "auth_lock_enabled", False))
@@ -171,10 +170,11 @@ class AuthService:
         return result
 
     async def initialize(self) -> None:
-        allow_runtime_ddl = os.getenv("DB_ALLOW_RUNTIME_DDL", "false").lower() in {"1", "true", "yes", "on"}
+        allow_runtime_ddl = bool(getattr(self._config, "db_schema", None) and self._config.db_schema.allow_runtime_ddl)
         if allow_runtime_ddl:
             await asyncio.to_thread(self._api.ensure_system_schema)
-        await asyncio.to_thread(self._api.seed_defaults)
+        admin_password = getattr(getattr(self._config, "service", None), "auth_admin_default_password", None) or None
+        await asyncio.to_thread(self._api.seed_defaults, admin_password=admin_password)
         admin = await asyncio.to_thread(self._api.get_user_by_username, "admin")
         if not self._lock_enabled:
             if hasattr(self._api, "reset_all_auth_states"):

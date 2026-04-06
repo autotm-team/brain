@@ -16,6 +16,7 @@ redis==5.0.8
 # 配置管理
 pydantic==2.5.2; python_version < "3.13"
 pydantic==2.12.5; python_version >= "3.13"
+pydantic-settings==2.11.0
 python-dotenv==1.0.0
 PyYAML>=6.0
 

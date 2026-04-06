@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime
-import os
 from typing import Any, Dict
 
 from aiohttp import web
@@ -15,9 +14,10 @@ from auth_service import AuthError
 class AuthHandler(BaseHandler):
     """Handle /api/v1/ui/auth/* endpoints."""
 
-    REFRESH_COOKIE_NAME = os.getenv("BRAIN_AUTH_REFRESH_COOKIE_NAME", "autotm_refresh_token")
-    REFRESH_COOKIE_PATH = os.getenv("BRAIN_AUTH_REFRESH_COOKIE_PATH", "/api/v1/ui/auth")
-    REFRESH_COOKIE_SAMESITE = os.getenv("BRAIN_AUTH_REFRESH_COOKIE_SAMESITE", "Lax")
+    REFRESH_COOKIE_NAME = "autotm_refresh_token"
+    REFRESH_COOKIE_PATH = "/api/v1/ui/auth"
+    REFRESH_COOKIE_SAMESITE = "Lax"
+    REFRESH_COOKIE_DOMAIN = None
 
     @staticmethod
     def _is_secure_request(request: web.Request) -> bool:
@@ -26,26 +26,38 @@ class AuthHandler(BaseHandler):
         forwarded_proto = request.headers.get("X-Forwarded-Proto", "")
         return forwarded_proto.lower() == "https"
 
+    @classmethod
+    def _cookie_settings(cls, request: web.Request) -> dict[str, Any]:
+        app = getattr(request, "app", None) or {}
+        config = app.get("config") if isinstance(app, dict) else None
+        service = getattr(config, "service", None)
+        return {
+            "name": getattr(service, "auth_refresh_cookie_name", cls.REFRESH_COOKIE_NAME),
+            "path": getattr(service, "auth_refresh_cookie_path", cls.REFRESH_COOKIE_PATH),
+            "samesite": getattr(service, "auth_refresh_cookie_samesite", cls.REFRESH_COOKIE_SAMESITE),
+            "domain": getattr(service, "auth_refresh_cookie_domain", cls.REFRESH_COOKIE_DOMAIN),
+        }
+
     def _set_refresh_cookie(self, request: web.Request, response: web.Response, refresh_token: str, max_age: int) -> None:
-        domain = os.getenv("BRAIN_AUTH_REFRESH_COOKIE_DOMAIN") or None
+        cookie = self._cookie_settings(request)
         secure = self._is_secure_request(request)
         response.set_cookie(
-            self.REFRESH_COOKIE_NAME,
+            cookie["name"],
             refresh_token,
             max_age=max_age,
-            path=self.REFRESH_COOKIE_PATH,
+            path=cookie["path"],
             httponly=True,
             secure=secure,
-            samesite=self.REFRESH_COOKIE_SAMESITE,
-            domain=domain,
+            samesite=cookie["samesite"],
+            domain=cookie["domain"],
         )
 
     def _clear_refresh_cookie(self, request: web.Request, response: web.Response) -> None:
-        domain = os.getenv("BRAIN_AUTH_REFRESH_COOKIE_DOMAIN") or None
+        cookie = self._cookie_settings(request)
         response.del_cookie(
-            self.REFRESH_COOKIE_NAME,
-            path=self.REFRESH_COOKIE_PATH,
-            domain=domain,
+            cookie["name"],
+            path=cookie["path"],
+            domain=cookie["domain"],
         )
 
     @staticmethod
@@ -109,7 +121,7 @@ class AuthHandler(BaseHandler):
                 payload = await self.get_request_json(request)
             if not isinstance(payload, dict):
                 return self.error_response("Request body must be a JSON object", 400)
-            refresh_token = str(payload.get("refresh_token") or request.cookies.get(self.REFRESH_COOKIE_NAME) or "").strip()
+            refresh_token = str(payload.get("refresh_token") or request.cookies.get(self._cookie_settings(request)["name"]) or "").strip()
             if not refresh_token:
                 return self.error_response("Missing refresh_token", 400)
 
@@ -153,7 +165,7 @@ class AuthHandler(BaseHandler):
             if not isinstance(payload, dict):
                 return self.error_response("Request body must be a JSON object", 400)
 
-            refresh_token = str(payload.get("refresh_token") or request.cookies.get(self.REFRESH_COOKIE_NAME) or "").strip() or None
+            refresh_token = str(payload.get("refresh_token") or request.cookies.get(self._cookie_settings(request)["name"]) or "").strip() or None
             revoke_all = bool(payload.get("revoke_all", False))
             auth_header = request.headers.get("Authorization", "")
             access_token = auth_header[7:] if auth_header.startswith("Bearer ") else None

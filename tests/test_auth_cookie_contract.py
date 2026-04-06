@@ -36,7 +36,7 @@ def test_login_sets_http_only_refresh_cookie_and_omits_body_refresh_token():
     handler.get_app_component = lambda request, key: _DummyAuthService()
 
     async def _get_request_json(_request):
-        return {"username": "admin", "password": "admin123!"}
+        return {"username": "admin", "password": "example-password"}
 
     handler.get_request_json = _get_request_json
 

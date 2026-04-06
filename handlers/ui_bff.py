@@ -568,7 +568,7 @@ class UIBffHandler(
         if self._system_api is None:
             db_manager = create_database_manager()
             self._system_api = UISystemDataAPI(db_manager)
-            self._system_api.seed_defaults()
+            self._system_api.seed_defaults(admin_password=None)
         return self._system_api
 
     @staticmethod

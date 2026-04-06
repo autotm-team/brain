@@ -11,7 +11,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -115,7 +114,7 @@ class DataInitializationCoordinator:
         self.state_path = STATE_PATH
         self.state = InitState.from_file(self.state_path)
         self._bootstrap_watch_tasks: set[asyncio.Task[Any]] = set()
-        self.flowhub_stable_wait_seconds = int(os.getenv("BRAIN_FLOWHUB_STABLE_WAIT_SECONDS", "20"))
+        self.flowhub_stable_wait_seconds = int(config.service.flowhub_stable_wait_seconds)
         # define phases
         for name in ("stock_meta", "macro_core", "equities", "macro_rest"):
             if name not in self.state.phases:
