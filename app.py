@@ -25,6 +25,7 @@ from initializers.data_initializer import DataInitializationCoordinator
 from task_orchestrator import TaskOrchestrator
 from auth_service import AuthService
 from control_plane_settings import BrainControlPlaneSettingsService
+from config_manager import BrainConfigManager
 
 logger = logging.getLogger(__name__)
 
@@ -308,6 +309,8 @@ async def init_components(app: web.Application, config: IntegrationConfig):
             "Control-plane settings initialized: %s",
             app["control_plane_settings"].last_startup_summary(),
         )
+        app["config_manager"] = BrainConfigManager(config=config, app=app)
+        await app["config_manager"].initialize()
 
         async def _dispatch_schedule(payload: dict) -> None:
             schedule = payload.get("schedule") if isinstance(payload, dict) else {}

@@ -765,6 +765,178 @@ class UIBffHandler(
                 return {"raw": body}
             return body
 
+    def _get_config_manager(self):
+        if self._app is None or "config_manager" not in self._app:
+            raise RuntimeError("Brain config manager is not initialized")
+        return self._app["config_manager"]
+
+    def _current_actor_id(self, request: web.Request) -> str:
+        current_user = request.get("current_user")
+        if isinstance(current_user, dict):
+            return str(current_user.get("id") or current_user.get("username") or "user_admin")
+        return "user_admin"
+
+    def _ensure_config_proxy_enabled(self, service_name: str | None = None) -> None:
+        if service_name == "brain":
+            return
+        manager = self._get_config_manager()
+        if hasattr(manager, "config_proxy_enabled") and not manager.config_proxy_enabled():
+            raise ValueError("Brain config proxy is disabled by dynamic configuration")
+
+    async def _fetch_service_config_payload(self, request: web.Request, service_name: str, kind: str) -> Dict[str, Any]:
+        if service_name == "brain":
+            manager = self._get_config_manager()
+            if kind == "runtime":
+                return manager.runtime_snapshot(masked=True)
+            if kind == "dynamic":
+                return await manager.dynamic_snapshot(masked=True)
+            if kind == "catalog":
+                return manager.catalog()
+            raise ValueError(f"Unsupported config kind: {kind}")
+        payload = await self._fetch_upstream_json(request, service_name, f"/api/v1/system/config/{kind}")
+        return self._unwrap_response_data(payload)
+
+    async def _post_service_config_payload(
+        self,
+        request: web.Request,
+        service_name: str,
+        path: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if service_name == "brain":
+            manager = self._get_config_manager()
+            if path.endswith("/dynamic"):
+                return await manager.update_dynamic_config(
+                    payload.get("changes"),
+                    actor_id=str(payload.get("actor_id") or "user_admin"),
+                    source=str(payload.get("source") or "brain_proxy"),
+                )
+            if path.endswith("/reload"):
+                return await manager.reload()
+            raise ValueError(f"Unsupported brain config path: {path}")
+        upstream = await self._fetch_upstream_json(request, service_name, path, method="POST", payload=payload)
+        return self._unwrap_response_data(upstream)
+
+    async def _append_config_audit(self, actor_id: str, action: str, service_name: str, payload: Dict[str, Any]) -> None:
+        api = self._get_system_api()
+        api.append_audit_log(
+            SystemAuditDTO(
+                id=str(uuid.uuid4()),
+                actor_id=actor_id,
+                action=action,
+                target_type="service_config",
+                target_id=service_name,
+                payload=payload,
+                created_at=datetime.utcnow().isoformat(),
+            )
+        )
+
+    async def _handle_system_config_services_list(self, request: web.Request) -> web.Response:
+        registry = self.get_app_component(request, "service_registry")
+        services = getattr(registry, "_services", {})
+        items = [
+            {
+                "service": "brain",
+                "status": "healthy",
+                "runtime_path": "/api/v1/ui/system/config/services/brain/runtime",
+                "dynamic_path": "/api/v1/ui/system/config/services/brain/dynamic",
+                "catalog_path": "/api/v1/ui/system/config/services/brain/catalog",
+            }
+        ]
+        for service_name in ("macro", "execution", "portfolio", "flowhub"):
+            record = services.get(service_name, {})
+            items.append(
+                {
+                    "service": service_name,
+                    "status": record.get("status", "unknown"),
+                    "runtime_path": f"/api/v1/ui/system/config/services/{service_name}/runtime",
+                    "dynamic_path": f"/api/v1/ui/system/config/services/{service_name}/dynamic",
+                    "catalog_path": f"/api/v1/ui/system/config/services/{service_name}/catalog",
+                }
+            )
+        return self.success_response({"items": items, "total": len(items)})
+
+    async def _handle_system_config_runtime(self, request: web.Request, service_name: str) -> web.Response:
+        try:
+            self._ensure_config_proxy_enabled(service_name)
+            return self.success_response(await self._fetch_service_config_payload(request, service_name, "runtime"))
+        except ValueError as exc:
+            return self.error_response(str(exc), 400)
+        except UpstreamServiceError as exc:
+            return self.error_response(exc.error.get("message") or "Upstream config runtime failed", 502)
+
+    async def _handle_system_config_dynamic(self, request: web.Request, service_name: str) -> web.Response:
+        try:
+            self._ensure_config_proxy_enabled(service_name)
+            return self.success_response(await self._fetch_service_config_payload(request, service_name, "dynamic"))
+        except ValueError as exc:
+            return self.error_response(str(exc), 400)
+        except UpstreamServiceError as exc:
+            return self.error_response(exc.error.get("message") or "Upstream config dynamic failed", 502)
+
+    async def _handle_system_config_catalog(self, request: web.Request, service_name: str) -> web.Response:
+        try:
+            self._ensure_config_proxy_enabled(service_name)
+            return self.success_response(await self._fetch_service_config_payload(request, service_name, "catalog"))
+        except ValueError as exc:
+            return self.error_response(str(exc), 400)
+        except UpstreamServiceError as exc:
+            return self.error_response(exc.error.get("message") or "Upstream config catalog failed", 502)
+
+    async def _handle_system_config_update(self, request: web.Request, service_name: str) -> web.Response:
+        try:
+            self._ensure_config_proxy_enabled(service_name)
+        except ValueError as exc:
+            return self.error_response(str(exc), 503)
+        body = await self.get_request_json(request)
+        if not isinstance(body, dict):
+            return self.error_response("Request body must be a JSON object", 400)
+        actor_id = self._current_actor_id(request)
+        try:
+            payload = await self._post_service_config_payload(
+                request,
+                service_name,
+                "/api/v1/system/config/dynamic",
+                {
+                    "changes": body.get("changes"),
+                    "actor_id": actor_id,
+                    "source": "brain_proxy",
+                },
+            )
+        except ValueError as exc:
+            return self.error_response(str(exc), 400)
+        except UpstreamServiceError as exc:
+            return self.error_response(exc.error.get("message") or "Upstream config update failed", 502)
+        await self._append_config_audit(
+            actor_id,
+            "service_config.update_dynamic",
+            service_name,
+            {"changes": body.get("changes")},
+        )
+        return self.success_response(payload, "Dynamic config updated")
+
+    async def _handle_system_config_reload(self, request: web.Request, service_name: str) -> web.Response:
+        try:
+            self._ensure_config_proxy_enabled(service_name)
+            actor_id = self._current_actor_id(request)
+            payload = await self._post_service_config_payload(
+                request,
+                service_name,
+                "/api/v1/system/config/reload",
+                {"actor_id": actor_id, "source": "brain_proxy"},
+            )
+        except ValueError as exc:
+            return self.error_response(str(exc), 400)
+        except UpstreamServiceError as exc:
+            return self.error_response(exc.error.get("message") or "Upstream config reload failed", 502)
+        await self._append_config_audit(
+            actor_id,
+            "service_config.reload",
+            service_name,
+            {"result": payload},
+        )
+        return self.success_response(payload, "Config reloaded")
+
     async def _handle_system_settings_list(self, request: web.Request) -> web.Response:
         api = self._get_system_api()
         control_plane_service = self._app.get("control_plane_settings") if self._app is not None else None
@@ -1592,6 +1764,26 @@ class UIBffHandler(
             matched = re.match(r"^/api/v1/ui/system/data/backfill/(?P<action>[^/]+)$", path)
             if matched:
                 return await self._handle_system_data_backfill(request, matched.group("action"))
+
+        if method == "GET" and path == "/api/v1/ui/system/config/services":
+            return await self._handle_system_config_services_list(request)
+        if method == "GET":
+            matched = re.match(r"^/api/v1/ui/system/config/services/(?P<service>[^/]+)/runtime$", path)
+            if matched:
+                return await self._handle_system_config_runtime(request, matched.group("service"))
+            matched = re.match(r"^/api/v1/ui/system/config/services/(?P<service>[^/]+)/dynamic$", path)
+            if matched:
+                return await self._handle_system_config_dynamic(request, matched.group("service"))
+            matched = re.match(r"^/api/v1/ui/system/config/services/(?P<service>[^/]+)/catalog$", path)
+            if matched:
+                return await self._handle_system_config_catalog(request, matched.group("service"))
+        if method == "POST":
+            matched = re.match(r"^/api/v1/ui/system/config/services/(?P<service>[^/]+)/dynamic$", path)
+            if matched:
+                return await self._handle_system_config_update(request, matched.group("service"))
+            matched = re.match(r"^/api/v1/ui/system/config/services/(?P<service>[^/]+)/reload$", path)
+            if matched:
+                return await self._handle_system_config_reload(request, matched.group("service"))
 
         if method == "GET" and path == "/api/v1/ui/system/settings":
             return await self._handle_system_settings_list(request)

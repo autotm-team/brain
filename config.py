@@ -10,6 +10,7 @@ import json
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 import yaml
 from pydantic import AliasChoices, Field
@@ -285,30 +286,72 @@ class LoggingConfig(BaseSettings):
 
 
 class DatabaseConfig(BaseSettings):
-    url: str = Field(default="postgresql://user:password@localhost:5432/stock_data", validation_alias="DATABASE_URL")
-    pool_size: int = Field(default=20, validation_alias="DATABASE_POOL_SIZE")
-    max_overflow: int = Field(default=30, validation_alias="DATABASE_MAX_OVERFLOW")
-    pool_timeout: int = Field(default=30, validation_alias="DATABASE_POOL_TIMEOUT")
-    pool_recycle: int = Field(default=3600, validation_alias="DATABASE_POOL_RECYCLE")
+    url: str = Field(
+        default="postgresql://user:password@localhost:5432/stock_data",
+        validation_alias=AliasChoices("DATABASE_URL", "BRAIN_DATABASE_URL"),
+    )
+    pool_size: int = Field(default=20, validation_alias=AliasChoices("DATABASE_POOL_SIZE", "BRAIN_DATABASE_POOL_SIZE"))
+    max_overflow: int = Field(
+        default=30,
+        validation_alias=AliasChoices("DATABASE_MAX_OVERFLOW", "BRAIN_DATABASE_MAX_OVERFLOW"),
+    )
+    pool_timeout: int = Field(
+        default=30,
+        validation_alias=AliasChoices("DATABASE_POOL_TIMEOUT", "BRAIN_DATABASE_POOL_TIMEOUT"),
+    )
+    pool_recycle: int = Field(
+        default=3600,
+        validation_alias=AliasChoices("DATABASE_POOL_RECYCLE", "BRAIN_DATABASE_POOL_RECYCLE"),
+    )
 
     model_config = COMMON_MODEL_CONFIG
 
 
 class EconDBRuntimeConfig(BaseSettings):
-    host: str = Field(default="localhost", validation_alias="ECONDB_DB_HOST")
-    port: int = Field(default=5432, validation_alias="ECONDB_DB_PORT")
-    name: str = Field(default="stock_data", validation_alias="ECONDB_DB_NAME")
-    user: str = Field(default="postgres", validation_alias="ECONDB_DB_USER")
-    password: str = Field(default="", validation_alias="ECONDB_DB_PASSWORD")
-    pool_size: int = Field(default=10, validation_alias="ECONDB_DB_POOL_SIZE")
-    max_overflow: int = Field(default=10, validation_alias="ECONDB_DB_MAX_OVERFLOW")
-    pool_recycle: int = Field(default=1800, validation_alias="ECONDB_DB_POOL_RECYCLE")
-    pool_timeout: int = Field(default=30, validation_alias="ECONDB_DB_POOL_TIMEOUT")
+    url: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("ECONDB_DATABASE_URL", "BRAIN_ECONDB_DATABASE_URL"),
+    )
+    host: str = Field(default="localhost", validation_alias=AliasChoices("ECONDB_DB_HOST", "BRAIN_ECONDB_DB_HOST"))
+    port: int = Field(default=5432, validation_alias=AliasChoices("ECONDB_DB_PORT", "BRAIN_ECONDB_DB_PORT"))
+    name: str = Field(default="stock_data", validation_alias=AliasChoices("ECONDB_DB_NAME", "BRAIN_ECONDB_DB_NAME"))
+    user: str = Field(default="postgres", validation_alias=AliasChoices("ECONDB_DB_USER", "BRAIN_ECONDB_DB_USER"))
+    password: str = Field(default="", validation_alias=AliasChoices("ECONDB_DB_PASSWORD", "BRAIN_ECONDB_DB_PASSWORD"))
+    pool_size: int = Field(default=10, validation_alias=AliasChoices("ECONDB_DB_POOL_SIZE", "BRAIN_ECONDB_DB_POOL_SIZE"))
+    max_overflow: int = Field(
+        default=10,
+        validation_alias=AliasChoices("ECONDB_DB_MAX_OVERFLOW", "BRAIN_ECONDB_DB_MAX_OVERFLOW"),
+    )
+    pool_recycle: int = Field(
+        default=1800,
+        validation_alias=AliasChoices("ECONDB_DB_POOL_RECYCLE", "BRAIN_ECONDB_DB_POOL_RECYCLE"),
+    )
+    pool_timeout: int = Field(
+        default=30,
+        validation_alias=AliasChoices("ECONDB_DB_POOL_TIMEOUT", "BRAIN_ECONDB_DB_POOL_TIMEOUT"),
+    )
 
     model_config = COMMON_MODEL_CONFIG
 
+    def model_post_init(self, __context: Any) -> None:
+        if not self.url:
+            return
+        parsed = urlparse(self.url)
+        if parsed.hostname and self.host == "localhost":
+            self.host = parsed.hostname
+        if parsed.port and self.port == 5432:
+            self.port = parsed.port
+        if parsed.path and self.name == "stock_data":
+            self.name = parsed.path.lstrip("/") or self.name
+        if parsed.username and self.user == "postgres":
+            self.user = parsed.username
+        if parsed.password is not None and self.password == "":
+            self.password = parsed.password
+
     @property
     def database_url(self) -> str:
+        if self.url:
+            return str(self.url)
         return f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.name}"
 
     def econdb_override(self) -> Dict[str, Any]:
@@ -327,14 +370,29 @@ class EconDBRuntimeConfig(BaseSettings):
 
 
 class RedisConfig(BaseSettings):
-    url: str = Field(default="redis://localhost:6379/0", validation_alias="REDIS_URL")
-    host: str = Field(default="localhost", validation_alias="REDIS_HOST")
-    port: int = Field(default=6379, validation_alias="REDIS_PORT")
-    db: int = Field(default=0, validation_alias="REDIS_DB")
-    password: Optional[str] = Field(default=None, validation_alias="REDIS_PASSWORD")
-    max_connections: int = Field(default=50, validation_alias="REDIS_MAX_CONNECTIONS")
+    url: str = Field(default="redis://localhost:6379/0", validation_alias=AliasChoices("REDIS_URL", "BRAIN_REDIS_URL"))
+    host: str = Field(default="localhost", validation_alias=AliasChoices("REDIS_HOST", "BRAIN_REDIS_HOST"))
+    port: int = Field(default=6379, validation_alias=AliasChoices("REDIS_PORT", "BRAIN_REDIS_PORT"))
+    db: int = Field(default=0, validation_alias=AliasChoices("REDIS_DB", "BRAIN_REDIS_DB"))
+    password: Optional[str] = Field(default=None, validation_alias=AliasChoices("REDIS_PASSWORD", "BRAIN_REDIS_PASSWORD"))
+    max_connections: int = Field(
+        default=50,
+        validation_alias=AliasChoices("REDIS_MAX_CONNECTIONS", "BRAIN_REDIS_MAX_CONNECTIONS"),
+    )
 
     model_config = COMMON_MODEL_CONFIG
+
+    def model_post_init(self, __context: Any) -> None:
+        parsed = urlparse(self.url)
+        if parsed.hostname and self.host == "localhost":
+            self.host = parsed.hostname
+        if parsed.port and self.port == 6379:
+            self.port = parsed.port
+        db_part = (parsed.path or "/0").lstrip("/")
+        if db_part and self.db == 0:
+            self.db = int(db_part)
+        if parsed.password is not None and self.password is None:
+            self.password = parsed.password
 
 
 class SchemaConfig(BaseSettings):
