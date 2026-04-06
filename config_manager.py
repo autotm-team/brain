@@ -464,6 +464,8 @@ class BrainConfigManager:
     async def reload(self) -> Dict[str, Any]:
         previous_runtime = self._runtime_dict()
         self.config = get_settings(force_reload=True)
+        if not self.config.validate():
+            raise ValueError("Brain runtime configuration validation failed during reload")
         self._service_dynamic = await self._load_service_dynamic()
         self._apply_service_dynamic()
         if self._app is not None:

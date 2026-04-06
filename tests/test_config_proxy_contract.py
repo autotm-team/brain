@@ -71,6 +71,7 @@ async def test_ui_bff_handles_system_config_routes_for_brain_and_upstream():
     handler.logger = logging.getLogger("test-ui-bff-config-proxy")
     handler._system_api = _FakeSystemApi()
     handler._app = {
+        "config": SimpleNamespace(service=SimpleNamespace(config_proxy_token="proxy-token")),
         "config_manager": _FakeBrainConfigManager(),
         "service_registry": SimpleNamespace(
             _services={
@@ -81,8 +82,10 @@ async def test_ui_bff_handles_system_config_routes_for_brain_and_upstream():
             }
         ),
     }
+    observed = {}
 
-    async def _fake_fetch(_request, service_name: str, path: str, method: str = "GET", params=None, payload=None):
+    async def _fake_fetch(_request, service_name: str, path: str, method: str = "GET", params=None, payload=None, headers=None):
+        observed["headers"] = headers
         return {"data": {"service": service_name, "path": path, "method": method, "payload": payload}}
 
     async def _fake_get_json(_request):
@@ -113,6 +116,7 @@ async def test_ui_bff_handles_system_config_routes_for_brain_and_upstream():
     update_response = await handler._handle_internal_route(update_request)
     assert update_response.status == 200
     assert handler._system_api.audit_logs[-1]["action"] == "service_config.update_dynamic"
+    assert observed["headers"]["X-AutoTM-Config-Proxy-Token"] == "proxy-token"
 
     reload_request = _DummyRequest("POST", "/api/v1/ui/system/config/services/brain/reload")
     reload_request.app = handler._app
@@ -132,11 +136,12 @@ async def test_ui_bff_keeps_brain_config_access_when_worker_proxy_is_disabled():
     handler.logger = logging.getLogger("test-ui-bff-config-proxy-disabled")
     handler._system_api = _FakeSystemApi()
     handler._app = {
+        "config": SimpleNamespace(service=SimpleNamespace(config_proxy_token="proxy-token")),
         "config_manager": _FakeBrainConfigManager(enabled=False),
         "service_registry": SimpleNamespace(_services={"macro": {"status": "healthy"}}),
     }
 
-    async def _fake_fetch(_request, service_name: str, path: str, method: str = "GET", params=None, payload=None):
+    async def _fake_fetch(_request, service_name: str, path: str, method: str = "GET", params=None, payload=None, headers=None):
         return {"data": {"service": service_name, "path": path, "method": method, "payload": payload}}
 
     handler._fetch_upstream_json = _fake_fetch

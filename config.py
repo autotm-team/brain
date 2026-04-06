@@ -173,6 +173,11 @@ class ServiceConfig(BaseSettings):
     host: str = Field(default="0.0.0.0", validation_alias="BRAIN_HOST")
     port: int = Field(default=8088, validation_alias="BRAIN_PORT")
     debug: bool = Field(default=False, validation_alias="BRAIN_DEBUG")
+    config_proxy_token: str = Field(
+        default="",
+        validation_alias="AUTOTM_CONFIG_PROXY_TOKEN",
+        exclude=True,
+    )
 
     macro_service_url: str = Field(
         default="http://macro:8080",
@@ -286,9 +291,9 @@ class LoggingConfig(BaseSettings):
 
 
 class DatabaseConfig(BaseSettings):
-    url: str = Field(
-        default="postgresql://user:password@localhost:5432/stock_data",
-        validation_alias=AliasChoices("DATABASE_URL", "BRAIN_DATABASE_URL"),
+    url: Optional[str] = Field(
+        default=None,
+        validation_alias="DATABASE_URL",
     )
     pool_size: int = Field(default=20, validation_alias=AliasChoices("DATABASE_POOL_SIZE", "BRAIN_DATABASE_POOL_SIZE"))
     max_overflow: int = Field(
@@ -310,7 +315,7 @@ class DatabaseConfig(BaseSettings):
 class EconDBRuntimeConfig(BaseSettings):
     url: Optional[str] = Field(
         default=None,
-        validation_alias=AliasChoices("ECONDB_DATABASE_URL", "BRAIN_ECONDB_DATABASE_URL"),
+        validation_alias="ECONDB_DATABASE_URL",
     )
     host: str = Field(default="localhost", validation_alias=AliasChoices("ECONDB_DB_HOST", "BRAIN_ECONDB_DB_HOST"))
     port: int = Field(default=5432, validation_alias=AliasChoices("ECONDB_DB_PORT", "BRAIN_ECONDB_DB_PORT"))
@@ -370,7 +375,7 @@ class EconDBRuntimeConfig(BaseSettings):
 
 
 class RedisConfig(BaseSettings):
-    url: str = Field(default="redis://localhost:6379/0", validation_alias=AliasChoices("REDIS_URL", "BRAIN_REDIS_URL"))
+    url: Optional[str] = Field(default=None, validation_alias="REDIS_URL")
     host: str = Field(default="localhost", validation_alias=AliasChoices("REDIS_HOST", "BRAIN_REDIS_HOST"))
     port: int = Field(default=6379, validation_alias=AliasChoices("REDIS_PORT", "BRAIN_REDIS_PORT"))
     db: int = Field(default=0, validation_alias=AliasChoices("REDIS_DB", "BRAIN_REDIS_DB"))
@@ -383,6 +388,8 @@ class RedisConfig(BaseSettings):
     model_config = COMMON_MODEL_CONFIG
 
     def model_post_init(self, __context: Any) -> None:
+        if not self.url:
+            return
         parsed = urlparse(self.url)
         if parsed.hostname and self.host == "localhost":
             self.host = parsed.hostname
@@ -505,6 +512,9 @@ class BrainSettings:
         self.logging = LoggingConfig()
         self.database = DatabaseConfig()
         self.econdb = EconDBRuntimeConfig()
+        if not self.econdb.url and self.database.url:
+            self.econdb.url = self.database.url
+            self.econdb.model_post_init(None)
         self.redis = RedisConfig()
         self.db_schema = SchemaConfig()
         self.control_plane = ControlPlaneDefaultsConfig()

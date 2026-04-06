@@ -55,6 +55,7 @@ HOP_BY_HOP_HEADERS = {
     "upgrade",
     "host",
 }
+CONFIG_PROXY_TOKEN_HEADER = "X-AutoTM-Config-Proxy-Token"
 
 CORS_HEADERS = {
     "access-control-allow-origin",
@@ -738,6 +739,7 @@ class UIBffHandler(
         method: str = "GET",
         params: Optional[Dict[str, Any]] = None,
         payload: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         registry = self.get_app_component(request, "service_registry")
         service = getattr(registry, "_services", {}).get(service_name)
@@ -746,7 +748,13 @@ class UIBffHandler(
             raise RuntimeError(f"Service not available: {service_name}")
 
         target_url = f"{service['url'].rstrip('/')}{path}"
-        async with session.request(method.upper(), target_url, params=params, json=payload) as resp:
+        async with session.request(
+            method.upper(),
+            target_url,
+            params=params,
+            json=payload,
+            headers=headers,
+        ) as resp:
             raw = await resp.text()
             body: Dict[str, Any]
             try:
@@ -783,6 +791,14 @@ class UIBffHandler(
         if hasattr(manager, "config_proxy_enabled") and not manager.config_proxy_enabled():
             raise ValueError("Brain config proxy is disabled by dynamic configuration")
 
+    def _config_proxy_headers(self) -> Dict[str, str]:
+        config = self._app.get("config") if self._app is not None else None
+        service_config = getattr(config, "service", None)
+        token = str(getattr(service_config, "config_proxy_token", "") or "").strip()
+        if not token:
+            raise ValueError("Brain config proxy token is not configured")
+        return {CONFIG_PROXY_TOKEN_HEADER: token}
+
     async def _fetch_service_config_payload(self, request: web.Request, service_name: str, kind: str) -> Dict[str, Any]:
         if service_name == "brain":
             manager = self._get_config_manager()
@@ -814,7 +830,14 @@ class UIBffHandler(
             if path.endswith("/reload"):
                 return await manager.reload()
             raise ValueError(f"Unsupported brain config path: {path}")
-        upstream = await self._fetch_upstream_json(request, service_name, path, method="POST", payload=payload)
+        upstream = await self._fetch_upstream_json(
+            request,
+            service_name,
+            path,
+            method="POST",
+            payload=payload,
+            headers=self._config_proxy_headers(),
+        )
         return self._unwrap_response_data(upstream)
 
     async def _append_config_audit(self, actor_id: str, action: str, service_name: str, payload: Dict[str, Any]) -> None:

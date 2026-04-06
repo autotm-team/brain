@@ -448,10 +448,9 @@ class SystemCoordinator(ISystemCoordinator):
         try:
             # 获取组合适配器
             if not hasattr(self, '_portfolio_adapter') or self._portfolio_adapter is None:
-                # 使用默认配置或从现有配置获取
-                from config import get_settings
-
-                config = getattr(self, 'config', get_settings())
+                config = getattr(self, 'config', None)
+                if config is None:
+                    raise RuntimeError("SystemCoordinator runtime config is not bound")
                 self._portfolio_adapter = PortfolioAdapter(config)
                 await self._portfolio_adapter.connect_to_system()
 
@@ -746,9 +745,9 @@ class SystemCoordinator(ISystemCoordinator):
         try:
             # 获取组合适配器
             if not hasattr(self, '_portfolio_adapter') or self._portfolio_adapter is None:
-                from config import get_settings
-
-                config = getattr(self, 'config', get_settings())
+                config = getattr(self, 'config', None)
+                if config is None:
+                    raise RuntimeError("SystemCoordinator runtime config is not bound")
                 self._portfolio_adapter = PortfolioAdapter(config)
                 await self._portfolio_adapter.connect_to_system()
 

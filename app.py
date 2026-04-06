@@ -289,7 +289,7 @@ async def init_components(app: web.Application, config: IntegrationConfig):
                 socket_timeout=30,
                 socket_connect_timeout=10,
                 retry_on_timeout=True,
-                max_connections=50,
+                max_connections=config.redis.max_connections,
                 health_check_interval=15,
             )
             await app['redis'].ping()
