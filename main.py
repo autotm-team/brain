@@ -41,6 +41,7 @@ def validate_schema_requirements(config: IntegrationConfig) -> None:
             "ui_auth_sessions",
         ],
         exit_on_failure=config.db_schema.exit_on_failure,
+        config=config.econdb.econdb_override(),
     )
 
 

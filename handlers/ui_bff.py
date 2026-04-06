@@ -788,25 +788,37 @@ class UIBffHandler(
         updated_by = body.get("updated_by") or "user_admin"
 
         api = self._get_system_api()
-        setting_payload = api.upsert_setting(
-            SystemSettingDTO(
-                key=key,
-                value=value if isinstance(value, dict) else {"value": value},
-                metadata=metadata,
-                updated_by=str(updated_by),
-            )
-        )
-        api.append_audit_log(
-            SystemAuditDTO(
-                id=str(uuid.uuid4()),
-                actor_id=str(updated_by),
-                action="setting.upsert",
-                target_type="setting",
-                target_id=key,
-                payload={"value": value, "metadata": metadata},
-                created_at=datetime.utcnow().isoformat(),
-            )
-        )
+        control_plane_service = self._app.get("control_plane_settings") if self._app is not None else None
+        try:
+            if control_plane_service is not None and control_plane_service.is_managed_key(key):
+                setting_payload = await control_plane_service.upsert_setting(
+                    key,
+                    value if isinstance(value, dict) else {"value": value},
+                    updated_by=str(updated_by),
+                    metadata=metadata,
+                )
+            else:
+                setting_payload = api.upsert_setting(
+                    SystemSettingDTO(
+                        key=key,
+                        value=value if isinstance(value, dict) else {"value": value},
+                        metadata=metadata,
+                        updated_by=str(updated_by),
+                    )
+                )
+                api.append_audit_log(
+                    SystemAuditDTO(
+                        id=str(uuid.uuid4()),
+                        actor_id=str(updated_by),
+                        action="setting.upsert",
+                        target_type="setting",
+                        target_id=key,
+                        payload={"value": value, "metadata": metadata},
+                        created_at=datetime.utcnow().isoformat(),
+                    )
+                )
+        except ValueError as exc:
+            return self.error_response(str(exc), 400)
         return self.success_response(setting_payload, "Setting updated")
 
     async def _handle_system_users_list(self, request: web.Request) -> web.Response:

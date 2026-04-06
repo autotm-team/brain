@@ -304,7 +304,10 @@ async def init_components(app: web.Application, config: IntegrationConfig):
 
         app["control_plane_settings"] = BrainControlPlaneSettingsService(config)
         await app["control_plane_settings"].ensure_seeded()
-        logger.info("Control-plane settings initialized")
+        logger.info(
+            "Control-plane settings initialized: %s",
+            app["control_plane_settings"].last_startup_summary(),
+        )
 
         async def _dispatch_schedule(payload: dict) -> None:
             schedule = payload.get("schedule") if isinstance(payload, dict) else {}

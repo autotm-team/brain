@@ -4,8 +4,9 @@ Integration Service 路由模块
 设置所有API路由和WebSocket连接。
 """
 
+from typing import Any
+
 from aiohttp import web
-from aiohttp_cors import CorsConfig
 
 from .health import setup_health_routes
 from .tasks import setup_task_routes
@@ -13,7 +14,7 @@ from .ui_bff import setup_ui_bff_routes
 from .auth import setup_auth_routes
 
 
-def setup_routes(app: web.Application, cors: CorsConfig = None):
+def setup_routes(app: web.Application, cors: Any = None):
     """设置所有路由
     
     Args:
