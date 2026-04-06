@@ -535,6 +535,7 @@ class UIBffHandler(
 
     def __init__(self):
         super().__init__()
+        self._app = None
         self._system_api = None
         self._macro_template_lock = asyncio.Lock()
 
@@ -566,7 +567,11 @@ class UIBffHandler(
                 "UISystemDataAPI unavailable; install or update the econdb runtime dependency"
             ) from _ECONDB_IMPORT_ERROR
         if self._system_api is None:
-            db_manager = create_database_manager()
+            config = self._app.get("config") if self._app is not None else None
+            econdb_cfg = getattr(config, "econdb", None)
+            db_manager = create_database_manager(
+                econdb_cfg.econdb_override() if econdb_cfg is not None else None
+            )
             self._system_api = UISystemDataAPI(db_manager)
             self._system_api.seed_defaults(admin_password=None)
         return self._system_api

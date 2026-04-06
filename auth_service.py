@@ -62,7 +62,10 @@ class AuthService:
             ) from _ECONDB_IMPORT_ERROR
         self._config = config
         self._redis = redis_client
-        self._db_manager = create_database_manager()
+        econdb_cfg = getattr(config, "econdb", None)
+        self._db_manager = create_database_manager(
+            econdb_cfg.econdb_override() if econdb_cfg is not None else None
+        )
         self._api = UISystemDataAPI(self._db_manager)
 
         service_cfg = getattr(config, "service", None)

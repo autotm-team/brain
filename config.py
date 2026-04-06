@@ -199,50 +199,6 @@ class ServiceConfig(BaseSettings):
         default="Asia/Shanghai",
         validation_alias="BRAIN_SCHEDULER_TIMEZONE",
     )
-    daily_data_fetch_cron: Optional[str] = Field(
-        default="at:16:30",
-        validation_alias="BRAIN_SCHEDULER_DAILY_CRON",
-    )
-    daily_index_fetch_retry_interval_seconds: int = Field(
-        default=1800,
-        validation_alias="BRAIN_SCHEDULER_DAILY_INDEX_RETRY_INTERVAL_SECONDS",
-    )
-    daily_index_fetch_retry_attempts: int = Field(
-        default=3,
-        validation_alias="BRAIN_SCHEDULER_DAILY_INDEX_RETRY_ATTEMPTS",
-    )
-    monthly_sw_industry_full_fetch_cron: Optional[str] = Field(
-        default="at:16:30",
-        validation_alias="BRAIN_SCHEDULER_MONTHLY_SW_FULL_CRON",
-    )
-    daily_data_fetch_timeout: int = Field(
-        default=86400,
-        validation_alias="BRAIN_SCHEDULER_DAILY_FETCH_TIMEOUT",
-    )
-    strategy_plan_generation_cron: Optional[str] = Field(
-        default="at:18:50",
-        validation_alias="BRAIN_SCHEDULER_STRATEGY_PLAN_CRON",
-    )
-    strategy_plan_generation_timeout: int = Field(
-        default=7200,
-        validation_alias="BRAIN_SCHEDULER_STRATEGY_PLAN_TIMEOUT",
-    )
-    strategy_plan_lookback_days: int = Field(
-        default=180,
-        validation_alias="BRAIN_SCHEDULER_STRATEGY_PLAN_LOOKBACK_DAYS",
-    )
-    strategy_plan_initial_cash: float = Field(
-        default=3000000.0,
-        validation_alias="BRAIN_SCHEDULER_STRATEGY_PLAN_INITIAL_CASH",
-    )
-    strategy_plan_benchmark: str = Field(
-        default="000300.SH",
-        validation_alias="BRAIN_SCHEDULER_STRATEGY_PLAN_BENCHMARK",
-    )
-    strategy_plan_cost: str = Field(
-        default="5bp",
-        validation_alias="BRAIN_SCHEDULER_STRATEGY_PLAN_COST",
-    )
 
     monitoring_enabled: bool = Field(
         default=True,
@@ -300,6 +256,142 @@ class ServiceConfig(BaseSettings):
 
     cors_allowed_origins_raw: str = Field(default="", validation_alias="BRAIN_CORS_ALLOWED_ORIGINS")
 
+    model_config = COMMON_MODEL_CONFIG
+
+    @property
+    def init_wait_dependencies(self) -> List[str]:
+        return _split_csv(self.init_wait_dependencies_raw, default=["flowhub"])
+
+    @property
+    def init_retry(self) -> Dict[str, Any]:
+        return {
+            "max_retries": self.init_retry_max_retries,
+            "backoff": _split_int_csv(self.init_retry_backoff_raw, default=[1, 2, 3, 5, 8, 13]),
+            "timeout": self.init_retry_timeout,
+        }
+
+    @property
+    def cors_allowed_origins(self) -> List[str]:
+        return _split_csv(self.cors_allowed_origins_raw, default=DEFAULT_CORS_ALLOWED_ORIGINS)
+
+
+class LoggingConfig(BaseSettings):
+    level: str = Field(default="INFO", validation_alias="BRAIN_LOG_LEVEL")
+    file: str = Field(default="logs/integration.log", validation_alias="BRAIN_LOG_FILE")
+    max_size: int = 10485760
+    backup_count: int = 5
+    format: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+    model_config = COMMON_MODEL_CONFIG
+
+
+class DatabaseConfig(BaseSettings):
+    url: str = Field(default="postgresql://user:password@localhost:5432/stock_data", validation_alias="DATABASE_URL")
+    pool_size: int = Field(default=20, validation_alias="DATABASE_POOL_SIZE")
+    max_overflow: int = Field(default=30, validation_alias="DATABASE_MAX_OVERFLOW")
+    pool_timeout: int = Field(default=30, validation_alias="DATABASE_POOL_TIMEOUT")
+    pool_recycle: int = Field(default=3600, validation_alias="DATABASE_POOL_RECYCLE")
+
+    model_config = COMMON_MODEL_CONFIG
+
+
+class EconDBRuntimeConfig(BaseSettings):
+    host: str = Field(default="localhost", validation_alias="ECONDB_DB_HOST")
+    port: int = Field(default=5432, validation_alias="ECONDB_DB_PORT")
+    name: str = Field(default="stock_data", validation_alias="ECONDB_DB_NAME")
+    user: str = Field(default="postgres", validation_alias="ECONDB_DB_USER")
+    password: str = Field(default="", validation_alias="ECONDB_DB_PASSWORD")
+    pool_size: int = Field(default=10, validation_alias="ECONDB_DB_POOL_SIZE")
+    max_overflow: int = Field(default=10, validation_alias="ECONDB_DB_MAX_OVERFLOW")
+    pool_recycle: int = Field(default=1800, validation_alias="ECONDB_DB_POOL_RECYCLE")
+    pool_timeout: int = Field(default=30, validation_alias="ECONDB_DB_POOL_TIMEOUT")
+
+    model_config = COMMON_MODEL_CONFIG
+
+    @property
+    def database_url(self) -> str:
+        return f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.name}"
+
+    def econdb_override(self) -> Dict[str, Any]:
+        return {
+            "database_url": self.database_url,
+            "db_host": self.host,
+            "db_port": self.port,
+            "db_name": self.name,
+            "db_user": self.user,
+            "db_password": self.password,
+            "pool_size": self.pool_size,
+            "max_overflow": self.max_overflow,
+            "pool_recycle": self.pool_recycle,
+            "pool_timeout": self.pool_timeout,
+        }
+
+
+class RedisConfig(BaseSettings):
+    url: str = Field(default="redis://localhost:6379/0", validation_alias="REDIS_URL")
+    host: str = Field(default="localhost", validation_alias="REDIS_HOST")
+    port: int = Field(default=6379, validation_alias="REDIS_PORT")
+    db: int = Field(default=0, validation_alias="REDIS_DB")
+    password: Optional[str] = Field(default=None, validation_alias="REDIS_PASSWORD")
+    max_connections: int = Field(default=50, validation_alias="REDIS_MAX_CONNECTIONS")
+
+    model_config = COMMON_MODEL_CONFIG
+
+
+class SchemaConfig(BaseSettings):
+    enforce: bool = Field(default=True, validation_alias="DB_SCHEMA_ENFORCE")
+    required_version: str = Field(default="V001", validation_alias="DB_SCHEMA_REQUIRED_VERSION")
+    exit_on_failure: bool = Field(default=True, validation_alias="DB_SCHEMA_EXIT_ON_FAILURE")
+    allow_runtime_ddl: bool = Field(default=False, validation_alias="DB_ALLOW_RUNTIME_DDL")
+
+    model_config = COMMON_MODEL_CONFIG
+
+
+class ControlPlaneDefaultsConfig(BaseSettings):
+    daily_data_fetch_cron: Optional[str] = Field(
+        default="at:16:30",
+        validation_alias="BRAIN_SCHEDULER_DAILY_CRON",
+    )
+    daily_index_fetch_retry_interval_seconds: int = Field(
+        default=1800,
+        validation_alias="BRAIN_SCHEDULER_DAILY_INDEX_RETRY_INTERVAL_SECONDS",
+    )
+    daily_index_fetch_retry_attempts: int = Field(
+        default=3,
+        validation_alias="BRAIN_SCHEDULER_DAILY_INDEX_RETRY_ATTEMPTS",
+    )
+    monthly_sw_industry_full_fetch_cron: Optional[str] = Field(
+        default="at:16:30",
+        validation_alias="BRAIN_SCHEDULER_MONTHLY_SW_FULL_CRON",
+    )
+    daily_data_fetch_timeout: int = Field(
+        default=86400,
+        validation_alias="BRAIN_SCHEDULER_DAILY_FETCH_TIMEOUT",
+    )
+    strategy_plan_generation_cron: Optional[str] = Field(
+        default="at:18:50",
+        validation_alias="BRAIN_SCHEDULER_STRATEGY_PLAN_CRON",
+    )
+    strategy_plan_generation_timeout: int = Field(
+        default=7200,
+        validation_alias="BRAIN_SCHEDULER_STRATEGY_PLAN_TIMEOUT",
+    )
+    strategy_plan_lookback_days: int = Field(
+        default=180,
+        validation_alias="BRAIN_SCHEDULER_STRATEGY_PLAN_LOOKBACK_DAYS",
+    )
+    strategy_plan_initial_cash: float = Field(
+        default=3000000.0,
+        validation_alias="BRAIN_SCHEDULER_STRATEGY_PLAN_INITIAL_CASH",
+    )
+    strategy_plan_benchmark: str = Field(
+        default="000300.SH",
+        validation_alias="BRAIN_SCHEDULER_STRATEGY_PLAN_BENCHMARK",
+    )
+    strategy_plan_cost: str = Field(
+        default="5bp",
+        validation_alias="BRAIN_SCHEDULER_STRATEGY_PLAN_COST",
+    )
     flowhub_bootstrap_enabled: bool = Field(default=True, validation_alias="BRAIN_FLOWHUB_BOOTSTRAP_ENABLED")
     flowhub_bootstrap_trigger_created: bool = Field(
         default=True,
@@ -341,62 +433,6 @@ class ServiceConfig(BaseSettings):
 
     model_config = COMMON_MODEL_CONFIG
 
-    @property
-    def init_wait_dependencies(self) -> List[str]:
-        return _split_csv(self.init_wait_dependencies_raw, default=["flowhub"])
-
-    @property
-    def init_retry(self) -> Dict[str, Any]:
-        return {
-            "max_retries": self.init_retry_max_retries,
-            "backoff": _split_int_csv(self.init_retry_backoff_raw, default=[1, 2, 3, 5, 8, 13]),
-            "timeout": self.init_retry_timeout,
-        }
-
-    @property
-    def cors_allowed_origins(self) -> List[str]:
-        return _split_csv(self.cors_allowed_origins_raw, default=DEFAULT_CORS_ALLOWED_ORIGINS)
-
-
-class LoggingConfig(BaseSettings):
-    level: str = Field(default="INFO", validation_alias="BRAIN_LOG_LEVEL")
-    file: str = Field(default="logs/integration.log", validation_alias="BRAIN_LOG_FILE")
-    max_size: int = 10485760
-    backup_count: int = 5
-    format: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-
-    model_config = COMMON_MODEL_CONFIG
-
-
-class DatabaseConfig(BaseSettings):
-    url: str = Field(default="postgresql://user:password@localhost:5432/stock_data", validation_alias="DATABASE_URL")
-    pool_size: int = Field(default=20, validation_alias="DATABASE_POOL_SIZE")
-    max_overflow: int = Field(default=30, validation_alias="DATABASE_MAX_OVERFLOW")
-    pool_timeout: int = Field(default=30, validation_alias="DATABASE_POOL_TIMEOUT")
-    pool_recycle: int = Field(default=3600, validation_alias="DATABASE_POOL_RECYCLE")
-
-    model_config = COMMON_MODEL_CONFIG
-
-
-class RedisConfig(BaseSettings):
-    url: str = Field(default="redis://localhost:6379/0", validation_alias="REDIS_URL")
-    host: str = Field(default="localhost", validation_alias="REDIS_HOST")
-    port: int = Field(default=6379, validation_alias="REDIS_PORT")
-    db: int = Field(default=0, validation_alias="REDIS_DB")
-    password: Optional[str] = Field(default=None, validation_alias="REDIS_PASSWORD")
-    max_connections: int = Field(default=50, validation_alias="REDIS_MAX_CONNECTIONS")
-
-    model_config = COMMON_MODEL_CONFIG
-
-
-class SchemaConfig(BaseSettings):
-    enforce: bool = Field(default=True, validation_alias="DB_SCHEMA_ENFORCE")
-    required_version: str = Field(default="V001", validation_alias="DB_SCHEMA_REQUIRED_VERSION")
-    exit_on_failure: bool = Field(default=True, validation_alias="DB_SCHEMA_EXIT_ON_FAILURE")
-    allow_runtime_ddl: bool = Field(default=False, validation_alias="DB_ALLOW_RUNTIME_DDL")
-
-    model_config = COMMON_MODEL_CONFIG
-
 
 class BrainSettings:
     def __init__(self, config_file: Optional[str] = None, environment: str = "development"):
@@ -411,8 +447,10 @@ class BrainSettings:
         self.service = ServiceConfig()
         self.logging = LoggingConfig()
         self.database = DatabaseConfig()
+        self.econdb = EconDBRuntimeConfig()
         self.redis = RedisConfig()
         self.db_schema = SchemaConfig()
+        self.control_plane = ControlPlaneDefaultsConfig()
 
     def get(self, key: str, default: Any = None) -> Any:
         value: Any = self
@@ -459,8 +497,10 @@ class BrainSettings:
             "service": {**self.service.model_dump(), "init_wait_dependencies": self.service.init_wait_dependencies, "init_retry": self.service.init_retry, "cors_allowed_origins": self.service.cors_allowed_origins},
             "logging": self.logging.model_dump(),
             "database": self.database.model_dump(),
+            "econdb": self.econdb.model_dump(),
             "redis": self.redis.model_dump(),
             "db_schema": self.db_schema.model_dump(),
+            "control_plane": self.control_plane.model_dump(),
         }
 
     def masked_summary(self) -> Dict[str, Any]:
@@ -485,11 +525,20 @@ class BrainSettings:
                 "pool_size": self.database.pool_size,
                 "max_overflow": self.database.max_overflow,
             },
+            "econdb": {
+                "database_url": _mask_url(self.econdb.database_url),
+                "pool_size": self.econdb.pool_size,
+                "max_overflow": self.econdb.max_overflow,
+            },
             "redis": {
                 "url": _mask_url(self.redis.url),
                 "max_connections": self.redis.max_connections,
             },
             "db_schema": self.db_schema.model_dump(),
+            "control_plane": {
+                "flowhub_bootstrap_enabled": self.control_plane.flowhub_bootstrap_enabled,
+                "strategy_plan_generation_cron": self.control_plane.strategy_plan_generation_cron,
+            },
         }
 
     def save_to_file(self, file_path: str) -> None:

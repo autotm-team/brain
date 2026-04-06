@@ -10,6 +10,7 @@ from handlers.ui_bff import UIBffHandler
 
 def setup_ui_bff_routes(app: web.Application, cors: CorsConfig = None):
     handler = UIBffHandler()
+    handler._app = app
     methods = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]
     routes = []
     for method in methods:

@@ -1554,7 +1554,11 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
                 raise RuntimeError(
                     "econdb runtime dependencies are unavailable; install service dependencies before using task storage"
                 ) from _ECONDB_IMPORT_ERROR
-            self._db_manager = create_database_manager()
+            app_config = self._app.get("config")
+            econdb_cfg = getattr(app_config, "econdb", None)
+            self._db_manager = create_database_manager(
+                econdb_cfg.econdb_override() if econdb_cfg is not None else None
+            )
         return self._db_manager
 
     def _get_task_api(self):
