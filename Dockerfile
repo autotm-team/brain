@@ -1,7 +1,7 @@
 # Brain Integration Service Dockerfile
 # AutoTM三层金融交易系统集成协调服务
 
-FROM python:3.13-slim AS base
+FROM python:3.13-slim AS build-base
 ARG APT_MIRROR=deb.debian.org
 ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 ARG PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn
@@ -36,7 +36,7 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 
 # 构建阶段
-FROM base AS builder
+FROM build-base AS builder
 
 WORKDIR /app
 
@@ -52,17 +52,33 @@ COPY external/econdb/ ./external/econdb/
 COPY external/asyncron/ ./external/asyncron/
 
 # 安装本地共享库
-RUN cd external/econdb && pip install --no-cache-dir --user .
-RUN mkdir -p /root/.local/lib/python3.13/site-packages && \
-    cp -R external/asyncron/asyncron /root/.local/lib/python3.13/site-packages/
+RUN pip install --no-cache-dir --user ./external/econdb ./external/asyncron
 
 # 复制服务代码
 COPY . ./
 
 # 运行阶段
-FROM base AS runtime
+FROM python:3.13-slim AS runtime
+ARG APT_MIRROR=deb.debian.org
 
 WORKDIR /app
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONPATH=/app
+ENV TZ=Asia/Shanghai
+
+RUN set -eux; \
+    if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+      sed -i -E "s|https?://deb.debian.org/debian-security|https://${APT_MIRROR}/debian-security|g; s|https?://deb.debian.org/debian|https://${APT_MIRROR}/debian|g" /etc/apt/sources.list.d/debian.sources; \
+    fi; \
+    if [ -f /etc/apt/sources.list ]; then \
+      sed -i -E "s|https?://deb.debian.org/debian-security|https://${APT_MIRROR}/debian-security|g; s|https?://deb.debian.org/debian|https://${APT_MIRROR}/debian|g" /etc/apt/sources.list; \
+    fi; \
+    export DEBIAN_FRONTEND=noninteractive; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends --fix-missing ca-certificates libpq5; \
+    rm -rf /var/lib/apt/lists/*
 
 # 复制Python包
 COPY --from=builder /root/.local /root/.local
@@ -85,7 +101,6 @@ RUN mkdir -p logs data config
 
 # 设置环境变量
 ENV PATH=/root/.local/bin:$PATH
-ENV PYTHONPATH=/app
 
 # 健康检查
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
