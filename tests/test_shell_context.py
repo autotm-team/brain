@@ -23,6 +23,15 @@ class _DummySystemAPI:
     def list_notifications(self, limit=5):
         return [{"id": "n1"}, {"id": "n2"}]
 
+    def get_setting(self, key):
+        values = {
+            "system.workspace": {"value": {"value": "Alpha Lab"}},
+            "system.name": {"value": {"value": "AutoTM Quant Research"}},
+            "system.locale": {"value": {"value": "zh-CN"}},
+            "system.timezone": {"value": {"value": "Asia/Shanghai"}},
+        }
+        return values.get(key)
+
 
 class _DummyRequest:
     def __init__(self):
@@ -51,3 +60,4 @@ async def test_shell_context_returns_real_watchlist_badge():
     assert payload["data"]["sidebar_badges"]["watchlist"] == 7
     assert payload["data"]["sidebar_badges"]["jobs"] == 1
     assert payload["data"]["sidebar_badges"]["alerts"] == 1
+    assert payload["data"]["workspace"] == "Alpha Lab"

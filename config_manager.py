@@ -10,6 +10,15 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from config import IntegrationConfig, get_settings
+from config_revision import (
+    append_revision,
+    blank_revision_envelope,
+    make_revision_entry,
+    next_revision,
+    normalize_revision_envelope,
+    revision_entry,
+    revision_history,
+)
 
 try:
     from econdb import UISystemDataAPI, SystemSettingDTO, create_database_manager
@@ -23,6 +32,7 @@ DYNAMIC_KEY = "config.service.brain.dynamic"
 SCHEMA_VERSION = "v1"
 MANAGED_BY = "BrainConfigManager"
 SERVICE_NAME = "brain"
+REVISION_SCHEMA_VERSION = "v2"
 
 
 def _deep_merge(base: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
@@ -241,6 +251,7 @@ class BrainConfigManager:
         self._system_api = system_api
         self._allow_store_fallback = allow_store_fallback
         self._service_dynamic = BrainServiceDynamicSettings()
+        self._dynamic_envelope = blank_revision_envelope()
         self.logger = logging.getLogger(__name__)
 
     def _runtime_dict(self) -> Dict[str, Any]:
@@ -306,35 +317,71 @@ class BrainConfigManager:
     async def _load_service_dynamic(self) -> BrainServiceDynamicSettings:
         api = self._get_system_api()
         defaults = self._dynamic_defaults()
+        control_plane_defaults = await self._control_plane_service().snapshot()
+        full_defaults = {**defaults, "control_plane": control_plane_defaults}
         if api is None:
-            return BrainServiceDynamicSettings.model_validate(defaults)
+            validated = BrainServiceDynamicSettings.model_validate(defaults)
+            self._dynamic_envelope = append_revision(
+                blank_revision_envelope(),
+                make_revision_entry(
+                    revision=1,
+                    value={**validated.model_dump(), "control_plane": control_plane_defaults},
+                    updated_by="system",
+                    source="defaults",
+                    reason="fallback_defaults",
+                    event="seed",
+                ),
+            )
+            return validated
         existing = await asyncio.to_thread(api.get_setting, DYNAMIC_KEY)
         if existing is None:
             validated = BrainServiceDynamicSettings.model_validate(defaults)
+            envelope = append_revision(
+                blank_revision_envelope(),
+                make_revision_entry(
+                    revision=1,
+                    value={**validated.model_dump(), "control_plane": control_plane_defaults},
+                    updated_by="system",
+                    source="seed",
+                    reason="defaults",
+                    event="seed",
+                ),
+            )
             await asyncio.to_thread(
                 api.upsert_setting,
-                self._setting_dto(DYNAMIC_KEY, validated.model_dump(), self._metadata(False), "system"),
+                self._setting_dto(DYNAMIC_KEY, envelope, self._metadata(False), "system"),
             )
+            self._dynamic_envelope = envelope
             return validated
         raw_value = existing.get("value")
         if not isinstance(raw_value, dict):
             raise ValueError("Brain dynamic config payload must be a JSON object")
         normalized_from_legacy = not isinstance(existing.get("metadata"), dict)
-        merged = _deep_merge(defaults, raw_value)
-        try:
-            validated = BrainServiceDynamicSettings.model_validate(merged)
-        except ValidationError as exc:
-            raise ValueError(f"Invalid brain dynamic config payload: {exc}") from exc
-        if merged != raw_value or normalized_from_legacy:
+        validated_dict, envelope, normalized = normalize_revision_envelope(
+            raw_value,
+            defaults=full_defaults,
+            validate_payload=lambda payload: {
+                **BrainServiceDynamicSettings.model_validate(
+                    {key: value for key, value in payload.items() if key != "control_plane"}
+                ).model_dump(),
+                "control_plane": deepcopy(payload.get("control_plane") if isinstance(payload.get("control_plane"), dict) else control_plane_defaults),
+            },
+            legacy_updated_by=str(existing.get("updated_by") or "system"),
+        )
+        validated = BrainServiceDynamicSettings.model_validate(
+            {key: value for key, value in validated_dict.items() if key != "control_plane"}
+        )
+        if normalized or normalized_from_legacy:
             await asyncio.to_thread(
                 api.upsert_setting,
                 self._setting_dto(
                     DYNAMIC_KEY,
-                    validated.model_dump(),
+                    envelope,
                     self._metadata(True),
                     str(existing.get("updated_by") or "system"),
                 ),
             )
+        self._dynamic_envelope = envelope
         return validated
 
     def _apply_service_dynamic(self) -> None:
@@ -368,6 +415,13 @@ class BrainConfigManager:
             "control_plane": await self._control_plane_service().snapshot(),
         }
 
+    def dynamic_history(self) -> Dict[str, Any]:
+        return {
+            "service": SERVICE_NAME,
+            "current_revision": int(self._dynamic_envelope.get("current_revision") or 0),
+            "items": revision_history(self._dynamic_envelope),
+        }
+
     def catalog(self) -> Dict[str, Any]:
         return {"service": SERVICE_NAME, "schema_version": SCHEMA_VERSION, "items": deepcopy(CATALOG_ITEMS)}
 
@@ -385,9 +439,11 @@ class BrainConfigManager:
             return {"scope": "dynamic", "key": key, "value": dynamic_value}
         raise KeyError(key)
 
-    async def update_dynamic_config(self, changes: Dict[str, Any], actor_id: str, source: str) -> Dict[str, Any]:
+    async def update_dynamic_config(self, changes: Dict[str, Any], actor_id: str, source: str, expected_revision: Optional[int] = None, reason: str = "") -> Dict[str, Any]:
         if not isinstance(changes, dict) or not changes:
             raise ValueError("changes must be a non-empty JSON object")
+        if expected_revision is not None and int(self._dynamic_envelope.get("current_revision") or 0) != int(expected_revision):
+            raise ValueError("Revision mismatch")
 
         before = await self.dynamic_snapshot(masked=False)
         hot_reloaded_keys: List[str] = []
@@ -436,29 +492,116 @@ class BrainConfigManager:
                 validated = BrainServiceDynamicSettings.model_validate(merged)
             except ValidationError as exc:
                 raise ValueError(f"Invalid brain dynamic config update: {exc}") from exc
-            api = self._get_system_api()
-            if api is not None:
-                await asyncio.to_thread(
-                    api.upsert_setting,
-                    self._setting_dto(
-                        DYNAMIC_KEY,
-                        validated.model_dump(),
-                        {**self._metadata(False), "updated_by": actor_id, "source": source},
-                        actor_id,
-                    ),
-                )
             self._service_dynamic = validated
             self._apply_service_dynamic()
             hot_reloaded_keys.extend(_changed_keys(before, await self.dynamic_snapshot(masked=False)))
 
         after = await self.dynamic_snapshot(masked=False)
         changed_keys = _changed_keys(before, after)
+        api = self._get_system_api()
+        envelope = append_revision(
+            deepcopy(self._dynamic_envelope),
+            make_revision_entry(
+                revision=next_revision(self._dynamic_envelope),
+                value=after,
+                updated_by=actor_id,
+                source=source,
+                reason=reason,
+                updated_keys=changed_keys,
+                hot_reloaded_keys=sorted(set(hot_reloaded_keys)),
+                restart_required_keys=restart_required_keys,
+            ),
+        )
+        if api is not None:
+            await asyncio.to_thread(
+                api.upsert_setting,
+                self._setting_dto(
+                    DYNAMIC_KEY,
+                    envelope,
+                    {**self._metadata(False), "updated_by": actor_id, "source": source},
+                    actor_id,
+                ),
+            )
+        self._dynamic_envelope = envelope
         return {
             "applied": True,
+            "current_revision": int(self._dynamic_envelope.get("current_revision") or 0),
             "updated_keys": changed_keys,
             "hot_reloaded_keys": sorted(set(hot_reloaded_keys)),
             "restart_required": bool(restart_required_keys),
             "restart_required_keys": restart_required_keys,
+        }
+
+    async def rollback_dynamic_config(self, revision: int, actor_id: str, source: str, reason: str = "") -> Dict[str, Any]:
+        entry = revision_entry(self._dynamic_envelope, revision)
+        if not entry:
+            raise ValueError("Revision not found")
+        before = await self.dynamic_snapshot(masked=False)
+        payload = deepcopy(entry.get("value") or {})
+        control_plane_payload = payload.get("control_plane") if isinstance(payload.get("control_plane"), dict) else {}
+        service_payload = {key: value for key, value in payload.items() if key != "control_plane"}
+        restored = BrainServiceDynamicSettings.model_validate(service_payload)
+        control_plane_service = self._control_plane_service()
+        if "scheduler" in control_plane_payload:
+            await control_plane_service.upsert_setting(
+                control_plane_service.SCHEDULER_KEY,
+                control_plane_payload["scheduler"],
+                updated_by=actor_id,
+                metadata={"source": source},
+            )
+        if "strategy_plan" in control_plane_payload:
+            await control_plane_service.upsert_setting(
+                control_plane_service.STRATEGY_PLAN_KEY,
+                control_plane_payload["strategy_plan"],
+                updated_by=actor_id,
+                metadata={"source": source},
+            )
+        if "flowhub_bootstrap" in control_plane_payload:
+            await control_plane_service.upsert_setting(
+                control_plane_service.FLOWHUB_BOOTSTRAP_KEY,
+                control_plane_payload["flowhub_bootstrap"],
+                updated_by=actor_id,
+                metadata={"source": source},
+            )
+        self._service_dynamic = restored
+        self._apply_service_dynamic()
+        after = await self.dynamic_snapshot(masked=False)
+        changed_keys = _changed_keys(before, after)
+        hot_reloaded_keys = sorted(changed_keys)
+        envelope = append_revision(
+            deepcopy(self._dynamic_envelope),
+            make_revision_entry(
+                revision=next_revision(self._dynamic_envelope),
+                value=after,
+                updated_by=actor_id,
+                source=source,
+                reason=reason or f"rollback:{revision}",
+                updated_keys=changed_keys,
+                hot_reloaded_keys=hot_reloaded_keys,
+                restart_required_keys=[],
+                event="rollback",
+            ),
+        )
+        api = self._get_system_api()
+        if api is not None:
+            await asyncio.to_thread(
+                api.upsert_setting,
+                self._setting_dto(
+                    DYNAMIC_KEY,
+                    envelope,
+                    {**self._metadata(False), "updated_by": actor_id, "source": source},
+                    actor_id,
+                ),
+            )
+        self._dynamic_envelope = envelope
+        return {
+            "applied": True,
+            "rolled_back_from_revision": int(revision),
+            "current_revision": int(self._dynamic_envelope.get("current_revision") or 0),
+            "updated_keys": changed_keys,
+            "hot_reloaded_keys": hot_reloaded_keys,
+            "restart_required": False,
+            "restart_required_keys": [],
         }
 
     async def reload(self) -> Dict[str, Any]:

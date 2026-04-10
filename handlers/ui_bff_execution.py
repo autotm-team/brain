@@ -35,6 +35,15 @@ class UIBffExecutionMixin:
         except Exception as exc:
             self.logger.warning(f"system api unavailable for shell context: {exc}")
 
+        shell_defaults: Dict[str, Any] = {}
+        try:
+            shell_defaults = self._get_system_settings_service().shell_context_settings(
+                self._get_system_api(),
+                context=self._system_settings_context(request),
+            )
+        except Exception as exc:
+            self.logger.warning(f"system settings unavailable for shell context: {exc}")
+
         watchlist_badge = 0
         try:
             watchlist_payload = await self._fetch_upstream_json(
@@ -71,6 +80,10 @@ class UIBffExecutionMixin:
                 "notifications": len(notifications),
                 "watchlist": watchlist_badge,
             },
+            "workspace": shell_defaults.get("workspace", "Alpha Lab"),
+            "system_name": shell_defaults.get("system_name", "AutoTM Quant Research"),
+            "locale": shell_defaults.get("locale", "zh-CN"),
+            "timezone": shell_defaults.get("timezone", "Asia/Shanghai"),
             "current_user": user_info,
             "notifications": notifications,
         }
