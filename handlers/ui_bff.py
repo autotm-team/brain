@@ -22,6 +22,7 @@ from handlers.ui_bff_execution import UIBffExecutionMixin
 from handlers.ui_bff_readiness import UIBffReadinessMixin
 from handlers.ui_bff_system_data import UIBffSystemDataMixin
 from handlers.ui_bff_system_ops import UIBffSystemOpsMixin
+from system_settings_service import BrainSystemSettingsService
 from task_orchestrator import UpstreamServiceError
 
 _ECONDB_IMPORT_ERROR: Exception | None = None
@@ -175,6 +176,7 @@ class UIBffHandler(
         RouteSpec("GET", re.compile(r"^/api/v1/ui/structure-rotation/flow-migration$"), "macro"),
         RouteSpec("GET", re.compile(r"^/api/v1/ui/candidates/clusters$"), "execution"),
         RouteSpec("GET", re.compile(r"^/api/v1/ui/candidates/events$"), "execution"),
+        RouteSpec("GET", re.compile(r"^/api/v1/ui/candidates/watchlist$"), "execution"),
         RouteSpec("GET", re.compile(r"^/api/v1/ui/candidates/symbols/(?P<symbol>[^/]+)/chart$"), "execution"),
         RouteSpec(
             "POST",
@@ -185,6 +187,23 @@ class UIBffHandler(
         ),
         RouteSpec("GET", re.compile(r"^/api/v1/ui/candidates/history/(?P<query_id>[^/]+)$"), "execution"),
         RouteSpec("POST", re.compile(r"^/api/v1/ui/candidates/promote$"), "execution", True, "ui_candidates_promote"),
+        RouteSpec("POST", re.compile(r"^/api/v1/ui/candidates/watchlist$"), "execution", True, "ui_candidates_watchlist_create"),
+        RouteSpec(
+            "PATCH",
+            re.compile(r"^/api/v1/ui/candidates/watchlist/(?P<candidate_id>[^/]+)$"),
+            "execution",
+            True,
+            "ui_candidates_watchlist_item_update",
+            lambda payload, params: {**payload, "candidate_id": params["candidate_id"]},
+        ),
+        RouteSpec(
+            "POST",
+            re.compile(r"^/api/v1/ui/candidates/watchlist/(?P<candidate_id>[^/]+)/promote-to-research$"),
+            "execution",
+            True,
+            "ui_candidates_watchlist_promote_to_research",
+            lambda payload, params: {**payload, "candidate_id": params["candidate_id"]},
+        ),
         RouteSpec(
             "POST",
             re.compile(r"^/api/v1/ui/candidates/sync-from-analysis$"),
@@ -577,6 +596,9 @@ class UIBffHandler(
             self._system_api.seed_defaults(admin_password=None)
         return self._system_api
 
+    def _get_system_settings_service(self) -> BrainSystemSettingsService:
+        return BrainSystemSettingsService()
+
     @staticmethod
     def _unwrap_response_data(payload: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(payload, dict):
@@ -690,6 +712,31 @@ class UIBffHandler(
                 updated_by=updated_by,
             )
         )
+
+    @staticmethod
+    def _system_settings_context(request: web.Request) -> Dict[str, Any]:
+        current_user = request.get("current_user") if isinstance(request, dict) else None
+        user_id = None
+        if isinstance(current_user, dict):
+            user_id = current_user.get("id") or current_user.get("username")
+        workspace_id = request.query.get("workspace_id") or request.headers.get("X-AutoTM-Workspace-Id") or "default"
+        return {
+            "user_id": str(user_id) if user_id else None,
+            "workspace_id": str(workspace_id),
+        }
+
+    @classmethod
+    def _system_settings_metadata_from_request(cls, request: web.Request, actor_id: Optional[str] = None) -> Dict[str, Any]:
+        context = cls._system_settings_context(request)
+        scope = str(request.query.get("scope") or "workspace").strip().lower()
+        metadata: Dict[str, Any] = {
+            "scope": scope if scope in {"global", "workspace", "user"} else "workspace",
+            "workspace_id": context["workspace_id"],
+        }
+        user_id = str(request.query.get("user_id") or context.get("user_id") or actor_id or "").strip()
+        if user_id:
+            metadata["user_id"] = user_id
+        return metadata
 
     @staticmethod
     def _safe_int(value: Any, default: int) -> int:
@@ -808,6 +855,8 @@ class UIBffHandler(
                 return await manager.dynamic_snapshot(masked=True)
             if kind == "catalog":
                 return manager.catalog()
+            if kind == "history":
+                return manager.dynamic_history()
             raise ValueError(f"Unsupported config kind: {kind}")
         payload = await self._fetch_upstream_json(request, service_name, f"/api/v1/system/config/{kind}")
         return self._unwrap_response_data(payload)
@@ -826,6 +875,15 @@ class UIBffHandler(
                     payload.get("changes"),
                     actor_id=str(payload.get("actor_id") or "user_admin"),
                     source=str(payload.get("source") or "brain_proxy"),
+                    expected_revision=payload.get("expected_revision"),
+                    reason=str(payload.get("reason") or ""),
+                )
+            if path.endswith("/rollback"):
+                return await manager.rollback_dynamic_config(
+                    int(payload.get("revision")),
+                    actor_id=str(payload.get("actor_id") or "user_admin"),
+                    source=str(payload.get("source") or "brain_proxy"),
+                    reason=str(payload.get("reason") or ""),
                 )
             if path.endswith("/reload"):
                 return await manager.reload()
@@ -864,6 +922,9 @@ class UIBffHandler(
                 "runtime_path": "/api/v1/ui/system/config/services/brain/runtime",
                 "dynamic_path": "/api/v1/ui/system/config/services/brain/dynamic",
                 "catalog_path": "/api/v1/ui/system/config/services/brain/catalog",
+                "history_path": "/api/v1/ui/system/config/services/brain/history",
+                "rollback_path": "/api/v1/ui/system/config/services/brain/rollback",
+                "reload_path": "/api/v1/ui/system/config/services/brain/reload",
             }
         ]
         for service_name in ("macro", "execution", "portfolio", "flowhub"):
@@ -875,6 +936,9 @@ class UIBffHandler(
                     "runtime_path": f"/api/v1/ui/system/config/services/{service_name}/runtime",
                     "dynamic_path": f"/api/v1/ui/system/config/services/{service_name}/dynamic",
                     "catalog_path": f"/api/v1/ui/system/config/services/{service_name}/catalog",
+                    "history_path": f"/api/v1/ui/system/config/services/{service_name}/history",
+                    "rollback_path": f"/api/v1/ui/system/config/services/{service_name}/rollback",
+                    "reload_path": f"/api/v1/ui/system/config/services/{service_name}/reload",
                 }
             )
         return self.success_response({"items": items, "total": len(items)})
@@ -906,6 +970,15 @@ class UIBffHandler(
         except UpstreamServiceError as exc:
             return self.error_response(exc.error.get("message") or "Upstream config catalog failed", 502)
 
+    async def _handle_system_config_history(self, request: web.Request, service_name: str) -> web.Response:
+        try:
+            self._ensure_config_proxy_enabled(service_name)
+            return self.success_response(await self._fetch_service_config_payload(request, service_name, "history"))
+        except ValueError as exc:
+            return self.error_response(str(exc), 400)
+        except UpstreamServiceError as exc:
+            return self.error_response(exc.error.get("message") or "Upstream config history failed", 502)
+
     async def _handle_system_config_update(self, request: web.Request, service_name: str) -> web.Response:
         try:
             self._ensure_config_proxy_enabled(service_name)
@@ -924,12 +997,18 @@ class UIBffHandler(
                     "changes": body.get("changes"),
                     "actor_id": actor_id,
                     "source": "brain_proxy",
+                    "expected_revision": body.get("expected_revision"),
+                    "reason": body.get("reason"),
                 },
             )
         except ValueError as exc:
+            if str(exc) == "Revision mismatch":
+                return self.error_response("Revision conflict", 409, "CONFIG_REVISION_CONFLICT")
             return self.error_response(str(exc), 400)
         except UpstreamServiceError as exc:
-            return self.error_response(exc.error.get("message") or "Upstream config update failed", 502)
+            status = 409 if exc.status_code == 409 else 502
+            code = "CONFIG_REVISION_CONFLICT" if exc.status_code == 409 else None
+            return self.error_response(exc.error.get("message") or "Upstream config update failed", status, code)
         await self._append_config_audit(
             actor_id,
             "service_config.update_dynamic",
@@ -960,15 +1039,47 @@ class UIBffHandler(
         )
         return self.success_response(payload, "Config reloaded")
 
+    async def _handle_system_config_rollback(self, request: web.Request, service_name: str) -> web.Response:
+        try:
+            self._ensure_config_proxy_enabled(service_name)
+        except ValueError as exc:
+            return self.error_response(str(exc), 503)
+        body = await self.get_request_json(request)
+        if not isinstance(body, dict):
+            return self.error_response("Request body must be a JSON object", 400)
+        actor_id = self._current_actor_id(request)
+        try:
+            payload = await self._post_service_config_payload(
+                request,
+                service_name,
+                "/api/v1/system/config/rollback",
+                {
+                    "revision": body.get("revision"),
+                    "actor_id": actor_id,
+                    "source": "brain_proxy",
+                    "reason": body.get("reason"),
+                },
+            )
+        except ValueError as exc:
+            return self.error_response(str(exc), 400)
+        except UpstreamServiceError as exc:
+            status = 409 if exc.status_code == 409 else 502
+            code = "CONFIG_REVISION_CONFLICT" if exc.status_code == 409 else None
+            return self.error_response(exc.error.get("message") or "Upstream config rollback failed", status, code)
+        await self._append_config_audit(
+            actor_id,
+            "service_config.rollback",
+            service_name,
+            {"revision": body.get("revision"), "reason": body.get("reason")},
+        )
+        return self.success_response(payload, "Config rolled back")
+
     async def _handle_system_settings_list(self, request: web.Request) -> web.Response:
         api = self._get_system_api()
-        control_plane_service = self._app.get("control_plane_settings") if self._app is not None else None
         payload = {
-            "settings": api.list_settings(),
+            "settings": self._get_system_settings_service().list_settings(api, context=self._system_settings_context(request)),
             "presets": api.list_presets(),
         }
-        if control_plane_service is not None:
-            payload["control_plane"] = await control_plane_service.snapshot()
         return self.success_response(payload)
 
     async def _handle_system_settings_upsert(self, request: web.Request, key: Optional[str] = None) -> web.Response:
@@ -980,10 +1091,15 @@ class UIBffHandler(
             return self.error_response("Request body must be a JSON object", 400)
         value = body.get("value") if body.get("value") is not None else {}
         metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+        if "expected_revision" in body and "expected_revision" not in metadata:
+            metadata = {**metadata, "expected_revision": body.get("expected_revision")}
+        if "effective_at" in body and "effective_at" not in metadata:
+            metadata = {**metadata, "effective_at": body.get("effective_at")}
         updated_by = body.get("updated_by") or "user_admin"
 
         api = self._get_system_api()
         control_plane_service = self._app.get("control_plane_settings") if self._app is not None else None
+        system_settings = self._get_system_settings_service()
         try:
             if control_plane_service is not None and control_plane_service.is_managed_key(key):
                 setting_payload = await control_plane_service.upsert_setting(
@@ -992,15 +1108,15 @@ class UIBffHandler(
                     updated_by=str(updated_by),
                     metadata=metadata,
                 )
-            else:
-                setting_payload = api.upsert_setting(
-                    SystemSettingDTO(
-                        key=key,
-                        value=value if isinstance(value, dict) else {"value": value},
-                        metadata=metadata,
-                        updated_by=str(updated_by),
-                    )
+            elif system_settings.is_public_key(key):
+                normalized = system_settings.upsert_setting(
+                    api,
+                    key,
+                    value,
+                    updated_by=str(updated_by),
+                    metadata=metadata,
                 )
+                setting_payload = normalized
                 api.append_audit_log(
                     SystemAuditDTO(
                         id=str(uuid.uuid4()),
@@ -1008,13 +1124,61 @@ class UIBffHandler(
                         action="setting.upsert",
                         target_type="setting",
                         target_id=key,
-                        payload={"value": value, "metadata": metadata},
+                        payload={"value": value, "metadata": metadata, "result_metadata": setting_payload.get("metadata", {})},
                         created_at=datetime.utcnow().isoformat(),
                     )
                 )
+            else:
+                return self.error_response("Unsupported system settings key", 400)
         except ValueError as exc:
+            if str(exc) == "Revision mismatch":
+                return self.error_response("Setting revision conflict", 409, "SETTING_REVISION_CONFLICT")
             return self.error_response(str(exc), 400)
         return self.success_response(setting_payload, "Setting updated")
+
+    async def _handle_system_settings_history(self, request: web.Request, key: str) -> web.Response:
+        api = self._get_system_api()
+        system_settings = self._get_system_settings_service()
+        if not system_settings.is_public_key(key):
+            return self.error_response("Unsupported system settings key", 400)
+        payload = system_settings.list_history(api, key, context=self._system_settings_metadata_from_request(request))
+        return self.success_response(payload)
+
+    async def _handle_system_settings_rollback(self, request: web.Request, key: str) -> web.Response:
+        body = await self.get_request_json(request)
+        if not isinstance(body, dict):
+            return self.error_response("Request body must be a JSON object", 400)
+        revision = body.get("revision")
+        if revision is None:
+            return self.error_response("Missing required field: revision", 400)
+        api = self._get_system_api()
+        system_settings = self._get_system_settings_service()
+        if not system_settings.is_public_key(key):
+            return self.error_response("Unsupported system settings key", 400)
+        updated_by = str(body.get("updated_by") or "user_admin")
+        metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+        try:
+            payload = system_settings.rollback_setting(
+                api,
+                key,
+                revision=int(revision),
+                updated_by=updated_by,
+                metadata=metadata,
+            )
+        except ValueError as exc:
+            return self.error_response(str(exc), 400)
+        api.append_audit_log(
+            SystemAuditDTO(
+                id=str(uuid.uuid4()),
+                actor_id=updated_by,
+                action="setting.rollback",
+                target_type="setting",
+                target_id=key,
+                payload={"revision": int(revision), "metadata": metadata},
+                created_at=datetime.utcnow().isoformat(),
+            )
+        )
+        return self.success_response(payload, "Setting rolled back")
 
     async def _handle_system_users_list(self, request: web.Request) -> web.Response:
         limit = int(request.query.get("limit", 100))
@@ -1800,20 +1964,34 @@ class UIBffHandler(
             matched = re.match(r"^/api/v1/ui/system/config/services/(?P<service>[^/]+)/catalog$", path)
             if matched:
                 return await self._handle_system_config_catalog(request, matched.group("service"))
+            matched = re.match(r"^/api/v1/ui/system/config/services/(?P<service>[^/]+)/history$", path)
+            if matched:
+                return await self._handle_system_config_history(request, matched.group("service"))
         if method == "POST":
             matched = re.match(r"^/api/v1/ui/system/config/services/(?P<service>[^/]+)/dynamic$", path)
             if matched:
                 return await self._handle_system_config_update(request, matched.group("service"))
+            matched = re.match(r"^/api/v1/ui/system/config/services/(?P<service>[^/]+)/rollback$", path)
+            if matched:
+                return await self._handle_system_config_rollback(request, matched.group("service"))
             matched = re.match(r"^/api/v1/ui/system/config/services/(?P<service>[^/]+)/reload$", path)
             if matched:
                 return await self._handle_system_config_reload(request, matched.group("service"))
 
         if method == "GET" and path == "/api/v1/ui/system/settings":
             return await self._handle_system_settings_list(request)
+        if method == "GET":
+            matched = re.match(r"^/api/v1/ui/system/settings/(?P<key>[^/]+)/history$", path)
+            if matched:
+                return await self._handle_system_settings_history(request, matched.group("key"))
         if method == "PUT":
             matched = re.match(r"^/api/v1/ui/system/settings/(?P<key>[^/]+)$", path)
             if matched:
                 return await self._handle_system_settings_upsert(request, matched.group("key"))
+        if method == "POST":
+            matched = re.match(r"^/api/v1/ui/system/settings/(?P<key>[^/]+)/rollback$", path)
+            if matched:
+                return await self._handle_system_settings_rollback(request, matched.group("key"))
 
         if method == "GET" and path == "/api/v1/ui/system/users":
             return await self._handle_system_users_list(request)
@@ -1880,7 +2058,22 @@ class UIBffHandler(
         if not service or session is None:
             return self.error_response(f"Service not available: {service_name}", 503)
 
-        target_url = f"{service['url'].rstrip('/')}{request.path_qs}"
+        query = dict(request.query)
+        try:
+            query = self._get_system_settings_service().apply_query_defaults(
+                request.path,
+                query,
+                self._get_system_api(),
+                context=self._system_settings_context(request),
+            )
+        except Exception as exc:
+            self.logger.warning(f"apply system setting defaults for proxy failed: {exc}")
+
+        target_url = f"{service['url'].rstrip('/')}{request.path}"
+        if query:
+            from urllib.parse import urlencode
+
+            target_url = f"{target_url}?{urlencode(query, doseq=True)}"
         body = await request.read() if request.can_read_body else None
         headers = {k: v for k, v in request.headers.items() if k.lower() not in HOP_BY_HOP_HEADERS}
         try:
@@ -1920,6 +2113,12 @@ class UIBffHandler(
         try:
             orchestrator = self.get_app_component(request, "task_orchestrator")
             params = self._build_job_params(route, request_payload, path_params)
+            params = self._get_system_settings_service().apply_mutation_defaults(
+                request.path,
+                params,
+                self._get_system_api(),
+                context=self._system_settings_context(request),
+            )
             metadata = {
                 "ui_path": request.path,
                 "ui_method": request.method,
