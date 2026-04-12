@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from typing import Any, Dict, Optional
 
 
@@ -12,13 +13,21 @@ logger = logging.getLogger(__name__)
 
 
 class TaskOrchestratorAutoChainMixin:
-    async def _maybe_trigger_followups(self, task_job_id: str, normalized: Dict[str, Any]) -> None:
+    async def _maybe_trigger_followups(
+        self,
+        task_job_id: str,
+        normalized: Dict[str, Any],
+        *,
+        snapshot_cache: Optional[Dict[str, Any]] = None,
+        raise_on_error: bool = False,
+    ) -> None:
         status = str(normalized.get("status") or "")
         service = str(normalized.get("service") or "").strip().lower()
         job_type = str(normalized.get("job_type") or "").strip()
         metadata = normalized.get("metadata") if isinstance(normalized.get("metadata"), dict) else {}
+        params = normalized.get("params") if isinstance(normalized.get("params"), dict) else {}
 
-        if bool(metadata.get("task_probe_disable_auto_chain")):
+        if bool(metadata.get("task_probe_disable_auto_chain")) or bool(params.get("_task_probe")) or job_type == "diagnostic_sleep":
             return
 
         if status in {"failed", "cancelled"}:
@@ -26,15 +35,17 @@ class TaskOrchestratorAutoChainMixin:
                 await self._maybe_release_failed_chain_locks(task_job_id, normalized)
             except Exception as exc:
                 logger.warning("Failed to release chain locks for %s: %s", task_job_id, exc)
+                if raise_on_error:
+                    raise
             return
 
         if status != "succeeded":
             return
         try:
             if service == "flowhub" and job_type == "stock_basic_data":
-                await self._maybe_trigger_stock_daily_fetches(task_job_id, normalized)
+                await self._maybe_trigger_stock_daily_fetches(task_job_id, normalized, raise_on_error=raise_on_error)
             elif service == "flowhub" and job_type in {"batch_daily_ohlc", "batch_daily_basic"}:
-                await self._maybe_trigger_daily_analysis(task_job_id, normalized)
+                await self._maybe_trigger_daily_analysis(task_job_id, normalized, raise_on_error=raise_on_error)
             elif service == "execution" and job_type == "batch_analyze":
                 await self._maybe_trigger_candidate_sync_incremental(
                     task_job_id,
@@ -42,7 +53,7 @@ class TaskOrchestratorAutoChainMixin:
                     source_job_type="batch_analyze",
                     repair_window_days=7,
                 )
-                await self._try_converge_snapshot_prereq("batch_analyze", task_job_id, normalized)
+                await self.maybe_converge_snapshot_pipeline("batch_analyze", task_job_id, normalized, cache=snapshot_cache)
             elif service == "execution" and job_type == "analysis_backfill":
                 await self._maybe_trigger_candidate_sync_incremental(
                     task_job_id,
@@ -50,15 +61,18 @@ class TaskOrchestratorAutoChainMixin:
                     source_job_type="analysis_backfill",
                     repair_window_days=30,
                 )
+                await self.maybe_converge_snapshot_pipeline("analysis_backfill", task_job_id, normalized, cache=snapshot_cache)
             elif service == "flowhub" and job_type == "index_daily_data":
-                await self._try_converge_snapshot_prereq("index_daily", task_job_id, normalized)
+                await self.maybe_converge_snapshot_pipeline("index_daily", task_job_id, normalized, cache=snapshot_cache)
             elif service == "flowhub" and job_type == "industry_board":
-                await self._try_converge_snapshot_prereq("industry_board", task_job_id, normalized)
+                await self.maybe_converge_snapshot_pipeline("industry_board", task_job_id, normalized, cache=snapshot_cache)
         except Exception as exc:
             await self._append_history(task_job_id, "auto_chain_error", normalized)
             normalized_metadata = normalized.get("metadata") if isinstance(normalized.get("metadata"), dict) else {}
             normalized_metadata["auto_chain_error"] = str(exc)
             await self._update_task_record_metadata(task_job_id, normalized_metadata)
+            if raise_on_error:
+                raise
 
     async def _maybe_release_failed_chain_locks(self, task_job_id: str, normalized: Dict[str, Any]) -> None:
         service = str(normalized.get("service") or "").strip().lower()
@@ -191,39 +205,63 @@ class TaskOrchestratorAutoChainMixin:
         value = str(data_summary.get("trade_date") or "").strip()
         return value or None
 
-    async def _maybe_trigger_stock_daily_fetches(self, task_job_id: str, normalized: Dict[str, Any]) -> None:
+    async def _maybe_trigger_stock_daily_fetches(
+        self,
+        task_job_id: str,
+        normalized: Dict[str, Any],
+        *,
+        raise_on_error: bool = False,
+    ) -> None:
         metadata = normalized.get("metadata") if isinstance(normalized.get("metadata"), dict) else {}
         if str(metadata.get("bootstrap_source") or "").strip().lower() == "brain_initializer":
             return
         if not self._job_result_ready_for_auto_chain(normalized):
             return
         claim_key = self._auto_chain_claim_key("stock_daily_fetch", task_job_id)
-        if not await self._claim_auto_chain(claim_key):
-            logger.warning(
-                "Auto-chain claim '%s' already taken, skipping batch_daily trigger for task_job_id=%s",
-                claim_key, task_job_id,
+        ohlc_idempotency_key = f"stock_daily_fetch:batch_daily_ohlc:{task_job_id}"
+        basic_idempotency_key = f"stock_daily_fetch:batch_daily_basic:{task_job_id}"
+        claimed, existing_children = await self._claim_auto_chain_or_get_existing_child(
+            claim_key,
+            [
+                {"service": "flowhub", "job_type": "batch_daily_ohlc", "idempotency_key": ohlc_idempotency_key},
+                {"service": "flowhub", "job_type": "batch_daily_basic", "idempotency_key": basic_idempotency_key},
+            ],
+        )
+        if not claimed:
+            await self._update_task_record_metadata(
+                task_job_id,
+                {
+                    "followup_flowhub_ohlc_task_job_id": (existing_children[0] or {}).get("id") if existing_children else None,
+                    "followup_flowhub_basic_task_job_id": (existing_children[1] or {}).get("id") if len(existing_children) > 1 else None,
+                },
             )
             return
-        ohlc_created = await self.create_task_job(
-            service="flowhub",
-            job_type="batch_daily_ohlc",
-            params={"incremental": True},
-            metadata={
-                "auto_chain_source": "stock_basic_data",
-                "auto_chain_parent_task_job_id": task_job_id,
-            },
-            lineage_context=await self._build_child_lineage_context(task_job_id),
-        )
-        basic_created = await self.create_task_job(
-            service="flowhub",
-            job_type="batch_daily_basic",
-            params={"incremental": True},
-            metadata={
-                "auto_chain_source": "stock_basic_data",
-                "auto_chain_parent_task_job_id": task_job_id,
-            },
-            lineage_context=await self._build_child_lineage_context(task_job_id),
-        )
+        try:
+            ohlc_created = await self.create_task_job(
+                service="flowhub",
+                job_type="batch_daily_ohlc",
+                params={"incremental": True},
+                metadata={
+                    "auto_chain_source": "stock_basic_data",
+                    "auto_chain_parent_task_job_id": task_job_id,
+                },
+                lineage_context=await self._build_child_lineage_context(task_job_id),
+                idempotency_key=ohlc_idempotency_key,
+            )
+            basic_created = await self.create_task_job(
+                service="flowhub",
+                job_type="batch_daily_basic",
+                params={"incremental": True},
+                metadata={
+                    "auto_chain_source": "stock_basic_data",
+                    "auto_chain_parent_task_job_id": task_job_id,
+                },
+                lineage_context=await self._build_child_lineage_context(task_job_id),
+                idempotency_key=basic_idempotency_key,
+            )
+        except Exception:
+            await self._release_auto_chain(claim_key)
+            raise
         await self._update_task_record_metadata(
             task_job_id,
             {
@@ -233,7 +271,13 @@ class TaskOrchestratorAutoChainMixin:
         )
         await self._append_history(task_job_id, "auto_chain_created", normalized)
 
-    async def _maybe_trigger_daily_analysis(self, task_job_id: str, normalized: Dict[str, Any]) -> None:
+    async def _maybe_trigger_daily_analysis(
+        self,
+        task_job_id: str,
+        normalized: Dict[str, Any],
+        *,
+        raise_on_error: bool = False,
+    ) -> None:
         ready, blocked_reason, latest_ohlc, latest_basic = await self._evaluate_daily_analysis_prereqs(
             source_task_job_id=task_job_id,
         )
@@ -252,10 +296,18 @@ class TaskOrchestratorAutoChainMixin:
         source_params = source_record.get("params") if isinstance(source_record.get("params"), dict) else {}
         scope_signature = self._scope_signature(source_params)
         claim_key = self._auto_chain_claim_key("daily_analysis", latest_ohlc, scope_signature)
-        if not await self._claim_auto_chain(claim_key):
-            logger.warning(
-                "Auto-chain claim '%s' already taken, skipping batch_analyze trigger for trade_date=%s",
-                claim_key, latest_ohlc,
+        idempotency_key = f"daily_analysis:{latest_ohlc}:{scope_signature or 'full'}:v1"
+        claimed, existing_children = await self._claim_auto_chain_or_get_existing_child(
+            claim_key,
+            [{"service": "execution", "job_type": "batch_analyze", "idempotency_key": idempotency_key}],
+        )
+        if not claimed:
+            await self._update_task_record_metadata(
+                task_job_id,
+                {
+                    "auto_chain_trade_date": latest_ohlc,
+                    "followup_execution_task_job_id": (existing_children[0] or {}).get("id") if existing_children else None,
+                },
             )
             return
         try:
@@ -268,32 +320,39 @@ class TaskOrchestratorAutoChainMixin:
                         running_holder, latest_ohlc,
                     )
                     await self._release_auto_chain(claim_key)
+                    if raise_on_error:
+                        raise RuntimeError(f"batch_analyze already running on execution (holder={running_holder})")
                     return
         except Exception as exc:
             logger.debug("Failed to check execution batch_analyze lock: %s", exc)
         source_symbols = source_params.get("symbols") if isinstance(source_params.get("symbols"), list) else None
-        created = await self.create_task_job(
-            service="execution",
-            job_type="batch_analyze",
-            params={
-                **({"symbols": list(source_symbols)} if source_symbols else {}),
-                "analyzers": ["livermore", "multi_indicator", "chanlun"],
-                "config": {
-                    "mode": "incremental",
-                    "save_all_dates": True,
-                    "save_daily_states": True,
-                    "emit_events": True,
-                    "cache_enabled": False,
-                    "use_incremental": True,
+        try:
+            created = await self.create_task_job(
+                service="execution",
+                job_type="batch_analyze",
+                params={
+                    **({"symbols": list(source_symbols)} if source_symbols else {}),
+                    "analyzers": ["livermore", "multi_indicator", "chanlun"],
+                    "config": {
+                        "mode": "incremental",
+                        "save_all_dates": True,
+                        "save_daily_states": True,
+                        "emit_events": True,
+                        "cache_enabled": False,
+                        "use_incremental": True,
+                    },
                 },
-            },
-            metadata={
-                "auto_chain_source": "flowhub_daily",
-                "auto_chain_trade_date": latest_ohlc,
-                **({"auto_chain_symbol_scope": list(source_symbols)} if source_symbols else {}),
-            },
-            lineage_context=await self._build_child_lineage_context(task_job_id),
-        )
+                metadata={
+                    "auto_chain_source": "flowhub_daily",
+                    "auto_chain_trade_date": latest_ohlc,
+                    **({"auto_chain_symbol_scope": list(source_symbols)} if source_symbols else {}),
+                },
+                lineage_context=await self._build_child_lineage_context(task_job_id),
+                idempotency_key=idempotency_key,
+            )
+        except Exception:
+            await self._release_auto_chain(claim_key)
+            raise
         await self._update_task_record_metadata(
             task_job_id,
             {
@@ -431,22 +490,36 @@ class TaskOrchestratorAutoChainMixin:
         trade_date = str(result.get("last_trade_date") or "").strip() or self._get_table_latest_date("analysis_results")
         if not trade_date:
             return
-        if not await self._claim_auto_chain(f"candidate_sync:{trade_date}"):
-            logger.warning(
-                "Auto-chain claim 'candidate_sync:%s' already taken, skipping candidate_sync trigger",
-                trade_date,
+        claim_key = f"candidate_sync:{trade_date}"
+        idempotency_key = f"candidate_sync_from_analysis:{trade_date}:v1"
+        claimed, existing_children = await self._claim_auto_chain_or_get_existing_child(
+            claim_key,
+            [{"service": "execution", "job_type": "ui_candidates_sync_from_analysis", "idempotency_key": idempotency_key}],
+        )
+        if not claimed:
+            await self._update_task_record_metadata(
+                task_job_id,
+                {
+                    "auto_chain_trade_date": trade_date,
+                    "followup_candidate_sync_task_job_id": (existing_children[0] or {}).get("id") if existing_children else None,
+                },
             )
             return
-        created = await self.create_task_job(
-            service="execution",
-            job_type="ui_candidates_sync_from_analysis",
-            params={"as_of_date": trade_date},
-            metadata={
-                "auto_chain_source": "batch_analyze",
-                "auto_chain_trade_date": trade_date,
-            },
-            lineage_context=await self._build_child_lineage_context(task_job_id),
-        )
+        try:
+            created = await self.create_task_job(
+                service="execution",
+                job_type="ui_candidates_sync_from_analysis",
+                params={"as_of_date": trade_date},
+                metadata={
+                    "auto_chain_source": "batch_analyze",
+                    "auto_chain_trade_date": trade_date,
+                },
+                lineage_context=await self._build_child_lineage_context(task_job_id),
+                idempotency_key=idempotency_key,
+            )
+        except Exception:
+            await self._release_auto_chain(claim_key)
+            raise
         await self._update_task_record_metadata(
             task_job_id,
             {
@@ -473,12 +546,6 @@ class TaskOrchestratorAutoChainMixin:
         lookback_days = 30
         formula_version = "candidate_sync_v4_per_analyzer"
         claim_key = f"candidate_sync_incremental:{latest_trade_date}:{analyzer_signature}:{lookback_days}:{formula_version}"
-        if not await self._claim_auto_chain(claim_key):
-            logger.warning(
-                "Auto-chain claim '%s' already taken, skipping candidate_sync_incremental trigger",
-                claim_key,
-            )
-            return
         params: Dict[str, Any] = {
             "mode": "resume_repair",
             "to_trade_date": latest_trade_date,
@@ -490,22 +557,40 @@ class TaskOrchestratorAutoChainMixin:
             params["from_trade_date"] = latest_trade_date
         else:
             params["from_trade_date"] = coverage_start_date
-        created = await self.create_task_job(
-            service="execution",
-            job_type="ui_candidates_sync_incremental",
-            params=params,
-            metadata={
-                "auto_chain_source": source_job_type,
-                "auto_chain_trade_date": latest_trade_date,
-                "auto_chain_claim_key": claim_key,
-                "auto_chain_profile": {
-                    "analyzer_signature": analyzer_signature,
-                    "lookback_days": lookback_days,
-                    "formula_version": formula_version,
-                },
-            },
-            lineage_context=await self._build_child_lineage_context(task_job_id),
+        claimed, existing_children = await self._claim_auto_chain_or_get_existing_child(
+            claim_key,
+            [{"service": "execution", "job_type": "ui_candidates_sync_incremental", "idempotency_key": claim_key}],
         )
+        if not claimed:
+            await self._update_task_record_metadata(
+                task_job_id,
+                {
+                    "auto_chain_trade_date": latest_trade_date,
+                    "followup_candidate_sync_incremental_task_job_id": (existing_children[0] or {}).get("id") if existing_children else None,
+                },
+            )
+            return
+        try:
+            created = await self.create_task_job(
+                service="execution",
+                job_type="ui_candidates_sync_incremental",
+                params=params,
+                metadata={
+                    "auto_chain_source": source_job_type,
+                    "auto_chain_trade_date": latest_trade_date,
+                    "auto_chain_claim_key": claim_key,
+                    "auto_chain_profile": {
+                        "analyzer_signature": analyzer_signature,
+                        "lookback_days": lookback_days,
+                        "formula_version": formula_version,
+                    },
+                },
+                lineage_context=await self._build_child_lineage_context(task_job_id),
+                idempotency_key=claim_key,
+            )
+        except Exception:
+            await self._release_auto_chain(claim_key)
+            raise
         await self._update_task_record_metadata(
             task_job_id,
             {
@@ -524,7 +609,7 @@ class TaskOrchestratorAutoChainMixin:
         service = str(normalized.get("service") or "").strip().lower()
         job_type = str(normalized.get("job_type") or "").strip()
         result = normalized.get("result") if isinstance(normalized.get("result"), dict) else {}
-        if service == "execution" and job_type == "batch_analyze":
+        if service == "execution" and job_type in {"batch_analyze", "analysis_backfill"}:
             td = str(result.get("last_trade_date") or "").strip()
             return td or None
         if service == "flowhub" and job_type in {"index_daily_data", "industry_board"}:
@@ -533,6 +618,95 @@ class TaskOrchestratorAutoChainMixin:
                 if td:
                     return td
         return None
+
+    @staticmethod
+    def _max_date(*values: Optional[str]) -> Optional[str]:
+        dates = [str(value or "").strip()[:10] for value in values if str(value or "").strip()]
+        return max(dates) if dates else None
+
+    def _latest_snapshot_id_date(self, table_name: str) -> Optional[str]:
+        try:
+            rows = self._get_db_manager().fetch_table_rows(
+                table_name,
+                ["snapshot_id", "metadata", "updated_at", "created_at"],
+                order_by=[("updated_at", "desc"), ("created_at", "desc")],
+                limit=200,
+            )
+        except Exception:
+            return None
+        dates = []
+        for row in rows or []:
+            metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+            for key in ("trade_date", "as_of_date", "snapshot_date"):
+                value = str(metadata.get(key) or "").strip()
+                if value:
+                    dates.append(value[:10])
+            snapshot_id = str(row.get("snapshot_id") or "")
+            match = re.search(r"(20\d{6}|19\d{6})", snapshot_id)
+            if match:
+                token = match.group(1)
+                dates.append(f"{token[0:4]}-{token[4:6]}-{token[6:8]}")
+        return max(dates) if dates else None
+
+    def _resolve_snapshot_ready_trade_date(self) -> Optional[str]:
+        stock_latest = self._get_table_latest_date("stock_daily_data")
+        index_latest = self._get_table_latest_date("index_daily_data")
+        industry_latest = self._get_table_latest_date("industry_board_daily_data")
+        analysis_latest = self._max_date(
+            self._get_table_latest_date("analysis_signal_events"),
+            self._get_table_latest_date("execution_signal_stats_daily"),
+        )
+        required = [stock_latest, index_latest, industry_latest, analysis_latest]
+        if any(not item for item in required):
+            return None
+        return min(str(item)[:10] for item in required if item)
+
+    def _snapshot_pipeline_current_date(self) -> Optional[str]:
+        market_latest = self._get_table_latest_date("market_snapshots", "snapshot_date")
+        macro_latest = self._latest_snapshot_id_date("macro_cycle_snapshots")
+        rotation_latest = self._latest_snapshot_id_date("rotation_snapshots")
+        dates = [item for item in (market_latest, macro_latest, rotation_latest) if item]
+        return min(str(item)[:10] for item in dates) if len(dates) == 3 else None
+
+    async def maybe_converge_snapshot_pipeline(
+        self,
+        reason: str,
+        task_job_id: str,
+        normalized: Dict[str, Any],
+        *,
+        cache: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        cache = cache if isinstance(cache, dict) else None
+        if cache is not None and "snapshot_ready_trade_date" in cache:
+            ready_trade_date = cache.get("snapshot_ready_trade_date")
+        else:
+            ready_trade_date = self._resolve_snapshot_ready_trade_date()
+            if cache is not None:
+                cache["snapshot_ready_trade_date"] = ready_trade_date
+        if not ready_trade_date:
+            await self._update_task_record_metadata(
+                task_job_id,
+                {"snapshot_convergence_blocked_reason": "source_dates_not_ready", "snapshot_convergence_reason": reason},
+            )
+            return
+        if cache is not None and "snapshot_current_date" in cache:
+            current_date = cache.get("snapshot_current_date")
+        else:
+            current_date = self._snapshot_pipeline_current_date()
+            if cache is not None:
+                cache["snapshot_current_date"] = current_date
+        if current_date and current_date >= ready_trade_date:
+            await self._update_task_record_metadata(
+                task_job_id,
+                {
+                    "snapshot_convergence_reason": reason,
+                    "snapshot_convergence_ready_trade_date": ready_trade_date,
+                    "snapshot_convergence_current_date": current_date,
+                    "snapshot_convergence_status": "already_current",
+                },
+            )
+            return
+        await self._fire_snapshot_refresh(ready_trade_date, task_job_id, normalized)
 
     async def _try_converge_snapshot_prereq(self, field: str, task_job_id: str, normalized: Dict[str, Any]) -> None:
         trade_date = self._resolve_snapshot_trade_date(normalized)
@@ -590,10 +764,18 @@ class TaskOrchestratorAutoChainMixin:
 
     async def _fire_snapshot_refresh(self, trade_date: str, task_job_id: str, normalized: Dict[str, Any]) -> None:
         claim_key = f"snapshot_refresh:{trade_date}"
-        if not await self._claim_auto_chain(claim_key):
-            logger.warning(
-                "Auto-chain claim '%s' already taken, skipping snapshot_refresh trigger",
-                claim_key,
+        idempotency_key = f"snapshot_refresh:{trade_date}:CSI300:D1:v1"
+        claimed, existing_children = await self._claim_auto_chain_or_get_existing_child(
+            claim_key,
+            [{"service": "macro", "job_type": "ui_snapshot_refresh", "idempotency_key": idempotency_key}],
+        )
+        if not claimed:
+            await self._update_task_record_metadata(
+                task_job_id,
+                {
+                    "auto_chain_trade_date": trade_date,
+                    "followup_snapshot_refresh_task_job_id": (existing_children[0] or {}).get("id") if existing_children else None,
+                },
             )
             return
         try:
@@ -611,6 +793,7 @@ class TaskOrchestratorAutoChainMixin:
                     "auto_chain_prereqs": sorted(self.SNAPSHOT_PREREQ_FIELDS),
                 },
                 lineage_context=await self._build_child_lineage_context(task_job_id),
+                idempotency_key=idempotency_key,
             )
             await self._update_task_record_metadata(
                 task_job_id,
@@ -627,3 +810,4 @@ class TaskOrchestratorAutoChainMixin:
         except Exception as exc:
             logger.warning("Failed to trigger snapshot_refresh for trade_date=%s: %s", trade_date, exc)
             await self._release_auto_chain(claim_key)
+            raise

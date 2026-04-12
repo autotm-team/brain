@@ -166,12 +166,17 @@ class SystemCoordinator(ISystemCoordinator):
 
             # 协调系统关闭
             await self.coordinate_system_shutdown()
+            await self._disconnect_adapters_best_effort()
             
             logger.info("SystemCoordinator stopped successfully")
             return True
             
         except Exception as e:
             logger.error(f"Error stopping SystemCoordinator: {e}")
+            try:
+                await self._disconnect_adapters_best_effort()
+            except Exception as disconnect_error:
+                logger.warning(f"Best-effort adapter disconnect failed after stop error: {disconnect_error}")
             return False
     
     async def coordinate_full_analysis_cycle(self) -> AnalysisCycleResult:
@@ -1051,6 +1056,28 @@ class SystemCoordinator(ISystemCoordinator):
                 logger.debug("StrategyAdapter not initialized, skipping shutdown notification")
         except Exception as e:
             logger.error(f"Failed to notify strategy system shutdown: {e}")
+
+    async def _disconnect_adapters_best_effort(self) -> None:
+        """Best-effort adapter cleanup for partially initialized shutdown paths."""
+        disconnect_entries = []
+        disconnect_tasks = []
+        adapters = [
+            ("macro", getattr(self, "_macro_adapter", None)),
+            ("portfolio", getattr(self, "_portfolio_adapter", None)),
+            ("strategy", getattr(self, "_strategy_adapter", None)),
+        ]
+        for name, adapter in adapters:
+            if adapter is not None:
+                disconnect_entries.append(name)
+                disconnect_tasks.append(adapter.disconnect_from_system())
+        if disconnect_tasks:
+            results = await asyncio.gather(*disconnect_tasks, return_exceptions=True)
+            for name, result in zip(disconnect_entries, results):
+                if isinstance(result, Exception):
+                    logger.warning("Best-effort %s adapter disconnect failed: %s", name, result)
+        self._macro_adapter = None
+        self._portfolio_adapter = None
+        self._strategy_adapter = None
 
     def _create_balanced_allocation(self, allocation_id: str) -> ResourceAllocation:
         """创建平衡资源分配"""

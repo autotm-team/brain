@@ -93,10 +93,12 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
         "ui_candidates_merge": "候选池合并",
         "ui_candidates_ignore": "候选池忽略",
         "ui_candidates_mark_read": "候选池标记已读",
-        "ui_candidates_watchlist_update": "候选池状态更新",
-        "ui_candidates_watchlist_create": "候选池入池",
-        "ui_candidates_watchlist_item_update": "候选池候选更新",
-        "ui_candidates_watchlist_promote_to_research": "候选池进入研究",
+        "ui_candidates_watchlist_update": "候选清单状态更新",
+        "ui_candidates_watchlist_create": "候选清单入选",
+        "ui_candidates_watchlist_item_update": "候选清单更新",
+        "ui_candidates_watchlist_transition": "候选清单流转",
+        "ui_candidates_watchlist_review": "候选清单复查",
+        "ui_candidates_watchlist_promote_to_research": "候选清单进入研究",
         "ui_candidates_sync_from_analysis": "候选池分析同步",
         "ui_candidates_sync_incremental": "候选池增量补齐",
         "ui_candidates_backfill_metadata": "候选池元数据回补",
@@ -134,6 +136,25 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
     TERMINAL_STATUSES = {"succeeded", "failed", "cancelled"}
     ACTIVE_STATUSES = {"queued", "running"}
     RECOVERY_MAX_ATTEMPTS = 3
+    AUTO_CHAIN_CONTINUATION_NAME = "brain_auto_chain_v1"
+    AUTO_CHAIN_CONTINUATION_JOB_TYPES = {
+        "stock_basic_data",
+        "batch_daily_ohlc",
+        "batch_daily_basic",
+        "batch_analyze",
+        "analysis_backfill",
+        "index_daily_data",
+        "industry_board",
+        "ui_candidates_sync_from_analysis",
+        "ui_candidates_sync_incremental",
+        "ui_snapshot_refresh",
+    }
+    DEFAULT_CONTINUATION_BATCH_SIZE = 25
+    DEFAULT_CONTINUATION_BATCH_TIME_BUDGET_SECONDS = 2.0
+    DEFAULT_CONTINUATION_BATCH_IDLE_SLEEP_SECONDS = 0.25
+    DEFAULT_CONTINUATION_MAX_BATCHES = 100
+    DEFAULT_CONTINUATION_INTERVAL_SECONDS = 60.0
+    DEFAULT_CONTINUATION_MAX_BATCHES_PER_RUN = 20
 
     def __init__(self, app):
         self._app = app
@@ -153,6 +174,7 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
         metadata: Optional[Dict[str, Any]] = None,
         service_payload: Optional[Dict[str, Any]] = None,
         lineage_context: Optional[Dict[str, Any]] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         service = (service or "").lower()
         if service not in self.SERVICES:
@@ -161,7 +183,13 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
         normalized_params = self._normalize_params(params)
         normalized_metadata = self._normalize_metadata(metadata)
 
-        payload = service_payload if isinstance(service_payload, dict) else self._build_create_payload(service, job_type, normalized_params)
+        deterministic_job_id = self._deterministic_service_job_id(service, job_type, idempotency_key)
+        payload = service_payload if isinstance(service_payload, dict) else self._build_create_payload(
+            service,
+            job_type,
+            normalized_params,
+            job_id=deterministic_job_id,
+        )
         request_payload_hash = self._hash_payload(payload)
         response = await self._request_service(service, "POST", "/api/v1/jobs", payload=payload)
         service_job_id = self._extract_job_id(response)
@@ -181,6 +209,7 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
             "metadata": {
                 **(((existing_record or {}).get("metadata")) if isinstance((existing_record or {}).get("metadata"), dict) else {}),
                 **normalized_metadata,
+                **({"idempotency_key": idempotency_key} if idempotency_key else {}),
             },
             "service_payload": dict(service_payload) if isinstance(service_payload, dict) else None,
             "request_payload_hash": request_payload_hash,
@@ -203,6 +232,7 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
             request_payload_hash=request_payload_hash,
             upstream_status=202,
         )
+        await self._sync_task_projection(task_job_id, normalized)
         self._schedule_followup_monitor(task_job_id, service, job_type)
         return normalized
 
@@ -214,6 +244,8 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
 
         async def _watch() -> None:
             deadline = asyncio.get_running_loop().time() + 6 * 3600
+            consecutive_errors = 0
+            max_consecutive_errors = 3
             while asyncio.get_running_loop().time() < deadline:
                 try:
                     payload = await self._refresh_task_job_snapshot(
@@ -221,11 +253,21 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
                         persist_history=True,
                         trigger_followups=True,
                     )
+                    consecutive_errors = 0
                     status = str(payload.get("status") or "").lower()
                     if status in {"succeeded", "failed", "cancelled"}:
                         return
-                except Exception:
-                    return
+                except Exception as exc:
+                    consecutive_errors += 1
+                    logger.warning(
+                        "Follow-up monitor refresh failed for %s (%s/%s): %s",
+                        task_job_id,
+                        consecutive_errors,
+                        max_consecutive_errors,
+                        exc,
+                    )
+                    if consecutive_errors >= max_consecutive_errors:
+                        return
                 await asyncio.sleep(5)
 
         task = asyncio.create_task(_watch())
@@ -498,6 +540,7 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
                     normalized = self._normalize_job(svc, raw_job, task_job_id=task_job_id)
                     if mapped_id:
                         normalized = await self._merge_record_metadata(mapped_id, normalized)
+                        await self._sync_task_projection(mapped_id, normalized)
                     normalized = self._compact_job_for_list(normalized)
                     if mapped_id:
                         seen_task_ids.add(mapped_id)
@@ -585,8 +628,16 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
                 normalized = await self._merge_record_metadata(mapped_task_job_id, normalized)
             if mapped_task_job_id and persist_history:
                 await self._append_history_if_changed(mapped_task_job_id, normalized)
+                await self._sync_task_projection(mapped_task_job_id, normalized)
                 if trigger_followups:
                     await self._maybe_trigger_followups(mapped_task_job_id, normalized)
+                    if str(normalized.get("status") or "").lower() in self.TERMINAL_STATUSES:
+                        try:
+                            await self.scan_terminal_continuations_once(limit=100)
+                        except Exception as exc:
+                            logger.warning("Task continuation refresh scan failed for %s: %s", mapped_task_job_id, exc)
+            elif mapped_task_job_id:
+                await self._sync_task_projection(mapped_task_job_id, normalized)
             return normalized
         except UpstreamServiceError as exc:
             if not mapped_task_job_id:
@@ -627,15 +678,18 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
                 record = await self._load_task_record(task_job_id)
                 if not isinstance(record, dict):
                     continue
+                record_status = str(record.get("status") or "").strip().lower()
+                service = str(record.get("service") or "").strip().lower()
+                service_job_id = str(record.get("service_job_id") or "").strip()
+                if service not in self.SERVICES or not service_job_id:
+                    continue
+                if record_status and record_status not in self.ACTIVE_STATUSES:
+                    continue
                 latest = await self._build_local_task_view(task_job_id)
                 if not isinstance(latest, dict):
                     continue
                 status = str(latest.get("status") or "").strip().lower()
                 if status not in self.ACTIVE_STATUSES:
-                    continue
-                service = str(record.get("service") or "").strip().lower()
-                service_job_id = str(record.get("service_job_id") or "").strip()
-                if service not in self.SERVICES or not service_job_id:
                     continue
                 scanned += 1
                 try:
@@ -681,6 +735,369 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
             "skipped": skipped,
             "errors": errors,
         }
+
+    async def _task_api_call(self, method_name: str, *args, **kwargs):
+        task_api = self._get_task_api()
+        method = getattr(task_api, method_name)
+        return await asyncio.to_thread(method, *args, **kwargs)
+
+    async def _find_idempotent_child_task(
+        self,
+        *,
+        service: str,
+        job_type: str,
+        idempotency_key: str,
+    ) -> Optional[Dict[str, Any]]:
+        service_job_id = self._deterministic_service_job_id(service, job_type, idempotency_key)
+        if not service_job_id:
+            return None
+        mapped_task_job_id = await self._find_task_job_id(service, service_job_id)
+        if mapped_task_job_id:
+            view = await self._build_local_task_view(mapped_task_job_id)
+            if isinstance(view, dict):
+                return view
+            record = await self._load_task_record(mapped_task_job_id)
+            if isinstance(record, dict):
+                return {"id": mapped_task_job_id, **record}
+        try:
+            runtime_job = await self._task_api_call("get_runtime_job", service_job_id, service_name=service)
+        except Exception:
+            runtime_job = None
+        if not isinstance(runtime_job, dict):
+            return None
+        task_job_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"autotm-brain-child:{service}:{service_job_id}"))
+        params = runtime_job.get("params") if isinstance(runtime_job.get("params"), dict) else {}
+        metadata = runtime_job.get("metadata") if isinstance(runtime_job.get("metadata"), dict) else {}
+        payload = self._build_create_payload(service, job_type, params, job_id=service_job_id)
+        record = {
+            "task_job_id": task_job_id,
+            "service": service,
+            "service_job_id": service_job_id,
+            "job_type": job_type,
+            "created_at": runtime_job.get("created_at") or self._utc_now(),
+            "params": params,
+            "metadata": {**metadata, "idempotency_key": idempotency_key, "recovered_from_runtime_child": True},
+            "service_payload": None,
+            "request_payload_hash": self._hash_payload(payload),
+        }
+        await self._save_task_record(record)
+        normalized = self._normalize_job(service, runtime_job, task_job_id=task_job_id)
+        normalized = await self._merge_record_metadata(task_job_id, normalized)
+        await self._append_history_if_changed(task_job_id, normalized)
+        await self._sync_task_projection(task_job_id, normalized)
+        return normalized
+
+    async def _claim_auto_chain_or_get_existing_child(
+        self,
+        claim_key: str,
+        child_specs: List[Dict[str, str]],
+    ) -> tuple[bool, List[Dict[str, Any]]]:
+        if await self._claim_auto_chain(claim_key):
+            return True, []
+        existing: List[Dict[str, Any]] = []
+        missing: List[str] = []
+        for spec in child_specs:
+            child = await self._find_idempotent_child_task(
+                service=str(spec.get("service") or ""),
+                job_type=str(spec.get("job_type") or ""),
+                idempotency_key=str(spec.get("idempotency_key") or ""),
+            )
+            if isinstance(child, dict):
+                existing.append(child)
+            else:
+                missing.append(f"{spec.get('service')}:{spec.get('job_type')}:{spec.get('idempotency_key')}")
+        if missing:
+            raise RuntimeError(f"Auto-chain claim '{claim_key}' exists but child job is missing: {missing}")
+        logger.info("Auto-chain claim '%s' already taken and child job exists; skipping duplicate trigger", claim_key)
+        return False, existing
+
+    def _service_config_value(self, name: str, default: Any) -> Any:
+        config = self._app.get("config") if isinstance(self._app, dict) else None
+        service_config = getattr(config, "service", None)
+        return getattr(service_config, name, default)
+
+    def _continuation_batch_size(self) -> int:
+        raw = self._service_config_value("continuation_batch_size", self.DEFAULT_CONTINUATION_BATCH_SIZE)
+        try:
+            return max(1, min(int(raw), 500))
+        except Exception:
+            return self.DEFAULT_CONTINUATION_BATCH_SIZE
+
+    def _continuation_batch_time_budget_seconds(self) -> float:
+        raw = self._service_config_value(
+            "continuation_batch_time_budget_seconds",
+            self.DEFAULT_CONTINUATION_BATCH_TIME_BUDGET_SECONDS,
+        )
+        try:
+            return max(0.1, float(raw))
+        except Exception:
+            return self.DEFAULT_CONTINUATION_BATCH_TIME_BUDGET_SECONDS
+
+    def _continuation_batch_idle_sleep_seconds(self) -> float:
+        raw = self._service_config_value(
+            "continuation_batch_idle_sleep_seconds",
+            self.DEFAULT_CONTINUATION_BATCH_IDLE_SLEEP_SECONDS,
+        )
+        try:
+            return max(0.0, float(raw))
+        except Exception:
+            return self.DEFAULT_CONTINUATION_BATCH_IDLE_SLEEP_SECONDS
+
+    def _continuation_interval_seconds(self) -> float:
+        raw = self._service_config_value("continuation_interval_seconds", self.DEFAULT_CONTINUATION_INTERVAL_SECONDS)
+        try:
+            return max(1.0, float(raw))
+        except Exception:
+            return self.DEFAULT_CONTINUATION_INTERVAL_SECONDS
+
+    def _continuation_max_batches_per_run(self) -> int:
+        raw = self._service_config_value("continuation_max_batches_per_run", self.DEFAULT_CONTINUATION_MAX_BATCHES_PER_RUN)
+        try:
+            return max(1, min(int(raw), 1000))
+        except Exception:
+            return self.DEFAULT_CONTINUATION_MAX_BATCHES_PER_RUN
+
+    async def run_terminal_continuation_recovery_until_idle(
+        self,
+        *,
+        max_batches: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        batch_cap = self._continuation_max_batches_per_run() if max_batches is None else max(1, int(max_batches))
+        batches = 0
+        processed = 0
+        fetched = 0
+        skipped_probe = 0
+        skipped_duplicate_intent = 0
+        advanced_to = None
+        has_more = False
+        errors: List[Dict[str, Any]] = []
+        while batches < batch_cap:
+            result = await self.scan_terminal_continuations_once(
+                limit=self._continuation_batch_size(),
+                time_budget_seconds=self._continuation_batch_time_budget_seconds(),
+            )
+            batches += 1
+            processed += int(result.get("processed") or 0)
+            fetched += int(result.get("fetched") or 0)
+            skipped_probe += int(result.get("skipped_probe") or 0)
+            skipped_duplicate_intent += int(result.get("skipped_duplicate_intent") or 0)
+            advanced_to = result.get("advanced_to") if result.get("advanced_to") is not None else advanced_to
+            errors.extend(result.get("errors") if isinstance(result.get("errors"), list) else [])
+            has_more = bool(result.get("has_more"))
+            if result.get("skipped") == "cursor_claimed" or errors or not bool(result.get("has_more")):
+                break
+            await asyncio.sleep(self._continuation_batch_idle_sleep_seconds())
+        if has_more and batches >= batch_cap and not errors:
+            logger.warning(
+                "Task continuation recovery reached max batches: batches=%s batch_cap=%s advanced_to=%s",
+                batches,
+                batch_cap,
+                advanced_to,
+            )
+        return {
+            "batches": batches,
+            "fetched": fetched,
+            "processed": processed,
+            "skipped_probe": skipped_probe,
+            "skipped_duplicate_intent": skipped_duplicate_intent,
+            "advanced_to": advanced_to,
+            "has_more": has_more,
+            "errors": errors,
+        }
+
+    async def scan_terminal_continuations_once(
+        self,
+        *,
+        limit: Optional[int] = None,
+        time_budget_seconds: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        owner = f"brain-{uuid.uuid4().hex[:8]}"
+        claim_expires_at = datetime.utcnow() + timedelta(minutes=5)
+        batch_limit = max(1, min(int(limit or self._continuation_batch_size()), 500))
+        budget = self._continuation_batch_time_budget_seconds() if time_budget_seconds is None else max(0.1, float(time_budget_seconds))
+        started = time.monotonic()
+        after_event_id = 0
+        advanced_to = 0
+        fetched = 0
+        processed = 0
+        skipped_probe = 0
+        skipped_duplicate_intent = 0
+        has_more = False
+        errors: List[Dict[str, Any]] = []
+        claimed = False
+        try:
+            claimed = await self._task_api_call(
+                "claim_brain_task_continuation_cursor",
+                self.AUTO_CHAIN_CONTINUATION_NAME,
+                claim_owner=owner,
+                claim_expires_at=claim_expires_at,
+            )
+        except Exception as exc:
+            logger.warning("Task continuation cursor unavailable: %s", exc)
+            return {"processed": 0, "advanced_to": None, "errors": [{"error": str(exc)}]}
+        if not claimed:
+            return {"processed": 0, "advanced_to": None, "errors": [], "skipped": "cursor_claimed"}
+
+        try:
+            cursor = await self._task_api_call("get_brain_task_continuation_cursor", self.AUTO_CHAIN_CONTINUATION_NAME) or {}
+            after_event_id = int(cursor.get("last_event_id") or 0)
+            advanced_to = after_event_id
+            rows = await self._task_api_call(
+                "list_runtime_terminal_events",
+                after_event_id=after_event_id,
+                service_names=["flowhub", "execution", "macro"],
+                job_types=sorted(self.AUTO_CHAIN_CONTINUATION_JOB_TYPES),
+                limit=batch_limit,
+            )
+            fetched = len(rows or [])
+            intent_keys: set[str] = set()
+            snapshot_cache: Dict[str, Any] = {}
+            for row in rows or []:
+                if processed > 0 and time.monotonic() - started >= budget:
+                    has_more = True
+                    break
+                event_id = int(row.get("event_id") or 0)
+                try:
+                    result = await self._process_terminal_continuation_event(row)
+                    if result.get("skipped_probe"):
+                        skipped_probe += 1
+                        processed += 1
+                        advanced_to = max(advanced_to, event_id)
+                        continue
+                    followup = result.get("followup") if isinstance(result.get("followup"), dict) else None
+                    if not followup:
+                        processed += 1
+                        advanced_to = max(advanced_to, event_id)
+                        continue
+                    intent_key = str(followup.get("intent_key") or "").strip()
+                    if intent_key and intent_key in intent_keys:
+                        skipped_duplicate_intent += 1
+                        processed += 1
+                        advanced_to = max(advanced_to, event_id)
+                        continue
+                    if intent_key:
+                        intent_keys.add(intent_key)
+                    await self._maybe_trigger_followups(
+                        str(followup["task_job_id"]),
+                        followup["normalized"],
+                        snapshot_cache=snapshot_cache,
+                        raise_on_error=True,
+                    )
+                    processed += 1
+                    advanced_to = max(advanced_to, event_id)
+                except Exception as exc:
+                    errors.append({"event_id": event_id, "error": str(exc)})
+                    break
+            if not errors:
+                has_more = has_more or fetched >= batch_limit
+        finally:
+            try:
+                await self._task_api_call(
+                    "advance_brain_task_continuation_cursor",
+                    self.AUTO_CHAIN_CONTINUATION_NAME,
+                    last_event_id=advanced_to,
+                    claim_owner=owner,
+                    release_claim=True,
+                )
+            except Exception as exc:
+                errors.append({"event_id": advanced_to, "error": f"cursor_release_failed: {exc}"})
+        duration_ms = round((time.monotonic() - started) * 1000, 2)
+        log_fn = logger.debug
+        if errors or has_more:
+            log_fn = logger.warning
+        elif processed or skipped_probe or skipped_duplicate_intent:
+            log_fn = logger.info
+        log_fn(
+            "Task continuation batch completed: from_event_id=%s to_event_id=%s fetched=%s processed=%s "
+            "skipped_probe=%s skipped_duplicate_intent=%s duration_ms=%s errors=%s",
+            after_event_id,
+            advanced_to,
+            fetched,
+            processed,
+            skipped_probe,
+            skipped_duplicate_intent,
+            duration_ms,
+            errors,
+        )
+        return {
+            "from_event_id": after_event_id,
+            "advanced_to": advanced_to,
+            "fetched": fetched,
+            "processed": processed,
+            "skipped_probe": skipped_probe,
+            "skipped_duplicate_intent": skipped_duplicate_intent,
+            "duration_ms": duration_ms,
+            "has_more": has_more,
+            "errors": errors,
+        }
+
+    async def _process_terminal_continuation_event(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        service = str(row.get("service_name") or "").strip().lower()
+        service_job_id = str(row.get("job_id") or "").strip()
+        if not service or not service_job_id:
+            return {"handled": False}
+        task_job_id = await self._find_task_job_id(service, service_job_id)
+        if not task_job_id:
+            return {"handled": False}
+        job_payload = {
+            "job_id": service_job_id,
+            "job_type": row.get("job_type"),
+            "status": row.get("status") or row.get("event_type"),
+            "progress": row.get("progress"),
+            "params": row.get("params") if isinstance(row.get("params"), dict) else {},
+            "result": row.get("result"),
+            "error": row.get("error"),
+            "error_code": row.get("error_code"),
+            "metadata": row.get("metadata") if isinstance(row.get("metadata"), dict) else {},
+            "created_at": row.get("created_at"),
+            "updated_at": row.get("updated_at") or row.get("event_created_at"),
+            "started_at": row.get("started_at"),
+            "completed_at": row.get("completed_at") or row.get("event_created_at"),
+        }
+        normalized = self._normalize_job(service, job_payload, task_job_id=task_job_id)
+        normalized = await self._merge_record_metadata(task_job_id, normalized)
+        await self._append_history_if_changed(task_job_id, normalized)
+        await self._sync_task_projection(task_job_id, normalized)
+        if self._is_probe_or_diagnostic_task(normalized):
+            return {"handled": True, "skipped_probe": True}
+        intent_key = self._build_continuation_intent_key(task_job_id, normalized)
+        if not intent_key:
+            return {"handled": True}
+        return {
+            "handled": True,
+            "followup": {
+                "task_job_id": task_job_id,
+                "normalized": normalized,
+                "intent_key": intent_key,
+            },
+        }
+
+    @staticmethod
+    def _is_probe_or_diagnostic_task(normalized: Dict[str, Any]) -> bool:
+        metadata = normalized.get("metadata") if isinstance(normalized.get("metadata"), dict) else {}
+        params = normalized.get("params") if isinstance(normalized.get("params"), dict) else {}
+        return bool(metadata.get("task_probe_disable_auto_chain")) or bool(params.get("_task_probe")) or str(normalized.get("job_type") or "") == "diagnostic_sleep"
+
+    def _build_continuation_intent_key(self, task_job_id: str, normalized: Dict[str, Any]) -> Optional[str]:
+        service = str(normalized.get("service") or "").strip().lower()
+        job_type = str(normalized.get("job_type") or "").strip()
+        result = normalized.get("result") if isinstance(normalized.get("result"), dict) else {}
+        params = normalized.get("params") if isinstance(normalized.get("params"), dict) else {}
+        scope = self._scope_signature(params) or "full"
+        if service == "execution" and job_type == "batch_analyze":
+            trade_date = str(result.get("last_trade_date") or "").strip()
+            return f"batch_analyze:{trade_date}:{scope}" if trade_date else None
+        if service == "execution" and job_type == "analysis_backfill":
+            last_trade_date = str(result.get("last_trade_date") or "").strip()
+            coverage_start_date = str(result.get("coverage_start_date") or "").strip() or last_trade_date
+            return f"analysis_backfill:{coverage_start_date}:{last_trade_date}:{scope}" if last_trade_date else None
+        if service == "flowhub" and job_type in {"index_daily_data", "industry_board"}:
+            trade_date = self._resolve_snapshot_trade_date(normalized)
+            return f"snapshot:{job_type}:{trade_date}" if trade_date else None
+        if service == "flowhub" and job_type in {"batch_daily_ohlc", "batch_daily_basic"}:
+            trade_date = self._extract_daily_fetch_trade_date(normalized)
+            return f"daily_analysis:{trade_date}:{scope}" if trade_date else None
+        return None
 
     async def cancel_task_job(self, task_job_id: str) -> Dict[str, Any]:
         service, service_job_id, mapped_task_job_id = await self._resolve_task_job_id(task_job_id)
@@ -771,11 +1188,29 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
             raise ValueError("metadata must be a JSON object")
         return dict(metadata)
 
-    def _build_create_payload(self, service: str, job_type: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        return request_envelope({
+    def _build_create_payload(
+        self,
+        service: str,
+        job_type: str,
+        params: Dict[str, Any],
+        *,
+        job_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        data = {
             "job_type": job_type,
             "params": params,
-        })
+        }
+        if job_id:
+            data["job_id"] = job_id
+        return request_envelope(data)
+
+    @staticmethod
+    def _deterministic_service_job_id(service: str, job_type: str, idempotency_key: Optional[str]) -> Optional[str]:
+        token = str(idempotency_key or "").strip()
+        if not token:
+            return None
+        digest = hashlib.sha256(f"{service}:{job_type}:{token}".encode("utf-8")).hexdigest()
+        return f"brain-{digest[:32]}"
 
     @staticmethod
     def _normalize_upstream_error(payload: Any, status: int) -> Dict[str, Any]:
@@ -958,7 +1393,7 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
                 return task_job_id
 
         try:
-            row = self._get_task_api().get_brain_task_job_by_service_job(service, service_job_id)
+            row = await self._task_api_call("get_brain_task_job_by_service_job", service, service_job_id)
             if isinstance(row, dict):
                 task_job_id = str(row.get("task_job_id") or "")
                 if task_job_id:
@@ -996,7 +1431,7 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
             elif has_result:
                 status = "succeeded"
         progress = self._normalize_progress(job.get("progress"), status)
-        if completed_at is not None and status in {"succeeded", "failed", "cancelled"}:
+        if completed_at is not None and status == "succeeded":
             progress = 100
         task_name = (
             metadata.get("task_name")
@@ -1026,6 +1461,7 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
             "message": message,
             "error": job.get("error"),
             "result": result,
+            "params": params,
             "created_at": created_at,
             "started_at": started_at,
             "updated_at": updated_at,
@@ -1207,7 +1643,8 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
             entry["upstream_status"] = upstream_status
         self._history.setdefault(task_job_id, []).append(entry)
         try:
-            self._get_task_api().append_brain_task_job_history(
+            await self._task_api_call(
+                "append_brain_task_job_history",
                 {
                     "task_job_id": task_job_id,
                     "event_type": event,
@@ -1215,7 +1652,7 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
                     "request_payload_hash": request_payload_hash,
                     "upstream_status": upstream_status,
                     "created_at": datetime.now(timezone.utc),
-                }
+                },
             )
         except Exception:
             return
@@ -1237,10 +1674,34 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
         task_job_id = record["task_job_id"]
         self._brain_jobs[task_job_id] = dict(record)
         try:
-            self._get_task_api().upsert_brain_task_job(record)
+            await self._task_api_call("upsert_brain_task_job", record)
         except Exception as exc:
             logger.warning("Persist brain task record failed for %s: %s", task_job_id, exc)
             return
+
+    async def _sync_task_projection(self, task_job_id: str, normalized_job: Dict[str, Any]) -> None:
+        record = await self._load_task_record(task_job_id)
+        if not isinstance(record, dict):
+            return
+        record_metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        job_metadata = normalized_job.get("metadata") if isinstance(normalized_job.get("metadata"), dict) else {}
+        updated_record = dict(record)
+        updated_record.update(
+            {
+                "status": self._normalize_status(normalized_job.get("status")),
+                "progress": self._normalize_progress(normalized_job.get("progress"), self._normalize_status(normalized_job.get("status"))),
+                "cancellable": bool(normalized_job.get("cancellable")),
+                "message": normalized_job.get("message"),
+                "error": normalized_job.get("error"),
+                "result": normalized_job.get("result"),
+                "metadata": {**record_metadata, **job_metadata},
+                "updated_at": self._datetime_or_none(normalized_job.get("updated_at")) or datetime.utcnow(),
+                "started_at": self._datetime_or_none(normalized_job.get("started_at")),
+                "completed_at": self._datetime_or_none(normalized_job.get("completed_at")),
+                "last_seen_at": datetime.utcnow(),
+            }
+        )
+        await self._save_task_record(updated_record)
 
     async def _update_task_record_metadata(self, task_job_id: str, updates: Dict[str, Any]) -> None:
         record = await self._load_task_record(task_job_id)
@@ -1637,7 +2098,7 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
             return dict(local)
 
         try:
-            record = self._get_task_api().get_brain_task_job(task_job_id)
+            record = await self._task_api_call("get_brain_task_job", task_job_id)
         except Exception:
             return None
         if not isinstance(record, dict):
@@ -1653,7 +2114,7 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
         }
 
         try:
-            ids.update(self._get_task_api().list_brain_task_job_ids())
+            ids.update(await self._task_api_call("list_brain_task_job_ids"))
         except Exception:
             pass
         return sorted(ids)
@@ -1669,7 +2130,7 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
             return normalized
 
         try:
-            rows, _ = self._get_task_api().list_brain_task_job_history(task_job_id, limit=self.HISTORY_MAX, offset=0)
+            rows, _ = await self._task_api_call("list_brain_task_job_history", task_job_id, limit=self.HISTORY_MAX, offset=0)
         except Exception:
             return []
         history: List[Dict[str, Any]] = []
@@ -1701,6 +2162,18 @@ class TaskOrchestrator(TaskOrchestratorAutoChainMixin):
         record = await self._load_task_record(task_job_id)
         if not isinstance(record, dict):
             return None
+        service = str(record.get("service") or "").strip().lower()
+        service_job_id = str(record.get("service_job_id") or "").strip()
+        if service and service_job_id:
+            try:
+                runtime_job = self._get_task_api().get_runtime_job(service_job_id, service_name=service)
+            except Exception:
+                runtime_job = None
+            if isinstance(runtime_job, dict):
+                normalized = self._normalize_job(service, runtime_job, task_job_id=task_job_id)
+                normalized = await self._merge_record_metadata(task_job_id, normalized)
+                await self._sync_task_projection(task_job_id, normalized)
+                return normalized
         latest = await self._latest_history_entry(task_job_id)
         if isinstance(latest, dict):
             job = latest.get("job")

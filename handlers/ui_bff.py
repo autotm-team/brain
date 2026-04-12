@@ -177,6 +177,8 @@ class UIBffHandler(
         RouteSpec("GET", re.compile(r"^/api/v1/ui/candidates/clusters$"), "execution"),
         RouteSpec("GET", re.compile(r"^/api/v1/ui/candidates/events$"), "execution"),
         RouteSpec("GET", re.compile(r"^/api/v1/ui/candidates/watchlist$"), "execution"),
+        RouteSpec("GET", re.compile(r"^/api/v1/ui/candidates/watchlist/metrics$"), "execution"),
+        RouteSpec("GET", re.compile(r"^/api/v1/ui/candidates/watchlist/(?P<candidate_id>[^/]+)/history$"), "execution"),
         RouteSpec("GET", re.compile(r"^/api/v1/ui/candidates/symbols/(?P<symbol>[^/]+)/chart$"), "execution"),
         RouteSpec(
             "POST",
@@ -202,6 +204,22 @@ class UIBffHandler(
             "execution",
             True,
             "ui_candidates_watchlist_promote_to_research",
+            lambda payload, params: {**payload, "candidate_id": params["candidate_id"]},
+        ),
+        RouteSpec(
+            "POST",
+            re.compile(r"^/api/v1/ui/candidates/watchlist/(?P<candidate_id>[^/]+)/transition$"),
+            "execution",
+            True,
+            "ui_candidates_watchlist_transition",
+            lambda payload, params: {**payload, "candidate_id": params["candidate_id"]},
+        ),
+        RouteSpec(
+            "POST",
+            re.compile(r"^/api/v1/ui/candidates/watchlist/(?P<candidate_id>[^/]+)/review$"),
+            "execution",
+            True,
+            "ui_candidates_watchlist_review",
             lambda payload, params: {**payload, "candidate_id": params["candidate_id"]},
         ),
         RouteSpec(

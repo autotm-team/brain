@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import task_orchestrator as task_orchestrator_module
 from task_orchestrator import TaskOrchestrator
 
 
@@ -12,6 +13,9 @@ class _FakeTaskRuntimeAPI:
         self.history = {}
         self.schedules = {}
         self.links = {}
+        self.runtime_jobs = {}
+        self.terminal_events = []
+        self.cursors = {}
 
     def upsert_brain_task_job(self, payload):
         self.jobs[payload["task_job_id"]] = dict(payload)
@@ -96,6 +100,57 @@ class _FakeTaskRuntimeAPI:
     def list_brain_task_jobs_by_ids(self, task_job_ids):
         return [dict(self.jobs[item]) for item in task_job_ids if item in self.jobs]
 
+    def get_runtime_job(self, job_id, service_name=None):
+        row = self.runtime_jobs.get((service_name, job_id))
+        return dict(row) if row else None
+
+    def list_runtime_terminal_events(self, after_event_id=0, service_names=None, job_types=None, limit=500):
+        rows = []
+        for row in self.terminal_events:
+            if int(row.get("event_id") or 0) <= int(after_event_id or 0):
+                continue
+            if service_names and row.get("service_name") not in service_names:
+                continue
+            if job_types and row.get("job_type") not in job_types:
+                continue
+            rows.append(dict(row))
+        rows.sort(key=lambda item: int(item.get("event_id") or 0))
+        return rows[:limit]
+
+    def get_brain_task_continuation_cursor(self, continuation_name):
+        row = self.cursors.get(continuation_name)
+        return dict(row) if row else None
+
+    def upsert_brain_task_continuation_cursor(self, continuation_name, last_event_id=0, claim_owner=None, claim_expires_at=None):
+        row = {
+            "continuation_name": continuation_name,
+            "last_event_id": int(last_event_id or 0),
+            "claim_owner": claim_owner,
+            "claim_expires_at": claim_expires_at,
+        }
+        self.cursors[continuation_name] = row
+        return dict(row)
+
+    def claim_brain_task_continuation_cursor(self, continuation_name, claim_owner, claim_expires_at):
+        row = self.cursors.setdefault(
+            continuation_name,
+            {"continuation_name": continuation_name, "last_event_id": 0},
+        )
+        row["claim_owner"] = claim_owner
+        row["claim_expires_at"] = claim_expires_at
+        return True
+
+    def advance_brain_task_continuation_cursor(self, continuation_name, last_event_id, claim_owner=None, release_claim=False):
+        row = self.cursors.setdefault(
+            continuation_name,
+            {"continuation_name": continuation_name, "last_event_id": 0},
+        )
+        row["last_event_id"] = max(int(row.get("last_event_id") or 0), int(last_event_id or 0))
+        if release_claim:
+            row["claim_owner"] = None
+            row["claim_expires_at"] = None
+        return dict(row)
+
 
 class _FakeServiceRuntime:
     def __init__(self) -> None:
@@ -106,8 +161,8 @@ class _FakeServiceRuntime:
     async def request(self, service, method, path, payload=None, params=None):
         if method == "POST" and path == "/api/v1/jobs":
             self.counter += 1
-            job_id = f"{service}-job-{self.counter}"
             body = payload.get("data") if isinstance(payload, dict) and isinstance(payload.get("data"), dict) else payload
+            job_id = str(body.get("job_id") or f"{service}-job-{self.counter}") if isinstance(body, dict) else f"{service}-job-{self.counter}"
             job_type = body.get("job_type") if isinstance(body, dict) else "unknown"
             job_params = body.get("params") if isinstance(body, dict) and isinstance(body.get("params"), dict) else {}
             job = {
@@ -250,6 +305,350 @@ async def _test_task_job_history_merges_control_plane_and_service_runtime_source
     ]
     assert history[1]["service_job_id"] == "execution-job-1"
     assert history[2]["payload"]["progress"] == 25
+
+
+def test_refresh_syncs_brain_projection_from_runtime_truth():
+    asyncio.run(_test_refresh_syncs_brain_projection_from_runtime_truth())
+
+
+async def _test_refresh_syncs_brain_projection_from_runtime_truth():
+    orchestrator = TaskOrchestrator(app={})
+    fake_api = _FakeTaskRuntimeAPI()
+    fake_runtime = _FakeServiceRuntime()
+    orchestrator._task_api = fake_api
+    orchestrator._request_service = fake_runtime.request
+
+    await orchestrator._save_task_record(
+        {
+            "task_job_id": "brain-task-sync",
+            "service": "execution",
+            "service_job_id": "svc-job-sync",
+            "job_type": "batch_analyze",
+            "status": "queued",
+            "progress": 0,
+            "params": {},
+            "metadata": {},
+            "created_at": "2026-04-01T00:00:00Z",
+        }
+    )
+    fake_runtime.jobs["svc-job-sync"] = {
+        "job_id": "svc-job-sync",
+        "job_type": "batch_analyze",
+        "status": "succeeded",
+        "progress": 100,
+        "params": {},
+        "result": {"last_trade_date": "2026-04-10"},
+        "metadata": {},
+        "created_at": "2026-04-01T00:00:00Z",
+        "updated_at": "2026-04-01T00:01:00Z",
+        "completed_at": "2026-04-01T00:01:00Z",
+    }
+
+    payload = await orchestrator._refresh_task_job_snapshot(
+        "brain-task-sync",
+        persist_history=True,
+        trigger_followups=False,
+    )
+
+    assert payload["status"] == "succeeded"
+    saved = fake_api.get_brain_task_job("brain-task-sync")
+    assert saved["status"] == "succeeded"
+    assert saved["progress"] == 100
+    assert saved["result"] == {"last_trade_date": "2026-04-10"}
+
+
+def test_continuation_replays_terminal_runtime_event():
+    asyncio.run(_test_continuation_replays_terminal_runtime_event())
+
+
+async def _test_continuation_replays_terminal_runtime_event():
+    orchestrator = TaskOrchestrator(app={})
+    fake_api = _FakeTaskRuntimeAPI()
+    orchestrator._task_api = fake_api
+    followups = []
+
+    async def fake_followups(task_job_id, normalized, **kwargs):
+        followups.append((task_job_id, normalized["status"], normalized["job_type"]))
+
+    orchestrator._maybe_trigger_followups = fake_followups
+    await orchestrator._save_task_record(
+        {
+            "task_job_id": "brain-task-event",
+            "service": "execution",
+            "service_job_id": "svc-job-event",
+            "job_type": "batch_analyze",
+            "status": "queued",
+            "progress": 0,
+            "params": {},
+            "metadata": {},
+            "created_at": "2026-04-01T00:00:00Z",
+        }
+    )
+    fake_api.terminal_events.append(
+        {
+            "event_id": 41,
+            "service_name": "execution",
+            "job_id": "svc-job-event",
+            "event_type": "succeeded",
+            "job_type": "batch_analyze",
+            "status": "succeeded",
+            "progress": 100,
+            "params": {},
+            "result": {"last_trade_date": "2026-04-10"},
+            "metadata": {},
+            "event_created_at": "2026-04-01T00:01:00Z",
+            "created_at": "2026-04-01T00:00:00Z",
+            "updated_at": "2026-04-01T00:01:00Z",
+            "completed_at": "2026-04-01T00:01:00Z",
+        }
+    )
+
+    result = await orchestrator.scan_terminal_continuations_once()
+
+    assert result["processed"] == 1
+    assert result["advanced_to"] == 41
+    assert followups == [("brain-task-event", "succeeded", "batch_analyze")]
+    assert fake_api.get_brain_task_job("brain-task-event")["status"] == "succeeded"
+
+
+def _terminal_event(event_id: int, *, service_job_id: str, job_type: str = "batch_analyze", probe: bool = False, trade_date: str = "2026-04-10"):
+    return {
+        "event_id": event_id,
+        "service_name": "execution",
+        "job_id": service_job_id,
+        "event_type": "succeeded",
+        "job_type": job_type,
+        "status": "succeeded",
+        "progress": 100,
+        "params": {"_task_probe": {"duration_seconds": 0.4}} if probe else {},
+        "result": {"last_trade_date": trade_date, "coverage_start_date": trade_date},
+        "metadata": {},
+        "event_created_at": "2026-04-01T00:01:00Z",
+        "created_at": "2026-04-01T00:00:00Z",
+        "updated_at": "2026-04-01T00:01:00Z",
+        "completed_at": "2026-04-01T00:01:00Z",
+    }
+
+
+async def _add_brain_mapping(orchestrator, service_job_id: str, *, task_job_id: str):
+    await orchestrator._save_task_record(
+        {
+            "task_job_id": task_job_id,
+            "service": "execution",
+            "service_job_id": service_job_id,
+            "job_type": "batch_analyze",
+            "status": "queued",
+            "progress": 0,
+            "params": {},
+            "metadata": {},
+            "created_at": "2026-04-01T00:00:00Z",
+        }
+    )
+
+
+def test_continuation_recovery_runs_in_small_batches_until_idle():
+    asyncio.run(_test_continuation_recovery_runs_in_small_batches_until_idle())
+
+
+async def _test_continuation_recovery_runs_in_small_batches_until_idle():
+    orchestrator = TaskOrchestrator(app={})
+    fake_api = _FakeTaskRuntimeAPI()
+    orchestrator._task_api = fake_api
+
+    async def fake_followups(*args, **kwargs):
+        return None
+
+    orchestrator._maybe_trigger_followups = fake_followups
+    for event_id in range(1, 101):
+        service_job_id = f"svc-batch-{event_id}"
+        await _add_brain_mapping(orchestrator, service_job_id, task_job_id=f"brain-batch-{event_id}")
+        fake_api.terminal_events.append(_terminal_event(event_id, service_job_id=service_job_id))
+
+    result = await orchestrator.run_terminal_continuation_recovery_until_idle(max_batches=10)
+
+    assert result["processed"] == 100
+    assert result["advanced_to"] == 100
+    assert result["batches"] >= 4
+    assert fake_api.get_brain_task_continuation_cursor("brain_auto_chain_v1")["last_event_id"] == 100
+
+
+def test_continuation_batch_failure_advances_only_before_failed_event():
+    asyncio.run(_test_continuation_batch_failure_advances_only_before_failed_event())
+
+
+async def _test_continuation_batch_failure_advances_only_before_failed_event():
+    orchestrator = TaskOrchestrator(app={})
+    fake_api = _FakeTaskRuntimeAPI()
+    orchestrator._task_api = fake_api
+    for event_id in range(1, 6):
+        fake_api.terminal_events.append(_terminal_event(event_id, service_job_id=f"svc-fail-{event_id}"))
+
+    async def fake_process(row):
+        if int(row["event_id"]) == 3:
+            raise RuntimeError("boom")
+        return {"handled": True}
+
+    orchestrator._process_terminal_continuation_event = fake_process
+    result = await orchestrator.scan_terminal_continuations_once(limit=5)
+
+    assert result["advanced_to"] == 2
+    assert result["errors"][0]["event_id"] == 3
+    assert fake_api.get_brain_task_continuation_cursor("brain_auto_chain_v1")["last_event_id"] == 2
+
+
+def test_continuation_followup_failure_does_not_advance_failed_event():
+    asyncio.run(_test_continuation_followup_failure_does_not_advance_failed_event())
+
+
+async def _test_continuation_followup_failure_does_not_advance_failed_event():
+    orchestrator = TaskOrchestrator(app={})
+    fake_api = _FakeTaskRuntimeAPI()
+    orchestrator._task_api = fake_api
+    await _add_brain_mapping(orchestrator, "svc-followup-fail", task_job_id="brain-followup-fail")
+    fake_api.terminal_events.append(_terminal_event(9, service_job_id="svc-followup-fail"))
+
+    async def failing_followups(*args, **kwargs):
+        raise RuntimeError("child submission failed")
+
+    orchestrator._maybe_trigger_followups = failing_followups
+    result = await orchestrator.scan_terminal_continuations_once(limit=5)
+
+    assert result["advanced_to"] == 0
+    assert result["errors"][0]["event_id"] == 9
+    assert fake_api.get_brain_task_continuation_cursor("brain_auto_chain_v1")["last_event_id"] == 0
+
+
+def test_continuation_max_batches_leaves_has_more_for_next_run():
+    asyncio.run(_test_continuation_max_batches_leaves_has_more_for_next_run())
+
+
+async def _test_continuation_max_batches_leaves_has_more_for_next_run():
+    orchestrator = TaskOrchestrator(app={})
+    fake_api = _FakeTaskRuntimeAPI()
+    orchestrator._task_api = fake_api
+
+    async def fake_followups(*args, **kwargs):
+        return None
+
+    orchestrator._maybe_trigger_followups = fake_followups
+    orchestrator._continuation_batch_size = lambda: 1
+    for event_id in range(1, 4):
+        service_job_id = f"svc-more-{event_id}"
+        await _add_brain_mapping(orchestrator, service_job_id, task_job_id=f"brain-more-{event_id}")
+        fake_api.terminal_events.append(_terminal_event(event_id, service_job_id=service_job_id))
+
+    first = await orchestrator.run_terminal_continuation_recovery_until_idle(max_batches=1)
+    second = await orchestrator.run_terminal_continuation_recovery_until_idle(max_batches=10)
+
+    assert first["processed"] == 1
+    assert first["has_more"] is True
+    assert fake_api.get_brain_task_continuation_cursor("brain_auto_chain_v1")["last_event_id"] == 3
+    assert second["processed"] == 2
+    assert second["has_more"] is False
+
+
+def test_probe_terminal_event_syncs_projection_without_followup():
+    asyncio.run(_test_probe_terminal_event_syncs_projection_without_followup())
+
+
+async def _test_probe_terminal_event_syncs_projection_without_followup():
+    orchestrator = TaskOrchestrator(app={})
+    fake_api = _FakeTaskRuntimeAPI()
+    orchestrator._task_api = fake_api
+    followups = []
+
+    async def fake_followups(*args, **kwargs):
+        followups.append(args)
+
+    orchestrator._maybe_trigger_followups = fake_followups
+    await _add_brain_mapping(orchestrator, "svc-probe", task_job_id="brain-probe")
+    fake_api.terminal_events.append(_terminal_event(1, service_job_id="svc-probe", probe=True))
+
+    result = await orchestrator.scan_terminal_continuations_once(limit=5)
+
+    assert result["processed"] == 1
+    assert result["skipped_probe"] == 1
+    assert followups == []
+    assert fake_api.get_brain_task_job("brain-probe")["status"] == "succeeded"
+
+
+def test_duplicate_continuation_intents_are_triggered_once_per_batch():
+    asyncio.run(_test_duplicate_continuation_intents_are_triggered_once_per_batch())
+
+
+async def _test_duplicate_continuation_intents_are_triggered_once_per_batch():
+    orchestrator = TaskOrchestrator(app={})
+    fake_api = _FakeTaskRuntimeAPI()
+    orchestrator._task_api = fake_api
+    followups = []
+
+    async def fake_followups(task_job_id, normalized, **kwargs):
+        followups.append((task_job_id, normalized["result"]["last_trade_date"]))
+
+    orchestrator._maybe_trigger_followups = fake_followups
+    await _add_brain_mapping(orchestrator, "svc-dup-1", task_job_id="brain-dup-1")
+    await _add_brain_mapping(orchestrator, "svc-dup-2", task_job_id="brain-dup-2")
+    fake_api.terminal_events.append(_terminal_event(1, service_job_id="svc-dup-1", trade_date="2026-04-10"))
+    fake_api.terminal_events.append(_terminal_event(2, service_job_id="svc-dup-2", trade_date="2026-04-10"))
+
+    result = await orchestrator.scan_terminal_continuations_once(limit=5)
+
+    assert result["processed"] == 2
+    assert result["skipped_duplicate_intent"] == 1
+    assert len(followups) == 1
+    assert fake_api.get_brain_task_continuation_cursor("brain_auto_chain_v1")["last_event_id"] == 2
+
+
+def test_continuation_cursor_calls_use_to_thread(monkeypatch):
+    asyncio.run(_test_continuation_cursor_calls_use_to_thread(monkeypatch))
+
+
+async def _test_continuation_cursor_calls_use_to_thread(monkeypatch):
+    orchestrator = TaskOrchestrator(app={})
+    fake_api = _FakeTaskRuntimeAPI()
+    orchestrator._task_api = fake_api
+    calls = []
+
+    async def fake_to_thread(fn, *args, **kwargs):
+        calls.append(getattr(fn, "__name__", repr(fn)))
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(task_orchestrator_module.asyncio, "to_thread", fake_to_thread)
+    await orchestrator.scan_terminal_continuations_once(limit=1)
+
+    assert "claim_brain_task_continuation_cursor" in calls
+    assert "list_runtime_terminal_events" in calls
+    assert "advance_brain_task_continuation_cursor" in calls
+
+
+def test_followup_monitor_retries_transient_errors(monkeypatch):
+    asyncio.run(_test_followup_monitor_retries_transient_errors(monkeypatch))
+
+
+async def _test_followup_monitor_retries_transient_errors(monkeypatch):
+    orchestrator = TaskOrchestrator(app={})
+    calls = {"count": 0}
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(delay):
+        await real_sleep(0)
+
+    async def fake_refresh(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] < 3:
+            raise RuntimeError("transient")
+        return {"status": "succeeded"}
+
+    monkeypatch.setattr(task_orchestrator_module.asyncio, "sleep", fake_sleep)
+    orchestrator._refresh_task_job_snapshot = fake_refresh
+    orchestrator._schedule_followup_monitor("task-monitor", "execution", "batch_analyze")
+
+    deadline = asyncio.get_running_loop().time() + 1.0
+    while orchestrator._followup_watch_tasks and asyncio.get_running_loop().time() < deadline:
+        await real_sleep(0.01)
+
+    assert calls["count"] == 3
+    assert not orchestrator._followup_watch_tasks
 
 
 def test_task_orchestrator_persists_schedule_and_auto_chain_lineage():

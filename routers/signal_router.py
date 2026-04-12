@@ -62,6 +62,7 @@ class SignalRouter(ISignalRouter):
 
         # 适配器实例
         self._strategy_adapter: Optional[StrategyAdapter] = None
+        self._portfolio_adapter: Optional[PortfolioAdapter] = None
         self._task_orchestrator: Optional[Any] = None
 
         # 路由规则和策略
@@ -133,6 +134,19 @@ class SignalRouter(ISignalRouter):
             # 停止组件
             await self._conflict_resolver.stop()
             await self._signal_processor.stop()
+
+            disconnect_tasks = []
+            if self._strategy_adapter is not None:
+                disconnect_tasks.append(self._strategy_adapter.disconnect_from_system())
+            if self._portfolio_adapter is not None:
+                disconnect_tasks.append(self._portfolio_adapter.disconnect_from_system())
+            if disconnect_tasks:
+                results = await asyncio.gather(*disconnect_tasks, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, Exception):
+                        logger.warning("SignalRouter adapter disconnect failed: %s", result)
+            self._strategy_adapter = None
+            self._portfolio_adapter = None
             
             logger.info("SignalRouter stopped successfully")
             return True

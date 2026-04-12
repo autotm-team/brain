@@ -204,6 +204,30 @@ class ServiceConfig(BaseSettings):
         default="Asia/Shanghai",
         validation_alias="BRAIN_SCHEDULER_TIMEZONE",
     )
+    continuation_batch_size: int = Field(
+        default=25,
+        validation_alias="BRAIN_CONTINUATION_BATCH_SIZE",
+    )
+    continuation_batch_time_budget_seconds: float = Field(
+        default=2.0,
+        validation_alias="BRAIN_CONTINUATION_BATCH_TIME_BUDGET_SECONDS",
+    )
+    continuation_batch_idle_sleep_seconds: float = Field(
+        default=0.25,
+        validation_alias="BRAIN_CONTINUATION_BATCH_IDLE_SLEEP_SECONDS",
+    )
+    continuation_startup_delay_seconds: float = Field(
+        default=30.0,
+        validation_alias="BRAIN_CONTINUATION_STARTUP_DELAY_SECONDS",
+    )
+    continuation_interval_seconds: float = Field(
+        default=60.0,
+        validation_alias="BRAIN_CONTINUATION_INTERVAL_SECONDS",
+    )
+    continuation_max_batches_per_run: int = Field(
+        default=20,
+        validation_alias="BRAIN_CONTINUATION_MAX_BATCHES_PER_RUN",
+    )
 
     monitoring_enabled: bool = Field(
         default=True,

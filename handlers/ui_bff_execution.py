@@ -46,11 +46,21 @@ class UIBffExecutionMixin:
 
         watchlist_badge = 0
         try:
+            watchlist_params: Dict[str, Any] = {"limit": 1, "offset": 0, "status": "pending"}
+            try:
+                watchlist_params = self._get_system_settings_service().apply_query_defaults(
+                    "/api/v1/ui/candidates/events",
+                    watchlist_params,
+                    self._get_system_api(),
+                    context=self._system_settings_context(request),
+                )
+            except Exception as exc:
+                self.logger.warning(f"candidate badge defaults unavailable: {exc}")
             watchlist_payload = await self._fetch_upstream_json(
                 request,
                 "execution",
                 "/api/v1/ui/candidates/events",
-                params={"limit": 1, "offset": 0, "status": "pending"},
+                params=watchlist_params,
             )
             watchlist_data = watchlist_payload.get("data") if isinstance(watchlist_payload, dict) else None
             watchlist_total = watchlist_data.get("total") if isinstance(watchlist_data, dict) else None

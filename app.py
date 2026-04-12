@@ -442,6 +442,59 @@ async def startup_handler(app: web.Application):
 
         orchestrator = app.get("task_orchestrator")
         if orchestrator:
+            async def _startup_continuation_recovery() -> None:
+                try:
+                    delay = float(getattr(app["config"].service, "continuation_startup_delay_seconds", 30.0) or 30.0)
+                    await asyncio.sleep(max(0.0, delay))
+                    result = await orchestrator.run_terminal_continuation_recovery_until_idle()
+                    if int(result.get("processed") or 0) or result.get("errors"):
+                        logger.info(
+                            "Task continuation startup recovery completed: batches=%s fetched=%s processed=%s "
+                            "skipped_probe=%s skipped_duplicate_intent=%s advanced_to=%s errors=%s",
+                            result.get("batches"),
+                            result.get("fetched"),
+                            result.get("processed"),
+                            result.get("skipped_probe"),
+                            result.get("skipped_duplicate_intent"),
+                            result.get("advanced_to"),
+                            result.get("errors"),
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as recovery_err:
+                    logger.warning(f"Task continuation startup recovery failed: {recovery_err}")
+
+            app["task_continuation_startup_recovery"] = asyncio.create_task(_startup_continuation_recovery())
+            logger.info("Task continuation startup recovery scheduled")
+
+            async def _task_continuation_periodic_worker() -> None:
+                interval = float(getattr(app["config"].service, "continuation_interval_seconds", 60.0) or 60.0)
+                await asyncio.sleep(max(1.0, interval))
+                while True:
+                    try:
+                        result = await orchestrator.run_terminal_continuation_recovery_until_idle()
+                        if int(result.get("processed") or 0) or result.get("errors") or result.get("has_more"):
+                            logger.info(
+                                "Task continuation periodic recovery completed: batches=%s fetched=%s processed=%s "
+                                "skipped_probe=%s skipped_duplicate_intent=%s advanced_to=%s has_more=%s errors=%s",
+                                result.get("batches"),
+                                result.get("fetched"),
+                                result.get("processed"),
+                                result.get("skipped_probe"),
+                                result.get("skipped_duplicate_intent"),
+                                result.get("advanced_to"),
+                                result.get("has_more"),
+                                result.get("errors"),
+                            )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as recovery_err:
+                        logger.warning(f"Task continuation periodic recovery failed: {recovery_err}")
+                    await asyncio.sleep(max(1.0, interval))
+
+            app["task_continuation_periodic_worker"] = asyncio.create_task(_task_continuation_periodic_worker())
+            logger.info("Task continuation periodic worker started")
+
             async def _orphan_task_monitor() -> None:
                 while True:
                     try:
@@ -512,6 +565,46 @@ async def startup_handler(app: web.Application):
         # raise
 
 
+async def _close_adapter_sessions_best_effort(app: web.Application) -> None:
+    """Close adapter-owned aiohttp sessions even when components partially initialized."""
+    candidates = [
+        app.get("macro_adapter"),
+        app.get("execution_adapter"),
+    ]
+    for holder_name in ("coordinator", "signal_router"):
+        holder = app.get(holder_name)
+        if holder is None:
+            continue
+        for attr in ("_macro_adapter", "_portfolio_adapter", "_strategy_adapter"):
+            candidates.append(getattr(holder, attr, None))
+
+    seen = set()
+    for adapter in candidates:
+        if adapter is None or id(adapter) in seen:
+            continue
+        seen.add(id(adapter))
+        try:
+            disconnect = getattr(adapter, "disconnect_from_system", None)
+            if callable(disconnect):
+                result = disconnect()
+                if inspect.isawaitable(result):
+                    await result
+                continue
+            http_client = getattr(adapter, "_http_client", None)
+            close = getattr(http_client, "close", None)
+            stop = getattr(http_client, "stop", None)
+            if callable(close):
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+            elif callable(stop):
+                result = stop()
+                if inspect.isawaitable(result):
+                    await result
+        except Exception as exc:
+            logger.warning("Best-effort adapter session close failed: %s", exc)
+
+
 async def cleanup_handler(app: web.Application):
     """应用清理处理器"""
     logger.info("Stopping Integration Service components")
@@ -533,6 +626,22 @@ async def cleanup_handler(app: web.Application):
             except asyncio.CancelledError:
                 pass
 
+        task_continuation_startup_recovery = app.get("task_continuation_startup_recovery")
+        if task_continuation_startup_recovery:
+            task_continuation_startup_recovery.cancel()
+            try:
+                await task_continuation_startup_recovery
+            except asyncio.CancelledError:
+                pass
+
+        task_continuation_periodic_worker = app.get("task_continuation_periodic_worker")
+        if task_continuation_periodic_worker:
+            task_continuation_periodic_worker.cancel()
+            try:
+                await task_continuation_periodic_worker
+            except asyncio.CancelledError:
+                pass
+
         if "unified_scheduler" in app:
             await app["unified_scheduler"].stop()
 
@@ -551,6 +660,8 @@ async def cleanup_handler(app: web.Application):
         # 停止系统协调器
         if 'coordinator' in app:
             await app['coordinator'].stop()
+
+        await _close_adapter_sessions_best_effort(app)
 
         # 停止服务注册表
         if 'service_registry' in app:

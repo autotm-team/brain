@@ -107,10 +107,12 @@ async def main():
         logger.info(f"Health check: http://{host}:{port}/health")
         logger.info(f"UI system health: http://{host}:{port}/api/v1/ui/system/health")
         
+        stop_event = asyncio.Event()
+
         # 设置信号处理
         def signal_handler():
             logger.info("Received shutdown signal")
-            asyncio.create_task(shutdown(runner, app))
+            stop_event.set()
         
         if sys.platform != 'win32':
             loop = asyncio.get_running_loop()
@@ -119,9 +121,11 @@ async def main():
         
         # 保持运行
         try:
-            await asyncio.Future()  # 永远等待
+            await stop_event.wait()
         except KeyboardInterrupt:
             logger.info("Received keyboard interrupt")
+        finally:
+            await shutdown(runner, app)
         
     except Exception as e:
         logging.error(f"Failed to start Integration Service: {e}")
@@ -136,22 +140,10 @@ async def shutdown(runner: web.AppRunner, app: web.Application):
     try:
         # 停止接收新请求
         await runner.cleanup()
-        
-        # 清理应用资源
-        if 'coordinator' in app:
-            await app['coordinator'].stop()
-        
-        if 'unified_scheduler' in app:
-            await app['unified_scheduler'].stop()
-        
         logger.info("Integration Service shutdown complete")
         
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")
-    
-    finally:
-        # 强制退出
-        asyncio.get_event_loop().stop()
 
 
 if __name__ == '__main__':
